@@ -1,0 +1,157 @@
+"""Gateway：把消息总线、渠道与 Agent 串成一个可运行的调度器。
+
+Gateway 是「渠道无关」的运行时核心。它不关心消息具体来自 CLI 还是飞书，
+只负责三件事：
+
+1. 从 bus 取出入站消息，按 ``session_key`` 分配给对应的 ``AgentLoop`` 处理；
+2. 把 Agent 的回复封装成 ``OutboundMessage`` 投回 bus；
+3. 把出站消息按渠道名分发给对应 ``Channel`` 下发。
+
+多会话由 ``_agents`` 字典按 ``session_key`` 缓存实现：同一用户
+（同 ``channel + sender_id``）复用同一个 ``AgentLoop`` 实例，天然支持
+多用户 / 多会话并发，且每个会话的历史、压缩状态各自独立。
+"""
+
+import asyncio
+from typing import Callable, Dict, List
+
+from bus.queue import MessageBus, InboundMessage, OutboundMessage, StreamEvent
+from channels.base import Channel
+from agent.loop import AgentLoop
+
+
+class Gateway:
+    """消息网关：驱动所有渠道与 Agent 协同工作。"""
+
+    def __init__(
+        self,
+        bus: MessageBus,
+        channels: List[Channel],
+        agent_factory: Callable[[str], AgentLoop],
+    ) -> None:
+        self.bus = bus
+        self.channels = channels
+        self.agent_factory = agent_factory
+        # 按渠道名索引，出站分发时 O(1) 查找
+        self._channel_map: Dict[str, Channel] = {ch.name: ch for ch in channels}
+        # 按 session_key 缓存 Agent 实例（同一会话复用，互不干扰）
+        self._agents: Dict[str, AgentLoop] = {}
+        # 每个会话一把锁：同一会话串行、不同会话并发，避免「一条消息卡死」拖垮全局入站
+        self._session_locks: Dict[str, asyncio.Lock] = {}
+        # 保护 _agents / _session_locks 的并发创建
+        self._reg_lock = asyncio.Lock()
+
+    async def run(self) -> None:
+        """并发启动所有渠道、入站消费循环与出站分发循环。"""
+        await asyncio.gather(
+            *(ch.start() for ch in self.channels),
+            self._process_inbound(),
+            self._dispatch_outbound(),
+            self._dispatch_stream(),
+        )
+
+    async def _process_inbound(self) -> None:
+        """入站消费循环：每条消息起一个独立任务处理，绝不在循环里 await 长耗时。
+
+        这样「某条消息卡在慢工具/慢模型」不会阻塞入站循环，其他会话、以及
+        同一会话的后续消息（在各自锁上排队）都能得到处理。
+        """
+        while True:
+            msg = await self.bus.consume_inbound()
+            session_key = f"{msg.channel}:{msg.sender_id}"
+
+            # 取/建该会话的锁（保护并发创建，避免同会话首条消息竞态）
+            async with self._reg_lock:
+                lock = self._session_locks.get(session_key)
+                if lock is None:
+                    lock = asyncio.Lock()
+                    self._session_locks[session_key] = lock
+
+            asyncio.create_task(self._handle_one(msg, session_key, lock))
+
+    async def _handle_one(self, msg: InboundMessage, session_key: str, lock: asyncio.Lock) -> None:
+        """处理单条入站消息：取/建 Agent → 持锁跑 → 回投出站队列。
+
+        同一 ``session_key`` 的多个任务会竞争同一把锁，从而天然串行；
+        不同会话的锁互不影响，可并发执行。锁用 ``async with`` 保证异常时释放。
+        """
+        # 取缓存；不存在则惰性创建并纳入缓存
+        async with self._reg_lock:
+            agent = self._agents.get(session_key)
+            if agent is None:
+                agent = self.agent_factory(session_key)
+                self._agents[session_key] = agent
+
+        # 仅网页渠道挂载流式事件接收方：把 Agent 的逐步事件实时推给网页端
+        # 渲染（思考过程/工具调用/逐字回答）。飞书/CLI 走原 OutboundMessage
+        # 路径，不挂 sink。sink 把事件发布到总线流的 stream_queue，由
+        # _dispatch_stream 转发给 web 渠道。
+        stream_sink = self._make_stream_sink(msg) if msg.channel == "web" else None
+
+        # 同一会话串行跑（持锁）；Agent 内部任何异常都兜底，避免单条消息拖垮整个网关
+        async with lock:
+            try:
+                reply = await agent.run(msg.content, stream_sink=stream_sink)
+            except Exception as exc:
+                reply = f"⚠️ 处理消息时出错：{exc}"
+                if stream_sink is not None:
+                    try:
+                        await stream_sink({"type": "done", "content": reply})
+                    except Exception:
+                        pass
+
+        await self.outbound_safe(reply, msg, stream_sink)
+
+    async def outbound_safe(self, reply: str, msg: InboundMessage, stream_sink) -> None:
+        """把回复安全地回投出站队列（锁外执行，避免持锁期间阻塞分发）。"""
+        try:
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=reply,
+                reply_to=None,
+                streamed=(stream_sink is not None),
+            ))
+        except Exception as exc:  # noqa: BLE001
+            print(f"⚠️ 出站投递失败：{exc}")
+
+    def _make_stream_sink(self, msg: InboundMessage):
+        """为一条入站消息构造流式事件 sink（发布到总线流的 stream_queue）。"""
+        async def sink(event: dict) -> None:
+            await self.bus.publish_stream(StreamEvent(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                event=event,
+            ))
+        return sink
+
+    async def _dispatch_stream(self) -> None:
+        """流式事件分发循环：取 StreamEvent → 按渠道路由给对应 Channel。
+
+        目前仅 web 渠道消费流式事件；其他渠道的事件在此被忽略（不阻塞）。
+        """
+        while True:
+            ev = await self.bus.consume_stream()
+            if ev.channel != "web":
+                continue
+            channel = self._channel_map.get("web")
+            if channel is None or not hasattr(channel, "stream_event"):
+                continue
+            await channel.stream_event(ev.chat_id, ev.event)
+
+    async def _dispatch_outbound(self) -> None:
+        """出站分发循环：取回复 → 按渠道名找到 Channel → 下发。"""
+        while True:
+            msg = await self.bus.consume_outbound()
+            channel = self._channel_map.get(msg.channel)
+            if channel is None:
+                # 找不到对应渠道就告警并丢弃，不阻塞分发循环
+                print(f"⚠️ 出站消息找不到渠道 '{msg.channel}'，已丢弃")
+                continue
+            await channel.send(msg)
+
+    async def shutdown(self) -> None:
+        """停止所有渠道并清空 Agent 缓存。"""
+        for ch in self.channels:
+            await ch.stop()
+        self._agents.clear()

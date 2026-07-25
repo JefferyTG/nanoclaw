@@ -1,0 +1,15 @@
+{
+  "api_key": "",
+  "base_url": "https://api.siliconflow.cn/v1",
+  "model": "Pro/moonshotai/Kimi-K2.5",
+  "subagent_model": "",
+  "workspace": ".",
+  "max_iterations": 32,
+  "identity_file": "identity.md",
+  "feishu_app_id": "",
+  "feishu_app_secret": "",
+  "web_host": "0.0.0.0",
+  "web_port": 0,
+  "turn_timeout_sec": 600,
+  "mcp_servers": {}
+}

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "apple-calendar": {
+      "source": "sundial-org/awesome-openclaw-skills",
+      "sourceType": "github",
+      "skillPath": "skills/apple-calendar/SKILL.md",
+      "computedHash": "684d54249e9aaec6d33c1591908e88e6fc48ea7e4f709d0c23e170eec1ed5b43"
+    }
+  }
+}

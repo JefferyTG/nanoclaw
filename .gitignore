@@ -1,0 +1,36 @@
+# Python / 虚拟环境
+.venv/
+list/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.uv/
+
+# 敏感配置与凭证（切勿提交）
+config.json
+.env
+*.env
+*.env.*
+
+# 个人数据 / 运行产物
+.workbuddy/
+workspace/
+sessions/
+*.log
+run.log
+nanoclaw.launchd.log
+
+# 人设（个人定制，仓库使用内置默认人设兜底）
+identity.md
+identity_oldsis.md
+
+# 环境相关脚手架（含本机绝对路径，不可移植）
+deploy/
+scripts/
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>NanoClaw 网页端</title>
+<meta name="page-version" content="__NC_PAGE_VERSION__" />
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --txt:#e6e8ec; --muted:#9aa3b2; --accent:#538bf0; --ok:#3ecf8e; --think:#2a2333; --think-line:#4a3a5e; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: -apple-system, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+         background:var(--bg); color:var(--txt); height:100vh; display:flex; flex-direction:column; }
+  header { display:flex; align-items:center; gap:12px; padding:10px 16px; border-bottom:1px solid var(--line); }
+  header h1 { font-size:15px; margin:0; font-weight:500; }
+  header .status { font-size:12px; color:var(--muted); margin-left:auto; }
+  header button { background:var(--panel); color:var(--txt); border:1px solid var(--line);
+                  border-radius:8px; padding:5px 12px; cursor:pointer; font-size:13px; }
+  header button:hover { border-color:var(--accent); }
+  #chat { flex:1; overflow-y:auto; padding:16px; display:flex; flex-direction:column; gap:12px; }
+  .msg { max-width:88%; padding:0; border-radius:12px; }
+  .msg.user { align-self:flex-end; }
+  .msg.user .bubble { background:var(--accent); color:#fff; padding:9px 12px; border-radius:12px; white-space:pre-wrap; word-break:break-word; }
+  .msg.bot { align-self:flex-start; width:88%; display:flex; flex-direction:column; gap:8px; }
+  .msg.sys { align-self:center; background:transparent; color:var(--muted); font-size:12px; }
+
+  /* —— 思考过程面板：独立分区、默认折叠、点开看 —— */
+  .think { border:1px solid var(--think-line); border-radius:10px; background:var(--think); overflow:hidden; }
+  .think .sum { cursor:pointer; padding:7px 11px; color:#c8b6e0; font-size:12px; user-select:none; display:flex; align-items:center; gap:6px; }
+  .think .sum::before { content:"▸"; font-size:10px; }                 /* 折叠态箭头 */
+  .think:not(.collapsed) .sum::before { content:"▾"; }                 /* 展开态箭头 */
+  .think .sum-label { white-space:nowrap; }
+  .think .sum-dur { color:#9a86bd; white-space:nowrap; }
+  .think .sum-preview { flex:1; min-width:0; color:#a895c4; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }  /* 单行预览 */
+  .think.live .sum::after { content:" ● 思考中"; color:var(--accent); animation:blink 1s steps(2,start) infinite; }
+  @keyframes blink { 50% { opacity:.25; } }
+  .think .think-body { padding:4px 11px 9px; color:#b9a9d6; white-space:pre-wrap; word-break:break-word;
+                border-top:1px dashed var(--think-line); max-height:260px; overflow:auto; font-size:13px; line-height:1.55; display:none; }
+  .think:not(.collapsed) .think-body { display:block; }               /* 仅展开时显示全文 */
+
+  /* —— 工具活动卡片：默认折叠，长内容收起，点开看详情 —— */
+  .activity { display:flex; flex-direction:column; gap:6px; }
+  .tool-card { font-size:12px; border:1px solid var(--line); border-radius:10px; background:#11141a; overflow:hidden; }
+  .tool-card .tc-head { cursor:pointer; padding:6px 10px; color:#7fd1ff; display:flex; gap:6px; align-items:center; }
+  .tool-card .tc-head::before { content:"▸"; font-size:10px; }
+  .tool-card.expanded .tc-head::before { content:"▾"; }
+  .tool-card .tc-name { font-weight:600; }
+  .tool-card .tc-status { margin-left:auto; color:var(--muted); white-space:nowrap; }
+  .tool-card .tc-args { display:none; padding:0 10px 6px; color:#aeb6c4; white-space:pre-wrap; word-break:break-word;
+                        font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; }
+  .tool-card .tc-result { display:none; padding:6px 10px; color:#9fe6c0; white-space:pre-wrap; word-break:break-word;
+                         border-top:1px dashed var(--line); font-size:11px; max-height:180px; overflow:auto; }
+  .tool-card.expanded .tc-args { display:block; }                      /* 展开才看入参 */
+  .tool-card.expanded.has-result .tc-result { display:block; }         /* 有结果才展示出参 */
+
+  /* —— 正式回答：与思考过程明显分隔 —— */
+  .answer-wrap { border:1px solid var(--line); border-radius:10px; background:var(--panel); overflow:hidden; }
+  .answer-label { padding:6px 11px; font-size:11px; color:var(--muted); border-bottom:1px solid var(--line); letter-spacing:.04em; }
+  .answer { padding:9px 12px; white-space:pre-wrap; word-break:break-word; line-height:1.65; min-height:20px; }
+  .answer.empty::after { content:"生成中…"; color:var(--muted); }
+
+  #bar { display:flex; gap:8px; padding:12px 16px; border-top:1px solid var(--line); }
+  #bar input { flex:1; background:var(--panel); border:1px solid var(--line); color:var(--txt);
+               border-radius:10px; padding:10px 12px; font-size:14px; outline:none; }
+  #bar input:focus { border-color:var(--accent); }
+  #bar button { background:var(--accent); color:#fff; border:none; border-radius:10px; padding:0 18px; font-size:14px; cursor:pointer; }
+  #config { display:none; padding:16px; border-top:1px solid var(--line); overflow-y:auto; max-height:55vh; }
+  #config.show { display:block; }
+  #config h2 { font-size:13px; color:var(--muted); margin:14px 0 6px; font-weight:500; }
+  #config label { display:block; font-size:12px; color:var(--muted); margin-bottom:3px; }
+  #config input { width:100%; background:var(--panel); border:1px solid var(--line); color:var(--txt);
+                  border-radius:8px; padding:8px 10px; font-size:13px; margin-bottom:10px; outline:none; }
+  #config input:focus { border-color:var(--accent); }
+  #config .row { display:flex; gap:10px; }
+  #config .row > div { flex:1; }
+  #config .actions { display:flex; gap:10px; margin-top:6px; }
+  #config .actions button { flex:1; padding:9px; border-radius:8px; font-size:13px; cursor:pointer; border:1px solid var(--line); }
+  #saveBtn { background:var(--ok); color:#06281c; border:none; font-weight:500; }
+  #cfgMsg { font-size:12px; color:var(--muted); }
+
+  /* —— 会话侧边栏布局 —— */
+  #app { flex:1; display:flex; min-height:0; overflow:hidden; }
+  #sidebar { width:264px; flex:none; border-right:1px solid var(--line); background:var(--panel);
+             display:flex; flex-direction:column; min-height:0; }
+  #sidebar .sb-head { display:flex; align-items:center; gap:8px; padding:10px 12px; border-bottom:1px solid var(--line); }
+  #sidebar .sb-head h2 { font-size:13px; margin:0; font-weight:500; }
+  #sidebar .sb-head button { margin-left:auto; background:var(--accent); color:#fff; border:none;
+                             border-radius:8px; padding:5px 10px; font-size:12px; cursor:pointer; }
+  #sidebar .sb-head button:hover { filter:brightness(1.1); }
+  #sidebar .sb-list { flex:1; overflow-y:auto; padding:8px; display:flex; flex-direction:column; gap:6px; }
+  .sb-item { position:relative; border:1px solid var(--line); border-radius:10px; padding:8px 10px;
+             cursor:pointer; background:#11141a; }
+  .sb-item:hover { border-color:var(--accent); }
+  .sb-item.active { border-color:var(--accent); background:#1b2230; }
+  .sb-item .sb-title { font-size:13px; color:var(--txt); white-space:nowrap; overflow:hidden;
+                       text-overflow:ellipsis; padding-right:24px; }
+  .sb-item .sb-preview { font-size:11px; color:var(--muted); margin-top:3px; white-space:nowrap;
+                         overflow:hidden; text-overflow:ellipsis; }
+  .sb-item .sb-time { font-size:10px; color:var(--muted); margin-top:3px; }
+  .sb-item .sb-del { position:absolute; top:6px; right:6px; background:transparent; border:none;
+                     color:var(--muted); cursor:pointer; font-size:12px; line-height:1; padding:2px 5px;
+                     border-radius:6px; }
+  .sb-item .sb-del:hover { color:#ff6b6b; background:rgba(255,107,107,.12); }
+  #main { flex:1; min-width:0; display:flex; flex-direction:column; }
+</style>
+</head>
+<body>
+<header>
+  <h1>NanoClaw 网页端</h1>
+  <span class="status" id="status">连接中…</span>
+  <button id="cfgBtn">配置</button>
+</header>
+
+<div id="app">
+  <aside id="sidebar">
+    <div class="sb-head">
+      <h2>会话</h2>
+      <button id="newBtn">＋ 新会话</button>
+    </div>
+    <div class="sb-list" id="sbList"></div>
+  </aside>
+  <div id="main">
+    <div id="chat"></div>
+
+<div id="config">
+  <h2>模型与接口</h2>
+  <label>API Key</label><input id="api_key" type="password" placeholder="留空则用环境变量" />
+  <label>Base URL</label><input id="base_url" />
+  <div class="row"><div><label>主模型</label><input id="model" /></div><div><label>子 Agent 模型</label><input id="subagent_model" /></div></div>
+  <label>最大迭代次数</label><input id="max_iterations" type="number" />
+  <label>单轮超时（秒）</label><input id="turn_timeout_sec" type="number" min="30" step="30" />
+
+  <h2>工作区与人设</h2>
+  <label>工作区目录</label><input id="workspace" />
+  <label>人设文件名</label><input id="identity_file" />
+
+  <h2>飞书渠道（可选）</h2>
+  <div class="row"><div><label>App ID</label><input id="feishu_app_id" /></div><div><label>App Secret</label><input id="feishu_app_secret" type="password" /></div></div>
+
+  <h2>网页渠道</h2>
+  <div class="row"><div><label>监听地址</label><input id="web_host" /></div><div><label>端口</label><input id="web_port" type="number" /></div></div>
+
+  <div class="actions">
+    <button id="reloadBtn">重新加载</button>
+    <button id="saveBtn">保存配置</button>
+  </div>
+  <div id="cfgMsg"></div>
+</div>
+
+    <div id="bar">
+      <input id="input" placeholder="输入消息，回车发送；/new 开新会话，/sessions 列表，/switch &lt;n&gt; 切换，/clear 清当前" autocomplete="off" />
+      <button id="sendBtn">发送</button>
+    </div>
+  </div><!-- /#main -->
+</div><!-- /#app -->
+
+<script>
+(function () {
+  var chat = document.getElementById('chat');
+  var input = document.getElementById('input');
+  var statusEl = document.getElementById('status');
+  var cfgBtn = document.getElementById('cfgBtn');
+  var cfgPanel = document.getElementById('config');
+  var cfgMsg = document.getElementById('cfgMsg');
+  var FIELDS = ['api_key','base_url','model','subagent_model','workspace','max_iterations','turn_timeout_sec','identity_file','feishu_app_id','feishu_app_secret','web_host','web_port'];
+
+  function addUser(text) {
+    var m = document.createElement('div'); m.className = 'msg user';
+    var b = document.createElement('div'); b.className = 'bubble'; b.textContent = text;
+    m.appendChild(b); chat.appendChild(m); chat.scrollTop = chat.scrollHeight;
+  }
+  function addSys(text) {
+    var m = document.createElement('div'); m.className = 'msg sys'; m.textContent = text;
+    chat.appendChild(m); chat.scrollTop = chat.scrollHeight;
+  }
+
+  // —— 一个 bot 回合 = 思考面板(默认折叠) + 工具活动(默认折叠) + 正式回答 ——
+  var cur = null;
+  function newTurn() {
+    var root = document.createElement('div'); root.className = 'msg bot';
+
+    // 思考面板：默认折叠 (collapsed)，标题行展示「单行预览 + 思考时长」
+    var think = document.createElement('div'); think.className = 'think live collapsed';
+    think.innerHTML = '<div class="sum"><span class="sum-label">💭 思考过程</span>'
+                    + '<span class="sum-preview"></span>'
+                    + '<span class="sum-dur"></span></div>'
+                    + '<div class="think-body"></div>';
+
+    var activity = document.createElement('div'); activity.className = 'activity';
+
+    var ansWrap = document.createElement('div'); ansWrap.className = 'answer-wrap';
+    ansWrap.innerHTML = '<div class="answer-label">正式回答</div><div class="answer empty"></div>';
+    var answer = ansWrap.querySelector('.answer');
+
+    root.appendChild(think);
+    root.appendChild(activity);
+    root.appendChild(ansWrap);
+    chat.appendChild(root); chat.scrollTop = chat.scrollHeight;
+    return { root: root, think: think,
+             thinkBody: think.querySelector('.think-body'),
+             thinkPreview: think.querySelector('.sum-preview'),
+             thinkDur: think.querySelector('.sum-dur'),
+             activity: activity, answer: answer,
+             answerStarted: false, lastTool: null,
+             thinkStart: performance.now(), thinkEnded: false };
+  }
+
+  // —— 思考时长：从回合开始到「正式回答首次出现」的耗时（含工具调用）——
+  function fmtDur(ms) { return ' · ' + (ms / 1000).toFixed(1) + 's'; }
+  function finishThink(c) {
+    if (c.thinkEnded) return;
+    c.thinkEnded = true;
+    if (!c.thinkBody.textContent.trim()) {
+      c.thinkPreview.textContent = '（模型未返回思考内容）';
+    }
+    c.thinkDur.textContent = fmtDur(performance.now() - c.thinkStart);
+  }
+
+  function onEvent(ev) {
+    // 版本握手：若服务端页面版本与本地不一致，说明本地是过期缓存页，
+    // 立即强制刷新拉取最新前端（自愈，避免旧页面把 {"event":...} 当文本贴出）
+    if (ev.type === 'hello') {
+      var pv = (document.querySelector('meta[name=page-version]') || {}).content;
+      if (pv && ev.version && pv !== ev.version) {
+        console.warn('检测到前端版本过期，自动刷新以加载最新页面…');
+        location.reload(true);
+      }
+      return;
+    }
+    // 会话切换/新建后，后端回传当前会话标识，前端同步高亮
+    if (ev.type === 'session_changed') {
+      currentKey = ev.key;
+      loadSessions();
+      return;
+    }
+    if (!cur) cur = newTurn();
+    var t = ev.type;
+    if (t === 'thinking') {
+      // 全文累积到 body（仅展开时可见），单行预览随思考流式刷新
+      cur.thinkBody.textContent += (ev.content || '');
+      cur.thinkPreview.textContent = cur.thinkBody.textContent;
+      chat.scrollTop = chat.scrollHeight;
+    } else if (t === 'token') {
+      if (!cur.answerStarted) {
+        cur.answer.classList.remove('empty'); cur.answer.textContent = ''; cur.answerStarted = true;
+        finishThink(cur);   // 正式回答开始 = 思考结束，记录思考时长
+      }
+      cur.answer.textContent += (ev.content || '');
+      chat.scrollTop = chat.scrollHeight;
+    } else if (t === 'tool_call') {
+      // 工具卡片默认折叠：标题只显示「名称 + 状态」，点开才看入参/出参
+      var card = document.createElement('div'); card.className = 'tool-card';
+      card.innerHTML = '<div class="tc-head"><span class="tc-name"></span>'
+                     + '<span class="tc-status">⏳ 执行中</span></div>'
+                     + '<div class="tc-args"></div><div class="tc-result"></div>';
+      card.querySelector('.tc-name').textContent = '🔧 ' + (ev.name || '');
+      card.querySelector('.tc-args').textContent = (ev.args != null ? ev.args : '');
+      cur.activity.appendChild(card); cur.lastTool = card;
+      chat.scrollTop = chat.scrollHeight;
+    } else if (t === 'tool_result') {
+      var card2 = cur.lastTool;
+      if (card2) {
+        card2.classList.add('has-result');
+        card2.querySelector('.tc-result').textContent = (ev.content || '');
+        card2.querySelector('.tc-status').textContent = '✅ 完成';
+      }
+      chat.scrollTop = chat.scrollHeight;
+    } else if (t === 'done') {
+      cur.think.classList.remove('live');
+      finishThink(cur);   // 兜底：无论是否出 token，回合结束都记录思考时长
+      if (!cur.answerStarted && ev.content) { cur.answer.classList.remove('empty'); cur.answer.textContent = ev.content; }
+      if (!cur.answer.textContent.trim()) cur.answer.textContent = '（本轮未生成正式回答）';
+      cur = null;
+      chat.scrollTop = chat.scrollHeight;
+      loadSessions();   // 刷新侧边栏：新会话出现 / 预览与末次时间更新
+    }
+  }
+  // 点标题折叠/展开：思考面板 (.sum) 与 工具卡片 (.tc-head)
+  chat.addEventListener('click', function (e) {
+    var tgt = e.target;
+    if (!tgt || !tgt.classList || !tgt.closest) return;
+    var sumEl = tgt.closest('.sum');
+    if (sumEl) { sumEl.parentNode.classList.toggle('collapsed'); return; }
+    var head = tgt.closest('.tc-head');
+    if (head) { head.parentNode.classList.toggle('expanded'); }
+  });
+
+  var proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  var ws = null;                 // 当前 WebSocket（断线后重建）
+  var _reconnectDelay = 1000;    // 重连间隔（指数退避，上限 10s）
+  var _reconnectTimer = null;
+
+  // 建立 WebSocket；断线后自动重连（指数退避），连上后自动接回当前会话。
+  // 解决：Mac 睡眠 / 重启实例后，浏览器旧连接死掉、一直「已断开」需手动刷新的问题。
+  function connectWS() {
+    ws = new WebSocket(proto + '://' + location.host + '/ws');
+    ws.onopen = function () {
+      statusEl.textContent = '已连接';
+      statusEl.style.color = 'var(--ok)';
+      _reconnectDelay = 1000;           // 连接成功，重置退避
+      // 若之前有激活会话，重连后自动接回（服务端新连接会重置会话，需要重新 open）
+      if (currentKey) {
+        ws.send(JSON.stringify({ ctl: true, type: 'open', key: currentKey }));
+      }
+      loadSessions();                   // 顺手刷新侧边栏列表
+    };
+    ws.onclose = function () {
+      statusEl.textContent = '已断开 · 重连中…';
+      statusEl.style.color = '#d98c00';
+      if (_reconnectTimer) clearTimeout(_reconnectTimer);
+      _reconnectTimer = setTimeout(connectWS, _reconnectDelay);
+      _reconnectDelay = Math.min(Math.floor(_reconnectDelay * 1.6), 10000);
+    };
+    ws.onerror = function () {
+      statusEl.textContent = '连接错误 · 重连中…';
+      statusEl.style.color = '#d98c00';
+    };
+    ws.onmessage = function (e) {
+      var data = e.data;
+      // 优先按流式事件 JSON 解析：{"event": {...}}
+      if (data && data.charAt(0) === '{') {
+        try {
+          var obj = JSON.parse(data);
+          if (obj && obj.event) { onEvent(obj.event); return; }
+        } catch (err) { /* 不是预期 JSON */ }
+        // 防御：非事件帧不渲染为文本（避免出现「一堆 JSON」），仅在控制台记录
+        console.warn('收到非事件帧，已忽略：', data.slice(0, 200));
+        return;
+      }
+      // 兜底：纯文本（/new 等命令回复）—— 开一个独立回合显示
+      if (!cur) cur = newTurn();
+      if (!cur.answerStarted) { cur.answer.classList.remove('empty'); cur.answer.textContent = ''; cur.answerStarted = true; }
+      cur.answer.textContent += data;
+      cur.think.classList.remove('live');
+      cur = null;
+    };
+  }
+  connectWS();
+
+  function send() {
+    var text = input.value.trim();
+    if (!text || ws.readyState !== WebSocket.OPEN) return;
+    addUser(text);
+    cur = newTurn();          // 立即开回合，先显示「思考中…」
+    ws.send(text);
+    input.value = '';
+  }
+  document.getElementById('sendBtn').onclick = send;
+  // 回车发送；但输入法（IME）组字过程中的回车（确认候选词）不算发送，
+  // 用 isComposing / keyCode===229 区分，避免中文上屏误发。
+  input.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) send();
+  });
+
+  cfgBtn.onclick = function () {
+    cfgPanel.classList.toggle('show');
+    if (cfgPanel.classList.contains('show')) loadConfig();
+  };
+  function loadConfig() {
+    cfgMsg.textContent = '';
+    fetch('/api/config').then(function (r) { return r.json(); }).then(function (d) {
+      FIELDS.forEach(function (f) {
+        var el = document.getElementById(f);
+        if (el && d[f] != null) el.value = d[f];
+      });
+    }).catch(function (e) { cfgMsg.textContent = '加载失败：' + e; });
+  }
+  document.getElementById('reloadBtn').onclick = loadConfig;
+  document.getElementById('saveBtn').onclick = function () {
+    var payload = {};
+    FIELDS.forEach(function (f) {
+      var el = document.getElementById(f);
+      if (el) payload[f] = el.value;
+    });
+    cfgMsg.textContent = '保存中…';
+    fetch('/api/config', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+    }).then(function (r) { return r.json(); }).then(function (d) {
+      cfgMsg.textContent = d.ok ? ('已保存。' + (d.note || '')) : ('失败：' + (d.error || ''));
+    }).catch(function (e) { cfgMsg.textContent = '保存失败：' + e; });
+  };
+
+  // —— 会话侧边栏：列出历史网页会话，点击查看并接上，可删除（含本地文件）——
+  var sbList = document.getElementById('sbList');
+  var newBtn = document.getElementById('newBtn');
+  var currentKey = null;   // 当前激活的会话标识（后端 current_key）
+
+  function relTime(iso) {
+    if (!iso) return '';
+    var t = new Date(iso);
+    if (isNaN(t.getTime())) return iso;
+    var diff = (Date.now() - t.getTime()) / 1000;
+    if (diff < 60) return '刚刚';
+    if (diff < 3600) return Math.floor(diff / 60) + ' 分钟前';
+    if (diff < 86400) return Math.floor(diff / 3600) + ' 小时前';
+    var p = iso.split('T');
+    return (p[0] || iso).slice(5) + ' ' + (p[1] || '').slice(0, 5);
+  }
+
+  function loadSessions() {
+    fetch('/api/sessions').then(function (r) { return r.json(); }).then(function (d) {
+      var items = (d && d.sessions) || [];
+      sbList.innerHTML = '';
+      if (!items.length) {
+        var tip = document.createElement('div');
+        tip.style.cssText = 'color:var(--muted);font-size:12px;padding:8px;';
+        tip.textContent = '暂无历史会话。点击「＋ 新会话」开始。';
+        sbList.appendChild(tip);
+        return;
+      }
+      items.forEach(function (it) {
+        var el = document.createElement('div');
+        el.className = 'sb-item' + (it.key === currentKey ? ' active' : '');
+        el.innerHTML = '<div class="sb-title"></div><div class="sb-preview"></div>'
+                     + '<div class="sb-time"></div><button class="sb-del" title="删除会话">🗑</button>';
+        el.querySelector('.sb-title').textContent = it.title || '(空会话)';
+        el.querySelector('.sb-preview').textContent = it.preview || '';
+        el.querySelector('.sb-time').textContent =
+          relTime(it.updated_at) + (it.count ? (' · ' + it.count + ' 条') : '');
+        el.addEventListener('click', function (e) {
+          if (e.target.classList.contains('sb-del')) return;
+          openSession(it.key);
+        });
+        el.querySelector('.sb-del').addEventListener('click', function (e) {
+          e.stopPropagation();
+          deleteSession(it.key);
+        });
+        sbList.appendChild(el);
+      });
+    }).catch(function (e) { console.warn('加载会话列表失败：', e); });
+  }
+
+  // 打开历史会话：后端切到该标识 + 前端拉取并回放历史，之后可继续对话
+  function openSession(key) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) { addSys('连接未就绪，无法打开会话'); return; }
+    ws.send(JSON.stringify({ ctl: true, type: 'open', key: key }));
+    fetch('/api/session?key=' + encodeURIComponent(key)).then(function (r) { return r.json(); }).then(function (d) {
+      currentKey = key;
+      chat.innerHTML = '';
+      cur = null;
+      renderHistory((d && d.messages) || []);
+      loadSessions();
+    }).catch(function (e) { addSys('打开会话失败：' + e); });
+  }
+
+  // 新建会话：后端生成新标识，前端清屏（收到 session_changed 后高亮）
+  function newSession() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) { addSys('连接未就绪'); return; }
+    ws.send(JSON.stringify({ ctl: true, type: 'new' }));
+    chat.innerHTML = '';
+    cur = null;
+    currentKey = null;
+  }
+
+  // 删除会话：同时删本地 JSONL 文件；若正打开则自动新建一个
+  function deleteSession(key) {
+    if (!confirm('确定删除该会话？本地记录也会一并删除，无法恢复。')) return;
+    fetch('/api/session?key=' + encodeURIComponent(key), { method: 'DELETE' })
+      .then(function (r) { return r.json(); }).then(function (d) {
+        if (d && d.ok) {
+          if (key === currentKey) { currentKey = null; newSession(); }
+          loadSessions();
+        } else { alert('删除失败：' + ((d && d.error) || '')); }
+      }).catch(function (e) { alert('删除失败：' + e); });
+  }
+
+  // 历史回放：把磁盘消息重建为聊天视图（思考折叠、正式回答展开）
+  function renderHistory(records) {
+    (records || []).forEach(function (m) {
+      var role = m.role;
+      if (role === 'user') {
+        addUser(m.content || '');
+      } else if (role === 'assistant') {
+        var c = newTurn();
+        if (m.reasoning_content) {
+          c.thinkBody.textContent = m.reasoning_content;
+          c.thinkPreview.textContent = m.reasoning_content;
+        }
+        var txt = m.content || '';
+        if (txt) {
+          c.answer.classList.remove('empty'); c.answer.textContent = txt; c.answerStarted = true;
+        } else if (m.tool_calls) {
+          c.answer.classList.remove('empty');
+          c.answer.textContent = '（该回合调用了工具，详见工具记录）';
+          c.answerStarted = true;
+        }
+        c.think.classList.remove('live');
+        finishThink(c);
+        cur = null;
+      }
+      // system / tool 消息在侧边栏回放中省略（不污染主对话视图）
+    });
+    chat.scrollTop = chat.scrollHeight;
+  }
+
+  newBtn.onclick = newSession;
+  loadSessions();   // 首屏拉取历史会话列表
+
+  addSys('欢迎使用 NanoClaw 网页端。左侧「会话」可查看并接上历史会话，也可删除；思考过程与工具调用默认折叠为单行，点标题即可展开，并显示思考时长。');
+})();
+</script>
+</body>
+</html>
