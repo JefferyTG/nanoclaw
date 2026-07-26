@@ -33,6 +33,9 @@ from agent.context import ContextBuilder
 from agent.loop import AgentLoop
 from session.manager import SessionManager
 from agent.memory import MemoryConsolidation
+from agent.daily import DailyMemory, summarize_messages_to_daily
+from agent.search import MemorySearcher
+from agent.tools.search import MemorySearchTool
 
 from bus.queue import MessageBus
 from gateway import Gateway
@@ -114,10 +117,27 @@ def build_shared() -> dict:
     sessions_dir = os.path.join(WORKSPACE, "workspace", "sessions")
     session_manager = SessionManager(sessions_dir)
 
-    # 8) 会话压缩器（上下文超预算时把旧消息压成摘要，落到 workspace/memory/HISTORY.md）
+    # 7.5) 记忆检索：SQLite + LIKE 索引 USER/MEMORY/daily/sessions，
+    #      启动时全量重建。注册 memory_search 工具（唯一新增工具——检索是
+    #      read_file 做不到的真新能力，符合大道至简的例外）。
+    searcher = MemorySearcher(
+        os.path.join(WORKSPACE, "workspace", "memory"),
+        session_manager=session_manager,
+    )
+    indexed = searcher.rebuild_all()
+    print(f"已索引记忆与会话文档：{indexed} 条")
+    tools.register(MemorySearchTool(searcher))
+
+    # 8) 每日记忆：按天把重要事件追加到 workspace/memory/daily/YYYY-MM-DD.md
+    #    供 /clear 与压缩前两个触发点写入；不暴露为工具。
+    daily_memory = DailyMemory(os.path.join(WORKSPACE, "workspace", "memory"))
+
+    # 9) 会话压缩器（上下文超预算时把旧消息压成摘要，落到 workspace/memory/HISTORY.md）
     #    token_budget 按 192k 估算 token 计；与 sessions 同级的 workspace/memory 目录。
+    #    压缩前先把旧消息里的重要事件落 daily，避免关键事实随压缩丢失。
     memory = MemoryConsolidation(
-        provider, os.path.join(WORKSPACE, "workspace"), token_budget=192_000
+        provider, os.path.join(WORKSPACE, "workspace"),
+        token_budget=192_000, daily_memory=daily_memory,
     )
 
     return {
@@ -127,6 +147,8 @@ def build_shared() -> dict:
         "context": context,
         "session_manager": session_manager,
         "memory": memory,
+        "daily_memory": daily_memory,
+        "searcher": searcher,
         "skills_summary": skills_summary,
     }
 
@@ -205,10 +227,25 @@ async def amain() -> None:
 
         同时供 CLI（传入 ``cli:local{n}``）与飞书（传入
         ``feishu:<chat_id>:<n>``）复用，避免重复定义。
+
+        清空前先拷贝历史，启动后台任务把重要事件总结写入当天 daily
+        （不阻塞 clear，daily 是 nice-to-have，失败忽略）。
         """
         agent = agents_registry.get(session_key)
         if agent is not None:
+            # 先拷贝历史供后台总结（clear_history 会清空 _session_history）
+            history_snapshot = list(agent._session_history)
             agent.clear_history()
+            # 后台总结写 daily；无历史或未启用 daily 时跳过
+            daily = shared.get("daily_memory")
+            if history_snapshot and daily is not None:
+                try:
+                    asyncio.create_task(summarize_messages_to_daily(
+                        shared["provider"], daily, history_snapshot,
+                        category="会话总结",
+                    ))
+                except Exception:  # noqa: BLE001 - daily 失败不影响 clear
+                    pass
 
     cli_channel._clear_callback = clear_callback
 

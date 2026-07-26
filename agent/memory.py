@@ -18,9 +18,10 @@
 import os
 import re
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 from providers.base import LLMProvider
+from agent.daily import DailyMemory, summarize_messages_to_daily
 
 
 # 粗略 token 估算用：匹配 CJK 表意文字及中文常用标点/全角符号
@@ -54,10 +55,13 @@ class MemoryConsolidation:
         provider: LLMProvider,
         workspace: str,
         token_budget: int = 192_000,
+        daily_memory: Optional[DailyMemory] = None,
     ):
         self.provider = provider
         self.workspace = workspace
         self.token_budget = token_budget
+        # 每日记忆：压缩前把旧消息里的重要事件落 daily，避免关键事实随压缩丢失
+        self.daily_memory = daily_memory
 
     def estimate_tokens(self, messages: List[dict]) -> int:
         """预估 messages 的总 token 数（极简启发式，非精确 tokenizer）。
@@ -104,6 +108,14 @@ class MemoryConsolidation:
         system_msg = messages[0]          # 第一条（system 提示），原样保留
         tail = messages[-6:]              # 末尾 6 条，原样保留
         old_messages = messages[1:-6]     # 中间待压缩的旧消息
+
+        # 压缩前：把旧消息里的重要事件落 daily，避免关键事实随压缩丢失。
+        # daily 是 nice-to-have，失败不影响压缩主流程。
+        if self.daily_memory is not None:
+            await summarize_messages_to_daily(
+                self.provider, self.daily_memory, old_messages,
+                category="压缩前保存",
+            )
 
         summary = await self._summarize(old_messages)
 
