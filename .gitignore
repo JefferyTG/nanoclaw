@@ -34,3 +34,7 @@ scripts/
 .DS_Store
 .idea/
 .vscode/
+
+# 个人杂项文件（不纳入版本库）
+avatar.png
+lolita_prompt.md
