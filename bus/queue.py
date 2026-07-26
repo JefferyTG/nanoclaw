@@ -9,10 +9,23 @@ CLI 等）把收到的用户消息封装成 :class:`InboundMessage` 投递进
 便于在任意渠道适配器中复用。
 """
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 import asyncio
+
+
+@dataclass
+class ImageRef:
+    """一张已落盘图片的引用，用于在消息总线上传递图片而不内联字节。
+
+    图片字节落盘到 ``ImageStore`` 指定目录，总线只搬运轻量的引用
+    （id / 路径 / 类型），真正读字节生成 base64 是在调用视觉模型时按需进行。
+    """
+
+    id: str                       # 全局唯一图片标识（uuid4 hex）
+    path: str                     # 落盘绝对路径：<sessions_dir>/<safe_key>_images/<id>.<ext>
+    mime: str = "image/png"       # MIME 类型，如 image/png / image/jpeg
 
 
 @dataclass
@@ -24,6 +37,7 @@ class InboundMessage:
     chat_id: str                  # 会话标识（群聊或私聊）
     content: str                  # 消息正文
     raw: Optional[dict] = None    # 原始消息（各渠道 SDK 的原始结构），调试用
+    images: Optional[List[ImageRef]] = None  # 随消息附带的图片引用（无则为 None）
 
 
 @dataclass

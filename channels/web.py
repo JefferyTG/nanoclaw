@@ -38,6 +38,8 @@ _CONFIG_FIELDS = (
     "api_key", "base_url", "model", "subagent_model", "workspace",
     "max_iterations", "identity_file", "feishu_app_id", "feishu_app_secret",
     "web_host", "web_port", "turn_timeout_sec",
+    "multimodal_model", "base_model_multimodal",
+    "image_gen_model",
 )
 
 
@@ -45,13 +47,14 @@ class WebChannel(Channel):
     """网页渠道（name 固定为 ``"web"``），在后台线程跑 aiohttp 服务。"""
 
     def __init__(self, name: str, bus, host: str, port: int, config, config_path: str,
-                 session_manager=None) -> None:
+                 session_manager=None, image_store=None) -> None:
         super().__init__(name=name, bus=bus)
         self.host = host
         self.port = port
         self.config = config              # 共享的 NanoClawConfig 实例（网页可就地修改）
         self.config_path = config_path    # 本实例 config.json 路径（用于持久化）
         self.session_manager = session_manager  # 会话持久化管理器（侧边栏读写用，可空）
+        self.image_store = image_store    # 图片存储（落盘/解析/清理），可空
         self._loop = None                 # 网关主事件循环（跨线程投递用）
         self._web_loop = None             # aiohttp 所在事件循环（后台线程）
         self._thread = None               # 后台守护线程
@@ -96,9 +99,12 @@ class WebChannel(Channel):
             asyncio.set_event_loop(loop)
             self._web_loop = loop
 
-            app = web.Application()
+            # client_max_size：默认仅 1MB，上传照片会 413；放宽到 20MB
+            app = web.Application(client_max_size=20 * 1024 * 1024)
             app.router.add_get("/", self._handle_index)
             app.router.add_get("/ws", self._handle_ws)
+            app.router.add_post("/upload", self._handle_upload)
+            app.router.add_get("/image", self._handle_get_image)
             app.router.add_get("/api/config", self._handle_get_config)
             app.router.add_post("/api/config", self._handle_post_config)
             # 会话侧边栏：列举 / 读取 / 删除（仅网页会话 web:*）
@@ -160,6 +166,72 @@ class WebChannel(Channel):
             "note": "新会话将使用更新后的配置；已在进行的会话保持原状。修改 web_host/web_port 需重启本实例生效。",
         })
 
+    @staticmethod
+    def _valid_key(key: str) -> bool:
+        """会话标识合法性校验：防止 key 携带路径分隔符/..，拼出穿越路径。"""
+        return bool(key) and ":" in key and "/" not in key and "\\" not in key and ".." not in key
+
+    # —— 图片上传（供网页发送图片，后端落盘并返回 image_id）——
+    async def _handle_upload(self, request) -> web.Response:
+        if self.image_store is None:
+            return web.json_response(
+                {"ok": False, "error": "图片存储未就绪"}, status=500
+            )
+        # key 为完整会话标识（含 web: 前缀），用于定位图片落盘目录
+        key = request.query.get("key", "")
+        if not self._valid_key(key):
+            return web.json_response(
+                {"ok": False, "error": "缺少合法的 key 参数（应为完整会话标识）"}, status=400
+            )
+        try:
+            data = await request.post()
+        except Exception as exc:  # noqa: BLE001
+            return web.json_response({"ok": False, "error": f"解析上传失败：{exc}"}, status=400)
+        f = data.get("file")
+        if f is None:
+            return web.json_response({"ok": False, "error": "未收到文件字段 file"}, status=400)
+        try:
+            raw = f.file.read()
+        except Exception as exc:  # noqa: BLE001
+            return web.json_response({"ok": False, "error": f"读取文件失败：{exc}"}, status=500)
+        if not raw:
+            return web.json_response({"ok": False, "error": "文件为空"}, status=400)
+        filename = getattr(f, "filename", "") or "image.png"
+        ext = os.path.splitext(filename)[1].lstrip(".") or "png"
+        mime = getattr(f, "content_type", None) or "image/png"
+        try:
+            ref = self.image_store.save(key, raw, ext, mime)
+        except Exception as exc:  # noqa: BLE001
+            return web.json_response({"ok": False, "error": f"保存失败：{exc}"}, status=500)
+        return web.json_response(
+            {"ok": True, "image_id": ref.id, "mime": ref.mime}, headers=_NO_CACHE
+        )
+
+    # —— 图片回显（前端缩略图 / 历史回放用）——
+    async def _handle_get_image(self, request) -> web.Response:
+        if self.image_store is None:
+            return web.Response(status=404)
+        key = request.query.get("key", "")
+        iid = request.query.get("id", "")
+        # 仅允许访问本渠道会话的图片；key/id 均校验，防路径穿越
+        if not key.startswith(f"{self.name}:") or not self._valid_key(key):
+            return web.Response(status=400)
+        if not iid or not iid.isalnum():
+            return web.Response(status=400)
+        ref = self.image_store.resolve(key, iid)
+        if ref is None or not os.path.exists(ref.path):
+            return web.Response(status=404)
+        try:
+            with open(ref.path, "rb") as f:
+                data = f.read()
+        except Exception:  # noqa: BLE001
+            return web.Response(status=500)
+        return web.Response(
+            body=data,
+            content_type=ref.mime or "application/octet-stream",
+            headers=_NO_CACHE,
+        )
+
     # —— 会话侧边栏 API（仅本渠道会话，前缀 web:）——
     async def _handle_list_sessions(self, request) -> web.Response:
         if self.session_manager is None:
@@ -194,6 +266,8 @@ class WebChannel(Channel):
                 self._sessions[cid]["current_key"] = new_key
         if self.session_manager is not None:
             self.session_manager.clear(key)
+        if self.image_store is not None:
+            self.image_store.clear(key)
         return web.json_response({"ok": True})
 
     # —— WebSocket 聊天 ——
@@ -210,6 +284,15 @@ class WebChannel(Channel):
             pass
         with self._lock:
             self._conns[conn_id] = ws
+        # 把本连接的初始会话标识推给前端（上传图片时需要携带完整 key）。
+        # 之后 new/open 都会再发 session_changed，前端始终持有最新 key。
+        try:
+            st0 = self._session_state(conn_id)
+            await self._ws_send_json(
+                ws, {"type": "session_changed", "key": f"{self.name}:{st0['current_key']}"}
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
         try:
             async for msg in ws:
@@ -222,10 +305,12 @@ class WebChannel(Channel):
                     continue
 
                 try:
+                    # 每条消息独立解析：obj 必须在循环体内重置，
+                    # 否则纯文本消息会误用上一条 JSON 消息的残留值
+                    obj = None
                     # 侧边栏控制消息：{"ctl":true,"type":"new"|"open","key":...}
                     # 仅当显式带 ctl 标记才走控制分支，避免误伤用户正常聊天文本。
                     if text.startswith("{"):
-                        obj = None
                         try:
                             obj = json.loads(text)
                         except Exception:
@@ -250,6 +335,30 @@ class WebChannel(Channel):
                                     )
                             # 控制消息不进入聊天流程
                             continue
+                    # 聊天用 JSON（不带 ctl 标记）：{"text":..., "images":[id,...]}
+                    # 用于网页发送带图片的消息；图片 id 来自 /upload 的返回。
+                    if obj and ("text" in obj or "images" in obj):
+                        st = self._session_state(conn_id)
+                        text2 = obj.get("text", "") or ""
+                        images = []
+                        skey = f"{self.name}:{st['current_key']}"
+                        for iid in (obj.get("images") or []):
+                            if self.image_store is not None:
+                                ref = self.image_store.resolve(skey, iid)
+                                if ref is not None:
+                                    images.append(ref)
+                        inbound = InboundMessage(
+                            channel=self.name,
+                            sender_id=st["current_key"],
+                            chat_id=conn_id,
+                            content=text2,
+                            images=images or None,
+                            raw={"conn_id": conn_id},
+                        )
+                        asyncio.run_coroutine_threadsafe(
+                            self.bus.publish_inbound(inbound), self._loop
+                        )
+                        continue
 
                     # 内置命令：命中则直接回复，不经过 Agent
                     if text.startswith("/"):

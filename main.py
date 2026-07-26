@@ -36,6 +36,9 @@ from agent.memory import MemoryConsolidation
 from agent.daily import DailyMemory, summarize_messages_to_daily
 from agent.search import MemorySearcher
 from agent.tools.search import MemorySearchTool
+from agent.tools.vision import AskImageTool
+from agent.tools.imagegen import GenerateImageTool
+from agent.imagestore import ImageStore
 
 from bus.queue import MessageBus
 from gateway import Gateway
@@ -117,6 +120,10 @@ def build_shared() -> dict:
     sessions_dir = os.path.join(WORKSPACE, "workspace", "sessions")
     session_manager = SessionManager(sessions_dir)
 
+    # 7.2) 图片存储：与 sessions 同目录，按会话落盘到 <safe_key>_images/，
+    #      现有 .jsonl 结构零改动；供 ask_image 工具与多模态直传使用。
+    image_store = ImageStore(sessions_dir)
+
     # 7.5) 记忆检索：SQLite + LIKE 索引 USER/MEMORY/daily/sessions，
     #      启动时全量重建。注册 memory_search 工具（唯一新增工具——检索是
     #      read_file 做不到的真新能力，符合大道至简的例外）。
@@ -127,6 +134,16 @@ def build_shared() -> dict:
     indexed = searcher.rebuild_all()
     print(f"已索引记忆与会话文档：{indexed} 条")
     tools.register(MemorySearchTool(searcher))
+
+    # 视觉工具 ask_image：基础模型为纯文本时注册（无论 multimodal_model 是否配置；
+    # 未配置时工具会返回"看不见图片"，由基础模型继续回答文字部分）。基础模型本身
+    # 多模态时不注册，图片直接以多模态 content 透传基础模型。
+    if not config.base_model_multimodal:
+        tools.register(AskImageTool(image_store, config))
+
+    # 生图工具 generate_image：始终注册（与 base_model_multimodal 无关）。
+    # 未配置 image_gen_model 时仍注册，工具内部返回友好提示，由主模型用文字继续。
+    tools.register(GenerateImageTool(image_store, config))
 
     # 8) 每日记忆：按天把重要事件追加到 workspace/memory/daily/YYYY-MM-DD.md
     #    供 /clear 与压缩前两个触发点写入；不暴露为工具。
@@ -146,6 +163,7 @@ def build_shared() -> dict:
         "tools": tools,
         "context": context,
         "session_manager": session_manager,
+        "image_store": image_store,
         "memory": memory,
         "daily_memory": daily_memory,
         "searcher": searcher,
@@ -181,6 +199,8 @@ def make_agent_factory(shared: dict, registry: dict) -> callable:
             max_iterations=cfg.max_iterations,
             memory=shared["memory"],
             turn_timeout=cfg.turn_timeout_sec,
+            image_store=shared["image_store"],
+            base_model_multimodal=cfg.base_model_multimodal,
         )
         registry[session_key] = agent
         return agent
@@ -246,6 +266,16 @@ async def amain() -> None:
                     ))
                 except Exception:  # noqa: BLE001 - daily 失败不影响 clear
                     pass
+        else:
+            # Agent 尚未创建（如进程重启后直接 /clear）：直接清落盘的会话历史，
+            # 否则 jsonl 会残留、下次创建 Agent 时旧历史又被读回来
+            shared["session_manager"].clear(session_key)
+        # 清除该会话落盘的图片目录，避免无限堆积。
+        # 注意必须放在 agent 判断之外：无论 Agent 是否已创建都要清图，
+        # 否则重启后直接 /clear 会漏掉图片目录。
+        image_store = shared.get("image_store")
+        if image_store is not None:
+            image_store.clear(session_key)
 
     cli_channel._clear_callback = clear_callback
 
@@ -278,6 +308,7 @@ async def amain() -> None:
         web_channel = WebChannel(
             "web", bus, cfg.web_host, cfg.web_port, cfg, CONFIG_PATH,
             session_manager=shared["session_manager"],  # 侧边栏读写历史会话
+            image_store=shared["image_store"],            # 图片上传落盘
         )
         web_channel._clear_callback = clear_callback  # 复用同一清空回调
         channels.append(web_channel)

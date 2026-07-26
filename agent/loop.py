@@ -27,7 +27,9 @@ B. 工具调用防爆（循环熔断）
 """
 
 import asyncio
+import base64
 import json
+import os
 import time
 from typing import List, Optional
 
@@ -55,6 +57,8 @@ class AgentLoop:
         max_iterations: int = 32,
         memory: Optional[MemoryConsolidation] = None,
         turn_timeout: int = 600,
+        image_store=None,
+        base_model_multimodal: bool = False,
     ):
         self.provider = provider
         self.tools = tools
@@ -68,6 +72,10 @@ class AgentLoop:
         self.turn_timeout = turn_timeout
         # 会话压缩器：为 None 时不启用压缩（保持向后兼容）
         self.memory = memory
+        # 图片存储：基础模型为多模态、需要把历史图片还原成多模态 content 时用
+        self.image_store = image_store
+        # 基础模型是否自带视觉：true→图片直传；false→抽走图片、用 ask_image 工具
+        self.base_model_multimodal = base_model_multimodal
 
         # 工具调用签名滑动窗口（防爆用），存 "name:args_json"
         self._tool_call_history: List[str] = []
@@ -118,11 +126,97 @@ class AgentLoop:
         if tail:
             print("\033[2;32m  " + tail + "\033[0m")
 
-    async def run(self, user_message: str, stream_sink=None) -> str:
+    # —— 图片消息装配（多模态直传 vs 占位符，由 base_model_multimodal 决定）——
+    @staticmethod
+    def _img_id(img) -> Optional[str]:
+        """从 ImageRef 或历史元数据 dict 中取出 image_id。"""
+        if hasattr(img, "id"):
+            return img.id
+        if isinstance(img, dict):
+            return img.get("id")
+        return None
+
+    @staticmethod
+    def _img_mime(img) -> str:
+        """从 ImageRef 或历史元数据 dict 中取出 mime。"""
+        if hasattr(img, "mime"):
+            return img.mime
+        if isinstance(img, dict):
+            return img.get("mime", "image/png")
+        return "image/png"
+
+    def _img_path_mime(self, img, session_key):
+        """解析出图片落盘路径与 mime（用于多模态直传）。
+
+        当前消息的 ImageRef 自带 path；历史元数据 dict 需经 ImageStore 按
+        session_key + id 找回。找不到返回 None。
+        """
+        if hasattr(img, "path"):
+            return img.path, self._img_mime(img)
+        if isinstance(img, dict) and self.image_store is not None and session_key:
+            ref = self.image_store.resolve(session_key, img.get("id"))
+            if ref is not None:
+                return ref.path, ref.mime
+        return None
+
+    def _user_content(self, text: str, images, base_mm: bool):
+        """把一条用户消息（文本 + 可选图片）装配成发给模型的 content。
+
+        - base_mm=True：返回多模态 list（text + 每张图的 image_url）。
+        - base_mm=False：返回 str，正文后追加占位符（含 image_id），引导模型
+          按需调用 ask_image 工具。
+        """
+        if base_mm:
+            content = [{"type": "text", "text": text}]
+            for img in (images or []):
+                pm = self._img_path_mime(img, self.session_key)
+                if pm and os.path.exists(pm[0]):
+                    path, mime = pm
+                    try:
+                        with open(path, "rb") as f:
+                            b64 = base64.b64encode(f.read()).decode("ascii")
+                        content.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime};base64,{b64}"},
+                        })
+                    except Exception:  # noqa: BLE001 - 读图失败则该图跳过
+                        continue
+            return content
+        # 纯文本基础模型：抽走图片，正文加占位符
+        ids = [self._img_id(r) for r in (images or []) if self._img_id(r)]
+        if ids:
+            return (
+                text
+                + "\n[用户附 "
+                + str(len(ids))
+                + " 张图片，image_id："
+                + ", ".join(ids)
+                + "。如需理解或回答关于图片内容的问题，请调用 ask_image 工具，"
+                "传入对应 image_id 与你的（可含上下文的）问题。]"
+            )
+        return text
+
+    def _history_item_to_api(self, msg: dict, base_mm: bool) -> dict:
+        """把一条历史消息清洗成可发给模型的格式。
+
+        - 带 images 元数据的 user 消息：按 base_mm 还原成多模态 content 或占位符；
+        - 其它消息：剥掉可能残留的 images 字段，其余原样返回。
+        """
+        if msg.get("role") == "user" and msg.get("images"):
+            text = msg.get("content") or ""
+            new_content = self._user_content(text, msg["images"], base_mm)
+            return {"role": "user", "content": new_content}
+        # 剥掉渲染专用元数据（OpenAI 不认），避免回传 API 报 400；
+        # generated_images 是 generate_image 落盘图片的历史回放标记，仅前端用。
+        return {k: v for k, v in msg.items() if k not in ("images", "generated_images")}
+
+    async def run(self, user_message: str, images=None, stream_sink=None) -> str:
         """处理一轮用户消息，返回模型最终文本回复。
 
         参数：
             user_message: 本轮用户输入。
+            images: 可选，随消息附带的图片引用列表（``List[ImageRef]``）。为 None
+                表示纯文本消息。
             stream_sink: 可选，一个 ``async def sink(event: dict)`` 回调。当提供时，
                 Agent 在推理/执行过程中的「逐步事件」（思考、工具调用、工具结果、
                 逐字生成的最终回答）会通过它实时推送，供支持流式展示的渠道
@@ -130,10 +224,18 @@ class AgentLoop:
 
         事件约定见 ``bus.queue.StreamEvent`` 的文档。
         """
+        base_mm = self.base_model_multimodal
+
         # 1. 构建初始 messages（注入跨轮历史 + 当前输入）
+        #    当前消息与历史消息都按 base_mm 分支装配：
+        #    - 多模态基础模型：图片以多模态 content 直传；
+        #    - 纯文本基础模型：抽走图片、正文追加占位符（含 image_id），
+        #      由模型按需调用 ask_image 工具。
+        current_content = self._user_content(user_message, images, base_mm)
+        history_clean = [self._history_item_to_api(m, base_mm) for m in self._session_history]
         messages = self.context.build_messages(
-            history=self._session_history,
-            current_message=user_message,
+            history=history_clean,
+            current_message=current_content,
         )
         # 1.5 会话压缩：当估算 token 超预算时，把中间旧消息压成一条摘要。
         #     MemoryConsolidation 仅在 messages 超出 token_budget 才触发压缩，
@@ -149,8 +251,14 @@ class AgentLoop:
                     f"{len(compressed)} 条（节省 token 预算）\033[0m"
                 )
             messages = compressed
-        # 持久化当前用户消息
-        self._persist({"role": "user", "content": user_message})
+        # 持久化当前用户消息（原文 + 图片元数据；图片字节由 ImageStore 落盘，
+        # 此处仅记 id/mime，发送时再按 base_mm 分支还原成多模态 content 或占位符）
+        user_record = {"role": "user", "content": user_message}
+        if images:
+            user_record["images"] = [
+                {"id": self._img_id(r), "mime": self._img_mime(r)} for r in images
+            ]
+        self._persist(user_record)
 
         # 是否走流式路径：仅当挂载了 sink 且 Provider 支持 chat_stream 时。
         # 否则走原有的 chat() 离散路径（有 sink 时也 emit 离散事件，保证网页可见）。
@@ -240,10 +348,9 @@ class AgentLoop:
                 if response.tool_calls[0].reasoning_content:
                     assistant_msg["reasoning_content"] = response.tool_calls[0].reasoning_content
                 messages.append(assistant_msg)
-                self._persist(assistant_msg)
-
-                # 执行工具（含熔断/防爆/事件推送），返回非 None 表示已终止本轮
-                stop = await self._execute_tools(response, messages, stream_sink)
+                # 持久化挪到执行工具之后（generate_image 需要把生成的 image_id 写回
+                # assistant_msg 元数据，供历史回放渲染图片）；见 _execute_tools 末尾。
+                stop = await self._execute_tools(response, messages, stream_sink, assistant_msg)
                 if stop is not None:
                     # 流式路径必须补 done，否则网页端卡在「思考中」
                     if stream_sink is not None:
@@ -336,13 +443,22 @@ class AgentLoop:
             await stream_sink({"type": "token", "content": response.content})
         return response.content or ""
 
-    async def _execute_tools(self, response, messages: list, stream_sink) -> Optional[str]:
+    async def _execute_tools(self, response, messages: list, stream_sink,
+                              assistant_msg=None) -> Optional[str]:
         """执行本轮所有工具调用，并把过程推给 sink（若提供）。
 
         返回：
             - ``None``：正常执行完毕，调用方继续下一轮（把结果喂回模型）。
             - 字符串：已终止本轮（熔断），该字符串即为返回给用户的终止说明。
+
+        参数：
+            assistant_msg: 本轮的 assistant(tool_calls) 消息。持久化由本方法负责
+                （而非调用方提前持久化），以便把 generate_image 生成的 image_id
+                写回元数据，供历史回放渲染图片。
         """
+        # 收集本轮 generate_image 生成的 image_id，执行完后写回 assistant_msg 元数据
+        gen_ids: list = []
+
         for tc in response.tool_calls:
             sig_args = json.dumps(tc.arguments, ensure_ascii=False)
             verdict = self._check_tool_loop(tc.name, sig_args)
@@ -357,6 +473,8 @@ class AgentLoop:
                     }
                     messages.append(close_msg)
                     self._persist(close_msg)
+                if assistant_msg is not None:
+                    self._persist(assistant_msg)
                 self._save_to_history(messages)
                 return verdict
 
@@ -375,10 +493,29 @@ class AgentLoop:
             self._print_tool_call(tc.name, sig_args)
             if stream_sink is not None:
                 await stream_sink({"type": "tool_call", "name": tc.name, "args": sig_args})
-            result = await self.tools.execute(tc.name, tc.arguments)
+            # ask_image / generate_image 都是跨会话共享单例，需注入当前 session_key
+            # 才能按会话定位图片落盘路径；其它工具忽略该参数。
+            exec_args = dict(tc.arguments)
+            if tc.name in ("ask_image", "generate_image"):
+                exec_args["session_key"] = self.session_key
+            # generate_image 还需挂载 stream_sink（实时把图片推给网页端内联显示）
+            # 与一个收集列表（把生成的 image_id 回写给主循环，用于历史回放持久化）；
+            # 非网页渠道 stream_sink 为 None，工具退化为"仅落盘 + 文本结果"。
+            if tc.name == "generate_image":
+                exec_args["stream_sink"] = stream_sink
+                exec_args["_generated_ids"] = gen_ids
+            # 记录工具执行耗时（毫秒），随 tool_result 事件推给网页端展示
+            t_start = time.monotonic()
+            result = await self.tools.execute(tc.name, exec_args)
+            duration_ms = int((time.monotonic() - t_start) * 1000)
             self._print_tool_result(tc.name, result)
             if stream_sink is not None:
-                await stream_sink({"type": "tool_result", "name": tc.name, "content": result})
+                await stream_sink({
+                    "type": "tool_result",
+                    "name": tc.name,
+                    "content": result,
+                    "duration_ms": duration_ms,
+                })
             tool_msg = {
                 "role": "tool",
                 "tool_call_id": tc.id,
@@ -386,6 +523,17 @@ class AgentLoop:
             }
             messages.append(tool_msg)
             self._persist(tool_msg)
+
+        # 正常执行完毕：把 assistant_msg 落盘；若本轮生成了图片，附上 image_id 元数据
+        if assistant_msg is not None:
+            if gen_ids:
+                record = dict(assistant_msg)
+                record["generated_images"] = gen_ids
+                self._persist(record)
+                # 内存副本保持干净，避免下一轮把 generated_images 回传给 API 触发 400
+                assistant_msg.pop("generated_images", None)
+            else:
+                self._persist(assistant_msg)
         return None
 
     def _check_tool_loop(self, tool_name: str, tool_args_json: str) -> Optional[str]:

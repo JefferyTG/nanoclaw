@@ -35,6 +35,13 @@ _CONFIG_FIELDS = (
     "web_port",
     "turn_timeout_sec",
     "mcp_servers",
+    # 多模态（视觉）模型：基础模型无视觉能力时，由 ask_image 工具把图片转交它理解
+    "multimodal_model",
+    # 基础模型是否本身即多模态（自带视觉）。true 时图片直传基础模型、不注册 ask_image
+    "base_model_multimodal",
+    # 生图模型：由 generate_image 工具调用，具体服务与模型由用户配置（见 image_gen_model）。
+    # 三者皆空视为未配置；api_key 可走环境变量 IMAGE_GEN_API_KEY 覆盖。
+    "image_gen_model",
 )
 
 
@@ -67,6 +74,37 @@ class NanoClawConfig:
     web_port: int = 0                # 网页渠道端口；0 表示不启用网页渠道
     turn_timeout_sec: int = 600      # 单轮对话墙钟超时（秒）；超时强制终止，防卡死
     mcp_servers: dict = field(default_factory=dict)  # MCP Server 配置：{server_name: {command, args, env?, cwd?}}
+    # 多模态（视觉）模型配置：基础模型为纯文本时，图片由 ask_image 工具转交该模型理解。
+    # 三者皆空视为未配置；api_key 也可走环境变量 MULTIMODAL_API_KEY 覆盖。
+    multimodal_model: dict = field(
+        default_factory=lambda: {"api_key": "", "base_url": "", "model": ""}
+    )
+    # 基础模型本身是否即多模态（自带视觉）。true→图片直传基础模型、不注册 ask_image；
+    # false→纯文本基础模型，需要 ask_image 工具（无论 multimodal_model 是否配置）。
+    base_model_multimodal: bool = False
+    # 生图模型配置：由 generate_image 工具调用。三者（api_key/base_url/model）皆空
+    # 视为未配置；具体服务地址与模型名完全由用户填写，代码不预填、不绑定任何服务商。
+    # api_key 也可走环境变量 IMAGE_GEN_API_KEY 覆盖。
+    image_gen_model: dict = field(
+        default_factory=lambda: {
+            "api_key": "",
+            "base_url": "",
+            "model": "",
+            "timeout_sec": 120,
+            # 图生图（img2img）专用配置；留空则回落到上面通用的 model / 默认装配。
+            # 源图编码、键名、位置、强度、标签均由服务商约定，全部可配、不写死任何家。
+            "img2img_model": "",
+            "img2img": {
+                "image_field": "image",    # 源图塞进请求体的键名
+                "image_location": "body",  # "body"=顶层 / "extra_body"=嵌套
+                "encoding": "auto",       # "auto"=按源图自动(本地图base64内联/公网链接url直发) / "base64" / "url"
+                "as_array": True,          # image 始终以数组形式传（支持多图，Agnes 即如此）
+                "strength_field": "",      # 强度键名（空=不传）
+                "strength": 0.0,           # 强度默认值（需 strength_field 非空才生效）
+                "tags": [],                # 服务商标签列表，如 ["img2img"]
+            },
+        }
+    )
 
 
 def load_config(config_path: str = "config.json") -> NanoClawConfig:
@@ -106,6 +144,18 @@ def load_config(config_path: str = "config.json") -> NanoClawConfig:
     env_fs_secret = os.environ.get("FEISHU_APP_SECRET")
     if env_fs_secret:
         cfg.feishu_app_secret = env_fs_secret
+
+    # 多模态（视觉）模型 API Key 走独立环境变量覆盖，避免与主模型 key 混淆
+    env_mm_key = os.environ.get("MULTIMODAL_API_KEY")
+    if env_mm_key:
+        cfg.multimodal_model = dict(cfg.multimodal_model)
+        cfg.multimodal_model["api_key"] = env_mm_key
+
+    # 生图模型 API Key 走环境变量覆盖（IMAGE_GEN_API_KEY 命中即覆盖）
+    env_img_key = os.environ.get("IMAGE_GEN_API_KEY")
+    if env_img_key:
+        cfg.image_gen_model = dict(cfg.image_gen_model)
+        cfg.image_gen_model["api_key"] = env_img_key
 
     return cfg
 

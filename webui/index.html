@@ -45,6 +45,7 @@
   .tool-card.expanded .tc-head::before { content:"▾"; }
   .tool-card .tc-name { font-weight:600; }
   .tool-card .tc-status { margin-left:auto; color:var(--muted); white-space:nowrap; }
+  .tool-card .tc-dur { color:#6fa8c7; white-space:nowrap; }     /* 工具执行耗时，与思考面板 .sum-dur 同思路 */
   .tool-card .tc-args { display:none; padding:0 10px 6px; color:#aeb6c4; white-space:pre-wrap; word-break:break-word;
                         font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; }
   .tool-card .tc-result { display:none; padding:6px 10px; color:#9fe6c0; white-space:pre-wrap; word-break:break-word;
@@ -59,10 +60,28 @@
   .answer.empty::after { content:"生成中…"; color:var(--muted); }
 
   #bar { display:flex; gap:8px; padding:12px 16px; border-top:1px solid var(--line); }
-  #bar input { flex:1; background:var(--panel); border:1px solid var(--line); color:var(--txt);
+  #bar input[type=text] { flex:1; background:var(--panel); border:1px solid var(--line); color:var(--txt);
                border-radius:10px; padding:10px 12px; font-size:14px; outline:none; }
-  #bar input:focus { border-color:var(--accent); }
+  #bar input[type=text]:focus { border-color:var(--accent); }
   #bar button { background:var(--accent); color:#fff; border:none; border-radius:10px; padding:0 18px; font-size:14px; cursor:pointer; }
+  #bar #attachBtn { background:var(--panel); color:var(--txt); border:1px solid var(--line); padding:0 12px; font-size:16px; }
+  #bar #attachBtn:hover { border-color:var(--accent); }
+
+  /* —— 待发送图片预览条（粘贴/选择后、发送前）—— */
+  #attach { display:none; gap:8px; padding:8px 16px 0; flex-wrap:wrap; }
+  #attach.show { display:flex; }
+  .att-item { position:relative; width:56px; height:56px; border:1px solid var(--line); border-radius:8px; overflow:hidden; background:var(--panel); }
+  .att-item img { width:100%; height:100%; object-fit:cover; display:block; }
+  .att-item .att-del { position:absolute; top:0; right:0; background:rgba(0,0,0,.55); color:#fff; border:none;
+                       cursor:pointer; font-size:11px; line-height:1; padding:2px 5px; border-radius:0 0 0 6px; }
+  .att-item .att-del:hover { background:rgba(255,107,107,.85); }
+
+  /* —— 消息里的图片条（用户气泡下方 / 历史回放）—— */
+  .img-strip { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; justify-content:flex-end; }
+  .img-strip img { max-width:180px; max-height:180px; border-radius:8px; border:1px solid var(--line); display:block; }
+  /* 机器人回合内联生成的图片：左对齐，放在「工具活动」与「正式回答」之间 */
+  .bot-images { justify-content:flex-start; margin-top:8px; }
+  .bot-images img { max-width:360px; max-height:360px; }
   #config { display:none; padding:16px; border-top:1px solid var(--line); overflow-y:auto; max-height:55vh; }
   #config.show { display:block; }
   #config h2 { font-size:13px; color:var(--muted); margin:14px 0 6px; font-weight:500; }
@@ -146,8 +165,11 @@
   <div id="cfgMsg"></div>
 </div>
 
+    <div id="attach"></div>
     <div id="bar">
-      <input id="input" placeholder="输入消息，回车发送；/new 开新会话，/sessions 列表，/switch &lt;n&gt; 切换，/clear 清当前" autocomplete="off" />
+      <button id="attachBtn" title="上传图片（也可直接粘贴）">🖼</button>
+      <input id="fileInput" type="file" accept="image/*" multiple style="display:none" />
+      <input id="input" type="text" placeholder="输入消息，回车发送；可粘贴/上传图片；/new 开新会话，/clear 清当前" autocomplete="off" />
       <button id="sendBtn">发送</button>
     </div>
   </div><!-- /#main -->
@@ -163,10 +185,21 @@
   var cfgMsg = document.getElementById('cfgMsg');
   var FIELDS = ['api_key','base_url','model','subagent_model','workspace','max_iterations','turn_timeout_sec','identity_file','feishu_app_id','feishu_app_secret','web_host','web_port'];
 
-  function addUser(text) {
+  function addUser(text, imgUrls) {
     var m = document.createElement('div'); m.className = 'msg user';
-    var b = document.createElement('div'); b.className = 'bubble'; b.textContent = text;
-    m.appendChild(b); chat.appendChild(m); chat.scrollTop = chat.scrollHeight;
+    if (text) {
+      var b = document.createElement('div'); b.className = 'bubble'; b.textContent = text;
+      m.appendChild(b);
+    }
+    if (imgUrls && imgUrls.length) {
+      var strip = document.createElement('div'); strip.className = 'img-strip';
+      imgUrls.forEach(function (u) {
+        var im = document.createElement('img'); im.src = u; im.loading = 'lazy';
+        strip.appendChild(im);
+      });
+      m.appendChild(strip);
+    }
+    chat.appendChild(m); chat.scrollTop = chat.scrollHeight;
   }
   function addSys(text) {
     var m = document.createElement('div'); m.className = 'msg sys'; m.textContent = text;
@@ -187,19 +220,23 @@
 
     var activity = document.createElement('div'); activity.className = 'activity';
 
+    // 机器人回合内联图片条（生图工具 generate_image 的 image 事件会往这里塞 <img>）
+    var botImages = document.createElement('div'); botImages.className = 'img-strip bot-images';
+
     var ansWrap = document.createElement('div'); ansWrap.className = 'answer-wrap';
     ansWrap.innerHTML = '<div class="answer-label">正式回答</div><div class="answer empty"></div>';
     var answer = ansWrap.querySelector('.answer');
 
     root.appendChild(think);
     root.appendChild(activity);
+    root.appendChild(botImages);
     root.appendChild(ansWrap);
     chat.appendChild(root); chat.scrollTop = chat.scrollHeight;
     return { root: root, think: think,
              thinkBody: think.querySelector('.think-body'),
              thinkPreview: think.querySelector('.sum-preview'),
              thinkDur: think.querySelector('.sum-dur'),
-             activity: activity, answer: answer,
+             activity: activity, botImages: botImages, answer: answer,
              answerStarted: false, lastTool: null,
              thinkStart: performance.now(), thinkEnded: false };
   }
@@ -250,21 +287,44 @@
       // 工具卡片默认折叠：标题只显示「名称 + 状态」，点开才看入参/出参
       var card = document.createElement('div'); card.className = 'tool-card';
       card.innerHTML = '<div class="tc-head"><span class="tc-name"></span>'
-                     + '<span class="tc-status">⏳ 执行中</span></div>'
+                     + '<span class="tc-status">⏳ 执行中</span>'
+                     + '<span class="tc-dur"></span></div>'
                      + '<div class="tc-args"></div><div class="tc-result"></div>';
       card.querySelector('.tc-name').textContent = '🔧 ' + (ev.name || '');
       card.querySelector('.tc-args').textContent = (ev.args != null ? ev.args : '');
       cur.activity.appendChild(card); cur.lastTool = card;
+      // 走动的计时：执行中实时刷新耗时，完成后由 tool_result 停表并结算
+      card._start = performance.now();
+      card._timer = setInterval(function () {
+        card.querySelector('.tc-dur').textContent = fmtDur(performance.now() - card._start);
+      }, 100);
       chat.scrollTop = chat.scrollHeight;
     } else if (t === 'tool_result') {
       var card2 = cur.lastTool;
       if (card2) {
+        if (card2._timer) { clearInterval(card2._timer); card2._timer = null; }
         card2.classList.add('has-result');
         card2.querySelector('.tc-result').textContent = (ev.content || '');
+        // 优先用后端精确时长；兜底用前端本地计时（异常断流未回传 duration_ms 时也能显示）
+        var durMs = (typeof ev.duration_ms === 'number') ? ev.duration_ms
+                  : (typeof card2._start === 'number' ? (performance.now() - card2._start) : null);
+        card2.querySelector('.tc-dur').textContent = (durMs != null) ? fmtDur(durMs) : '';
         card2.querySelector('.tc-status').textContent = '✅ 完成';
       }
       chat.scrollTop = chat.scrollHeight;
+    } else if (t === 'image') {
+      // 生图工具 generate_image 内联图片：把 <img> 塞进当前回合的图片条
+      var iu = ev.url || ('/image?key=' + encodeURIComponent(currentKey)
+                + '&id=' + encodeURIComponent(ev.id || ''));
+      var im = document.createElement('img');
+      im.src = iu; im.loading = 'lazy';
+      cur.botImages.appendChild(im);
+      chat.scrollTop = chat.scrollHeight;
     } else if (t === 'done') {
+      // 兜底：清理任何残留的工具计时器（如某工具异常未回传 tool_result）
+      if (cur.activity) cur.activity.querySelectorAll('.tool-card').forEach(function (tc) {
+        if (tc._timer) { clearInterval(tc._timer); tc._timer = null; }
+      });
       cur.think.classList.remove('live');
       finishThink(cur);   // 兜底：无论是否出 token，回合结束都记录思考时长
       if (!cur.answerStarted && ev.content) { cur.answer.classList.remove('empty'); cur.answer.textContent = ev.content; }
@@ -336,13 +396,106 @@
   }
   connectWS();
 
+  // —— 图片附件：粘贴或选择后先本地暂存（File + ObjectURL 预览），发送时才上传 ——
+  // 发送时才上传的原因：上传接口按「当前会话 key」落盘，若附图后又切换会话，
+  // 提前上传的图会落错目录；发送瞬间 currentKey 一定是本条消息所属会话。
+  var attachBar = document.getElementById('attach');
+  var fileInput = document.getElementById('fileInput');
+  var pendingImages = [];   // [{file, url}]
+
+  function renderAttach() {
+    attachBar.innerHTML = '';
+    attachBar.className = pendingImages.length ? 'show' : '';
+    pendingImages.forEach(function (it, idx) {
+      var d = document.createElement('div'); d.className = 'att-item';
+      var im = document.createElement('img'); im.src = it.url; d.appendChild(im);
+      var del = document.createElement('button'); del.className = 'att-del'; del.textContent = '✕';
+      del.title = '移除这张图';
+      del.onclick = function () {
+        URL.revokeObjectURL(it.url);
+        pendingImages.splice(idx, 1);
+        renderAttach();
+      };
+      d.appendChild(del);
+      attachBar.appendChild(d);
+    });
+  }
+  function addPendingFile(file) {
+    if (!file || file.type.indexOf('image/') !== 0) return;
+    pendingImages.push({ file: file, url: URL.createObjectURL(file) });
+    renderAttach();
+  }
+  // 入口 1：按钮选择文件（可多选）
+  document.getElementById('attachBtn').onclick = function () { fileInput.click(); };
+  fileInput.addEventListener('change', function () {
+    Array.prototype.forEach.call(fileInput.files || [], addPendingFile);
+    fileInput.value = '';   // 允许再次选择同一文件
+  });
+  // 入口 2：在输入框（或页面任意处）粘贴剪贴板图片
+  document.addEventListener('paste', function (e) {
+    var items = (e.clipboardData && e.clipboardData.items) || [];
+    var got = false;
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].kind === 'file' && items[i].type.indexOf('image/') === 0) {
+        var f = items[i].getAsFile();
+        if (f) { addPendingFile(f); got = true; }
+      }
+    }
+    if (got) e.preventDefault();   // 有图片时不把二进制粘进输入框
+  });
+  // 入口 3：拖拽图片到聊天区
+  chat.addEventListener('dragover', function (e) { e.preventDefault(); });
+  chat.addEventListener('drop', function (e) {
+    e.preventDefault();
+    Array.prototype.forEach.call((e.dataTransfer && e.dataTransfer.files) || [], addPendingFile);
+  });
+
+  function uploadOne(file, key) {
+    var fd = new FormData();
+    fd.append('file', file, file.name || 'pasted.png');
+    return fetch('/upload?key=' + encodeURIComponent(key), { method: 'POST', body: fd })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d || !d.ok) throw new Error((d && d.error) || '上传失败');
+        return d.image_id;
+      });
+  }
+
+  var sending = false;   // 上传期间防重复发送
   function send() {
+    if (sending) return;
     var text = input.value.trim();
-    if (!text || ws.readyState !== WebSocket.OPEN) return;
-    addUser(text);
-    cur = newTurn();          // 立即开回合，先显示「思考中…」
-    ws.send(text);
-    input.value = '';
+    var hasImgs = pendingImages.length > 0;
+    if ((!text && !hasImgs) || ws.readyState !== WebSocket.OPEN) return;
+
+    if (!hasImgs) {          // 纯文本：维持原路径（命令等均不受影响）
+      addUser(text);
+      cur = newTurn();
+      ws.send(text);
+      input.value = '';
+      return;
+    }
+    // 带图片：需要当前会话 key；连接建立/切换会话时后端会推 session_changed
+    if (!currentKey) { addSys('会话尚未就绪，请稍候再发送图片'); return; }
+    sending = true;
+    var imgs = pendingImages.slice();
+    var key = currentKey;
+    statusEl.textContent = '上传图片中…';
+    Promise.all(imgs.map(function (it) { return uploadOne(it.file, key); }))
+      .then(function (ids) {
+        addUser(text, imgs.map(function (it) { return it.url; }));   // 本地预览 URL 直接回显
+        cur = newTurn();
+        ws.send(JSON.stringify({ text: text, images: ids }));
+        input.value = '';
+        pendingImages = [];
+        renderAttach();
+        statusEl.textContent = '已连接';
+      })
+      .catch(function (e) {
+        addSys('图片上传失败：' + (e && e.message || e) + '，本条消息未发送');
+        statusEl.textContent = '已连接';
+      })
+      .finally(function () { sending = false; });
   }
   document.getElementById('sendBtn').onclick = send;
   // 回车发送；但输入法（IME）组字过程中的回车（确认候选词）不算发送，
@@ -468,7 +621,14 @@
     (records || []).forEach(function (m) {
       var role = m.role;
       if (role === 'user') {
-        addUser(m.content || '');
+        // 带图片元数据的历史消息：通过 /image 端点回显缩略图
+        var urls = null;
+        if (m.images && m.images.length && currentKey) {
+          urls = m.images.map(function (im) {
+            return '/image?key=' + encodeURIComponent(currentKey) + '&id=' + encodeURIComponent(im.id || im);
+          });
+        }
+        addUser(m.content || '', urls);
       } else if (role === 'assistant') {
         var c = newTurn();
         if (m.reasoning_content) {
@@ -485,6 +645,16 @@
         }
         c.think.classList.remove('live');
         finishThink(c);
+        // 回放本轮生成的图片（generate_image 落盘 + generated_images 元数据）
+        if (m.generated_images && m.generated_images.length && currentKey) {
+          m.generated_images.forEach(function (iid) {
+            var gim = document.createElement('img');
+            gim.src = '/image?key=' + encodeURIComponent(currentKey)
+                    + '&id=' + encodeURIComponent(iid);
+            gim.loading = 'lazy';
+            c.botImages.appendChild(gim);
+          });
+        }
         cur = null;
       }
       // system / tool 消息在侧边栏回放中省略（不污染主对话视图）

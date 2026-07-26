@@ -91,7 +91,10 @@ class Gateway:
         # 同一会话串行跑（持锁）；Agent 内部任何异常都兜底，避免单条消息拖垮整个网关
         async with lock:
             try:
-                reply = await agent.run(msg.content, stream_sink=stream_sink)
+                # 把随消息附带的图片引用一并交给 Agent；纯文本消息 images 为 None
+                reply = await agent.run(
+                    msg.content, images=msg.images, stream_sink=stream_sink
+                )
             except Exception as exc:
                 reply = f"⚠️ 处理消息时出错：{exc}"
                 if stream_sink is not None:
