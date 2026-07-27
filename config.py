@@ -44,6 +44,8 @@ _CONFIG_FIELDS = (
     "image_gen_model",
     # 语音识别：首版用于 Web 端录音转文字；api_key 可由 ASR_API_KEY 覆盖。
     "asr_model",
+    # 文字转语音：首版使用 edge-tts；服务端能力与网页自动朗读开关相互独立。
+    "tts_model",
 )
 
 
@@ -127,6 +129,21 @@ class NanoClawConfig:
             "ffprobe_path": "ffprobe",
         }
     )
+    # TTS 后端默认可用，但网页喇叭开关始终默认关闭；修改这些启动期参数后需重启。
+    tts_model: dict = field(
+        default_factory=lambda: {
+            "enabled": True,
+            "provider": "edge_tts",
+            "voice": "zh-CN-XiaoxiaoNeural",
+            "rate": "+0%",
+            "timeout_sec": 60,
+            "connect_timeout_sec": 10,
+            "receive_timeout_sec": 60,
+            "max_text_chars": 4000,
+            "max_audio_bytes": 16 * 1024 * 1024,
+            "max_concurrency": 2,
+        }
+    )
 
 
 def load_config(config_path: str = "config.json") -> NanoClawConfig:
@@ -149,10 +166,10 @@ def load_config(config_path: str = "config.json") -> NanoClawConfig:
             data = json.load(f)
         for key in _CONFIG_FIELDS:
             if key in data and data[key] is not None:
-                # ASR 配置允许只覆盖少数字段；其余继续使用当前代码默认值，
+                # ASR/TTS 配置允许只覆盖少数字段；其余继续使用当前代码默认值，
                 # 方便未来新增可选参数而不要求用户立刻重写旧 config.json。
-                if key == "asr_model" and isinstance(data[key], dict):
-                    merged = dict(cfg.asr_model)
+                if key in ("asr_model", "tts_model") and isinstance(data[key], dict):
+                    merged = dict(getattr(cfg, key))
                     merged.update(data[key])
                     setattr(cfg, key, merged)
                 else:

@@ -49,5 +49,17 @@
     "prompt": "",
     "ffmpeg_path": "ffmpeg",
     "ffprobe_path": "ffprobe"
+  },
+  "tts_model": {
+    "enabled": true,
+    "provider": "edge_tts",
+    "voice": "zh-CN-XiaoxiaoNeural",
+    "rate": "+0%",
+    "timeout_sec": 60,
+    "connect_timeout_sec": 10,
+    "receive_timeout_sec": 60,
+    "max_text_chars": 4000,
+    "max_audio_bytes": 16777216,
+    "max_concurrency": 2
   }
 }

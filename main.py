@@ -22,6 +22,8 @@ from config import load_config
 from providers.openai_compat import OpenAICompatProvider
 from voice.asr.openai_compat import OpenAICompatibleASRProvider
 from voice.asr.service import AudioTranscriptionService
+from voice.tts.edge import EdgeTTSProvider
+from voice.tts.service import TextToSpeechService
 from agent.tools.registry import ToolRegistry
 from agent.tools.mcp import MCPClientManager
 from agent.tools.filesystem import ReadFileTool, WriteFileTool, ListDirTool
@@ -96,6 +98,45 @@ def build_asr_service(config):
     return service
 
 
+def build_tts_service(config):
+    """按启动期配置创建渠道无关的 TTS 服务；无效配置只禁用朗读。"""
+
+    settings = config.tts_model if isinstance(config.tts_model, dict) else {}
+    if not settings.get("enabled", True):
+        return None
+    if settings.get("provider", "edge_tts") != "edge_tts":
+        print("[!] TTS 未启用：当前仅支持 provider=edge_tts")
+        return None
+
+    voice = str(settings.get("voice") or "").strip()
+    rate = str(settings.get("rate") or "").strip()
+    if not voice or not rate:
+        print("[!] TTS 未启用：请配置 tts_model.voice/rate")
+        return None
+
+    try:
+        provider = EdgeTTSProvider(
+            voice=voice,
+            rate=rate,
+            connect_timeout_sec=int(settings.get("connect_timeout_sec", 10)),
+            receive_timeout_sec=int(settings.get("receive_timeout_sec", 60)),
+            max_audio_bytes=int(settings.get("max_audio_bytes", 16 * 1024 * 1024)),
+        )
+        service = TextToSpeechService(
+            provider,
+            max_text_chars=int(settings.get("max_text_chars", 4000)),
+            max_audio_bytes=int(settings.get("max_audio_bytes", 16 * 1024 * 1024)),
+            max_concurrency=int(settings.get("max_concurrency", 2)),
+            timeout_sec=float(settings.get("timeout_sec", 60)),
+        )
+    except (TypeError, ValueError) as exc:
+        print(f"[!] TTS 未启用：配置值无效（{exc}）")
+        return None
+
+    print(f"（网页文字朗读：服务已就绪·音色 {voice}·页面默认关闭）")
+    return service
+
+
 def build_shared() -> dict:
     """创建跨会话共享的组件，返回供 agent_factory 复用的配置字典。
 
@@ -115,6 +156,7 @@ def build_shared() -> dict:
     # 2) 创建模型 Provider（OpenAI 兼容，默认硅基流动）
     provider = OpenAICompatProvider(config.api_key, config.base_url, config.model)
     asr_service = build_asr_service(config)
+    tts_service = build_tts_service(config)
 
     # 3) 技能加载器（扫描 <workspace>/skills 下的 SKILL.md，供摘要注入与技能工具共用）
     skills_dir = os.path.join(config.workspace, "skills")
@@ -207,6 +249,7 @@ def build_shared() -> dict:
         "config": config,
         "provider": provider,
         "asr_service": asr_service,
+        "tts_service": tts_service,
         "tools": tools,
         "context": context,
         "session_manager": session_manager,
@@ -357,6 +400,7 @@ async def amain() -> None:
             session_manager=shared["session_manager"],  # 侧边栏读写历史会话
             image_store=shared["image_store"],            # 图片上传落盘
             asr_service=shared["asr_service"],             # Web 录音即时转写；音频不进入 Bus
+            tts_service=shared["tts_service"],             # Web 新回复按需朗读；不进入会话历史
         )
         web_channel._clear_callback = clear_callback  # 复用同一清空回调
         channels.append(web_channel)

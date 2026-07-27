@@ -64,8 +64,9 @@
                border-radius:10px; padding:10px 12px; font-size:14px; outline:none; }
   #bar input[type=text]:focus { border-color:var(--accent); }
   #bar button { background:var(--accent); color:#fff; border:none; border-radius:10px; padding:0 18px; font-size:14px; cursor:pointer; }
-  #bar #attachBtn, #bar #recordBtn { background:var(--panel); color:var(--txt); border:1px solid var(--line); padding:0 12px; font-size:16px; }
-  #bar #attachBtn:hover, #bar #recordBtn:hover { border-color:var(--accent); }
+  #bar #attachBtn, #bar #recordBtn, #bar #ttsBtn { background:var(--panel); color:var(--txt); border:1px solid var(--line); padding:0 12px; font-size:16px; }
+  #bar #attachBtn:hover, #bar #recordBtn:hover, #bar #ttsBtn:hover { border-color:var(--accent); }
+  #bar #ttsBtn.enabled { color:var(--ok); border-color:var(--ok); }
   #bar #recordBtn.recording { background:#b13d4b; border-color:#e86b78; color:#fff; }
 
   /* —— 待发送图片预览条（粘贴/选择后、发送前）—— */
@@ -171,6 +172,7 @@
       <button id="attachBtn" title="上传图片（也可直接粘贴）">🖼</button>
       <input id="fileInput" type="file" accept="image/*" multiple style="display:none" />
       <button id="recordBtn" title="开始录音">🎙</button>
+      <button id="ttsBtn" title="开启自动朗读" aria-label="开启自动朗读" aria-pressed="false">🔇</button>
       <input id="input" type="text" placeholder="输入消息，回车发送；可粘贴/上传图片；/new 开新会话，/clear 清当前" autocomplete="off" />
       <button id="sendBtn">发送</button>
     </div>
@@ -186,6 +188,264 @@
   var cfgPanel = document.getElementById('config');
   var cfgMsg = document.getElementById('cfgMsg');
   var FIELDS = ['api_key','base_url','model','subagent_model','workspace','max_iterations','turn_timeout_sec','identity_file','feishu_app_id','feishu_app_secret','web_host','web_port'];
+
+  // —— 网页 TTS：只消费本页收到的、实时 Agent token；不保存开关状态 ——
+  var ttsBtn = document.getElementById('ttsBtn');
+  var ttsEnabled = false;
+  var ttsGeneration = 0;       // 失效旧 fetch / 音频，防止关闭后迟到播放
+  var ttsReplySeq = 0;
+  var ttsQueue = [];           // 待合成文本；最多积压三段，过快时合并末段
+  var ttsPrepared = {};        // seq -> 已合成音频；乱序返回也不改变播放顺序
+  var ttsInFlight = 0;
+  var ttsAborts = {};          // seq -> { controller, replyId }
+  var ttsNextSeq = 0;
+  var ttsNextPlaySeq = 0;
+  var ttsSkipped = {};         // 合成失败/取消的序号，防止后续段被它阻塞
+  var ttsCurrent = null;
+  var ttsFailedReplies = {};
+  var ttsDiscardUntilDone = false; // 新消息/切会话时，不让旧回合的迟到 token 开始朗读
+  var ttsAudio = new Audio();  // 复用单个播放器，确保关闭可立即停止
+
+  function updateTtsButton() {
+    ttsBtn.textContent = ttsEnabled ? '🔊' : '🔇';
+    ttsBtn.title = ttsEnabled ? '关闭自动朗读并停止播放' : '开启自动朗读';
+    ttsBtn.setAttribute('aria-label', ttsBtn.title);
+    ttsBtn.setAttribute('aria-pressed', ttsEnabled ? 'true' : 'false');
+    ttsBtn.classList.toggle('enabled', ttsEnabled);
+  }
+
+  function revokePrepared() {
+    Object.keys(ttsPrepared).forEach(function (seq) {
+      if (ttsPrepared[seq].url) URL.revokeObjectURL(ttsPrepared[seq].url);
+    });
+    ttsPrepared = {};
+  }
+
+  function stopTts() {
+    ttsGeneration += 1;
+    Object.keys(ttsAborts).forEach(function (seq) { ttsAborts[seq].controller.abort(); });
+    ttsAborts = {};
+    ttsInFlight = 0;
+    ttsQueue = [];
+    revokePrepared();
+    ttsSkipped = {};
+    ttsNextSeq = 0;
+    ttsNextPlaySeq = 0;
+    ttsFailedReplies = {};
+    if (ttsCurrent && ttsCurrent.url) URL.revokeObjectURL(ttsCurrent.url);
+    ttsCurrent = null;
+    ttsAudio.onended = null;
+    ttsAudio.onerror = null;
+    ttsAudio.pause();
+    ttsAudio.currentTime = 0;
+    ttsAudio.removeAttribute('src');
+    ttsAudio.load();
+  }
+
+  function stopTtsForTransition() {
+    // 同会话的新消息会排队，旧 Agent 回合仍可能继续推 token；在它的 done 前静音。
+    if (cur) ttsDiscardUntilDone = true;
+    stopTts();
+  }
+
+  function failTtsReply(replyId, err) {
+    // 单段失败只放弃本次 Agent 回复的剩余朗读；聊天和开关均不受影响。
+    ttsFailedReplies[replyId] = true;
+    ttsQueue = ttsQueue.filter(function (item) {
+      if (item.replyId === replyId) { ttsSkipped[item.seq] = true; return false; }
+      return true;
+    });
+    Object.keys(ttsPrepared).forEach(function (seq) {
+      var item = ttsPrepared[seq];
+      if (item.replyId === replyId) {
+        ttsSkipped[item.seq] = true;
+        URL.revokeObjectURL(item.url);
+        delete ttsPrepared[seq];
+      }
+    });
+    Object.keys(ttsAborts).forEach(function (seq) {
+      var pending = ttsAborts[seq];
+      if (pending.replyId === replyId) {
+        ttsSkipped[Number(seq)] = true;
+        pending.controller.abort();
+      }
+    });
+    console.warn('TTS 分段失败，已跳过本轮剩余朗读：', err);
+  }
+
+  function playNextTts() {
+    if (ttsCurrent || !ttsEnabled) return;
+    while (ttsSkipped[ttsNextPlaySeq]) {
+      delete ttsSkipped[ttsNextPlaySeq];
+      ttsNextPlaySeq += 1;
+    }
+    var item = ttsPrepared[ttsNextPlaySeq];
+    if (!item) return; // 等待较早的并发请求，严格按文本先后播放
+    delete ttsPrepared[ttsNextPlaySeq];
+    ttsNextPlaySeq += 1;
+    if (ttsFailedReplies[item.replyId]) { URL.revokeObjectURL(item.url); pumpTts(); return; }
+    ttsCurrent = item;
+    ttsAudio.onended = function () {
+      if (ttsCurrent === item) {
+        URL.revokeObjectURL(item.url);
+        ttsCurrent = null;
+        pumpTts();
+      }
+    };
+    ttsAudio.onerror = function () {
+      if (ttsCurrent === item) {
+        URL.revokeObjectURL(item.url);
+        ttsCurrent = null;
+        failTtsReply(item.replyId, 'audio playback error');
+        pumpTts();
+      }
+    };
+    ttsAudio.src = item.url;
+    ttsAudio.play().catch(function (err) {
+      // 自动播放策略、设备错误等都只能降级，绝不能影响聊天。
+      if (ttsCurrent === item) {
+        URL.revokeObjectURL(item.url);
+        ttsCurrent = null;
+        failTtsReply(item.replyId, err);
+        pumpTts();
+      }
+    });
+    // 当前段播放期间立即预合成下一段，降低句间停顿。
+    pumpTts();
+  }
+
+  function startTtsSynthesis(item) {
+    var generation = ttsGeneration;
+    var controller = new AbortController();
+    ttsInFlight += 1;
+    ttsAborts[item.seq] = { controller: controller, replyId: item.replyId };
+    fetch('/api/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: item.text }),
+        signal: controller.signal
+    }).then(function (response) {
+        if (!response.ok) throw new Error('TTS 请求失败（' + response.status + '）');
+        return response.blob();
+    }).then(function (blob) {
+        if (!ttsEnabled || generation !== ttsGeneration || ttsFailedReplies[item.replyId]) return;
+        if (!blob.size) throw new Error('TTS 返回了空音频');
+        ttsPrepared[item.seq] = { replyId: item.replyId, url: URL.createObjectURL(blob) };
+    }).catch(function (err) {
+        if (err && err.name === 'AbortError') return;
+        if (generation === ttsGeneration) {
+          ttsSkipped[item.seq] = true;
+          failTtsReply(item.replyId, err);
+        }
+    }).finally(function () {
+        if (generation !== ttsGeneration) return;
+        delete ttsAborts[item.seq];
+        ttsInFlight = Math.max(0, ttsInFlight - 1);
+        pumpTts();
+    });
+  }
+
+  function pumpTts() {
+    if (!ttsEnabled) return;
+    playNextTts();
+    // 在途请求 + 已就绪音频合计最多两段，避免播放赶不上合成时 Blob 无界增长。
+    while (ttsInFlight < 2 && (ttsInFlight + Object.keys(ttsPrepared).length) < 2 && ttsQueue.length) {
+      var item = ttsQueue.shift();
+      if (ttsFailedReplies[item.replyId]) { ttsSkipped[item.seq] = true; continue; }
+      startTtsSynthesis(item);
+    }
+    playNextTts();
+  }
+
+  function enqueueTts(text, replyId) {
+    text = (text || '').trim();
+    if (!text || !ttsEnabled || ttsFailedReplies[replyId]) return;
+    // 同时最多积压三段待合成文本；极端高速输出时合并末段，不丢正文。
+    if (ttsQueue.length >= 3) ttsQueue[ttsQueue.length - 1].text += ' ' + text;
+    else ttsQueue.push({ text: text, replyId: replyId, seq: ttsNextSeq++ });
+    pumpTts();
+  }
+
+  function isStrongTtsBoundary(ch) {
+    return /[。！？!?；;]/.test(ch) || ch === String.fromCharCode(10);
+  }
+
+  function findTtsBoundary(buf, limit, minLength) {
+    var strong = -1;
+    var weak = -1;
+    for (var i = 0; i < Math.min(buf.length, limit); i++) {
+      var n = i + 1;
+      if (n < minLength) continue;
+      var ch = buf.charAt(i);
+      if (isStrongTtsBoundary(ch)) strong = n;
+      else if (/[，,：:]/.test(ch)) weak = n;
+    }
+    // 完整句末优先于逗号等弱边界；都没有时由调用方决定是否硬切。
+    return strong >= 0 ? strong : weak;
+  }
+
+  function chooseTtsCut(turn, buf) {
+    var firstSegment = turn.ttsSegmentCount === 0;
+    if (firstSegment) {
+      // 第一完整句尽快开口，降低首段等待；短语/逗号仍继续累计。
+      for (var i = 0; i < buf.length; i++) {
+        if (i + 1 >= 8 && isStrongTtsBoundary(buf.charAt(i))) return i + 1;
+      }
+    } else {
+      // 后续把多个短句合成较自然的段落，再在完整句末切开。
+      for (var j = 39; j < buf.length; j++) {
+        if (isStrongTtsBoundary(buf.charAt(j))) return j + 1;
+      }
+    }
+
+    // 首段没有句号时可在较长分句处启动；后续逗号只作长文本回退。
+    var fallbackAt = firstSegment ? 32 : 80;
+    var fallbackMin = firstSegment ? 16 : 40;
+    if (buf.length >= fallbackAt) {
+      var longBoundary = findTtsBoundary(buf, fallbackAt, fallbackMin);
+      if (longBoundary >= 0) return longBoundary;
+    }
+    // 无标点文本只在达到较高上限时切开；仍优先选择完整句或分句边界。
+    var hardLimit = firstSegment ? 64 : 120;
+    if (buf.length >= hardLimit) {
+      var safeBoundary = findTtsBoundary(buf, hardLimit, fallbackMin);
+      return safeBoundary >= 0 ? safeBoundary : hardLimit;
+    }
+    return -1;
+  }
+
+  function flushTtsSegments(turn, force) {
+    if (ttsDiscardUntilDone || !turn.ttsEligible || turn.ttsGeneration !== ttsGeneration || !ttsEnabled) return;
+    var buf = turn.ttsBuffer || '';
+    while (buf) {
+      var cut = chooseTtsCut(turn, buf);
+      if (cut < 0) {
+        if (force) { enqueueTts(buf, turn.ttsReplyId); buf = ''; }
+        break;
+      }
+      enqueueTts(buf.slice(0, cut), turn.ttsReplyId);
+      turn.ttsSegmentCount += 1;
+      buf = buf.slice(cut);
+    }
+    turn.ttsBuffer = buf;
+  }
+
+  function collectTtsToken(turn, text) {
+    if (ttsDiscardUntilDone || !turn.ttsEligible || turn.ttsGeneration !== ttsGeneration || !ttsEnabled) return;
+    turn.ttsBuffer += (text || '');
+    flushTtsSegments(turn, false);
+  }
+
+  ttsBtn.onclick = function () {
+    if (ttsEnabled) {
+      ttsEnabled = false;
+      stopTts();
+    } else {
+      ttsEnabled = true;
+    }
+    updateTtsButton();
+  };
+  updateTtsButton();
 
   function addUser(text, imgUrls) {
     var m = document.createElement('div'); m.className = 'msg user';
@@ -240,6 +500,8 @@
              thinkDur: think.querySelector('.sum-dur'),
              activity: activity, botImages: botImages, answer: answer,
              answerStarted: false, lastTool: null,
+             ttsEligible: ttsEnabled, ttsGeneration: ttsGeneration,
+             ttsReplyId: ++ttsReplySeq, ttsBuffer: '', ttsSegmentCount: 0,
              thinkStart: performance.now(), thinkEnded: false };
   }
 
@@ -267,6 +529,7 @@
     }
     // 会话切换/新建后，后端回传当前会话标识，前端同步高亮
     if (ev.type === 'session_changed') {
+      stopTtsForTransition();
       currentKey = ev.key;
       loadSessions();
       return;
@@ -284,6 +547,7 @@
         finishThink(cur);   // 正式回答开始 = 思考结束，记录思考时长
       }
       cur.answer.textContent += (ev.content || '');
+      collectTtsToken(cur, ev.content || '');
       chat.scrollTop = chat.scrollHeight;
     } else if (t === 'tool_call') {
       // 工具卡片默认折叠：标题只显示「名称 + 状态」，点开才看入参/出参
@@ -329,8 +593,17 @@
       });
       cur.think.classList.remove('live');
       finishThink(cur);   // 兜底：无论是否出 token，回合结束都记录思考时长
-      if (!cur.answerStarted && ev.content) { cur.answer.classList.remove('empty'); cur.answer.textContent = ev.content; }
+      if (!cur.answerStarted && ev.content) {
+        cur.answer.classList.remove('empty');
+        cur.answer.textContent = ev.content;
+        cur.answerStarted = true;
+        // 兼容未逐 token 推送、仅在 done 给出完整正文的 Provider；不会与流式正文重复。
+        collectTtsToken(cur, ev.content);
+      }
       if (!cur.answer.textContent.trim()) cur.answer.textContent = '（本轮未生成正式回答）';
+      // token 已增量分句；done 只清空尾部，避免把完整 content 重复朗读。
+      flushTtsSegments(cur, true);
+      ttsDiscardUntilDone = false;
       cur = null;
       chat.scrollTop = chat.scrollHeight;
       loadSessions();   // 刷新侧边栏：新会话出现 / 预览与末次时间更新
@@ -366,6 +639,10 @@
       loadSessions();                   // 顺手刷新侧边栏列表
     };
     ws.onclose = function () {
+      // 旧连接不会再送达 done；直接废弃其回合，避免“静音到 done”状态污染重连后的首条回复。
+      stopTts();
+      ttsDiscardUntilDone = false;
+      cur = null;
       statusEl.textContent = '已断开 · 重连中…';
       statusEl.style.color = '#d98c00';
       if (_reconnectTimer) clearTimeout(_reconnectTimer);
@@ -476,6 +753,7 @@
     if ((!text && !hasImgs) || ws.readyState !== WebSocket.OPEN) return;
 
     if (!hasImgs) {          // 纯文本：维持原路径（命令等均不受影响）
+      stopTtsForTransition();
       addUser(text);
       cur = newTurn();
       ws.send(text);
@@ -490,6 +768,7 @@
     statusEl.textContent = '上传图片中…';
     Promise.all(imgs.map(function (it) { return uploadOne(it.file, key); }))
       .then(function (ids) {
+        stopTtsForTransition();
         addUser(text, imgs.map(function (it) { return it.url; }));   // 本地预览 URL 直接回显
         cur = newTurn();
         ws.send(JSON.stringify({ text: text, images: ids }));
@@ -612,6 +891,7 @@
           if (!text) throw new Error('没有识别到可发送的文字，请重新录制。');
           if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error('连接未就绪，未发送转写文本。');
           if (currentKey !== recordingSessionKey) throw new Error('会话已变化，未发送转写文本。');
+          stopTtsForTransition();
           addUser(text);
           cur = newTurn();
           ws.send(text);
@@ -723,6 +1003,7 @@
   function openSession(key) {
     if (!canChangeSession()) return;
     if (!ws || ws.readyState !== WebSocket.OPEN) { addSys('连接未就绪，无法打开会话'); return; }
+    stopTtsForTransition();
     ws.send(JSON.stringify({ ctl: true, type: 'open', key: key }));
     fetch('/api/session?key=' + encodeURIComponent(key)).then(function (r) { return r.json(); }).then(function (d) {
       currentKey = key;
@@ -737,6 +1018,7 @@
   function newSession() {
     if (!canChangeSession()) return;
     if (!ws || ws.readyState !== WebSocket.OPEN) { addSys('连接未就绪'); return; }
+    stopTtsForTransition();
     ws.send(JSON.stringify({ ctl: true, type: 'new' }));
     chat.innerHTML = '';
     cur = null;
@@ -747,6 +1029,7 @@
   function deleteSession(key) {
     if (!canChangeSession()) return;
     if (!confirm('确定删除该会话？本地记录也会一并删除，无法恢复。')) return;
+    if (key === currentKey) stopTtsForTransition();
     fetch('/api/session?key=' + encodeURIComponent(key), { method: 'DELETE' })
       .then(function (r) { return r.json(); }).then(function (d) {
         if (d && d.ok) {

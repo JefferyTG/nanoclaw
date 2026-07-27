@@ -27,6 +27,7 @@ from aiohttp import web
 from bus.queue import InboundMessage, OutboundMessage
 from channels.base import Channel
 from voice.asr.base import ASRError
+from voice.tts.base import TTSError
 
 logger = logging.getLogger("nanoclaw.web")
 
@@ -52,7 +53,8 @@ class WebChannel(Channel):
     """网页渠道（name 固定为 ``"web"``），在后台线程跑 aiohttp 服务。"""
 
     def __init__(self, name: str, bus, host: str, port: int, config, config_path: str,
-                 session_manager=None, image_store=None, asr_service=None) -> None:
+                 session_manager=None, image_store=None, asr_service=None,
+                 tts_service=None) -> None:
         super().__init__(name=name, bus=bus)
         self.host = host
         self.port = port
@@ -63,6 +65,9 @@ class WebChannel(Channel):
         # 语音转写服务；由 composition root 注入。None 表示本实例未启用 ASR。
         # 服务属于主 asyncio loop，不能直接在本文件的 aiohttp 后台 loop 调用。
         self.asr_service = asr_service
+        # 文字转语音服务同样属于主 asyncio loop。None 表示 TTS 未启用；
+        # 这不会影响既有文本 WebSocket 聊天。
+        self.tts_service = tts_service
         self._loop = None                 # 网关主事件循环（跨线程投递用）
         self._web_loop = None             # aiohttp 所在事件循环（后台线程）
         self._thread = None               # 后台守护线程
@@ -113,6 +118,7 @@ class WebChannel(Channel):
             app.router.add_get("/ws", self._handle_ws)
             app.router.add_post("/upload", self._handle_upload)
             app.router.add_post("/api/asr", self._handle_asr)
+            app.router.add_post("/api/tts", self._handle_tts)
             app.router.add_get("/image", self._handle_get_image)
             app.router.add_get("/api/config", self._handle_get_config)
             app.router.add_post("/api/config", self._handle_post_config)
@@ -289,6 +295,66 @@ class WebChannel(Channel):
         if not text:
             return self._asr_error("empty_transcript", "没有识别到可发送的文字，请重新录制。", 422)
         return web.json_response({"ok": True, "text": text}, headers=_NO_CACHE)
+
+    @staticmethod
+    def _tts_error(message: str, status: int) -> web.Response:
+        """返回不含上游细节的 TTS 错误，确保聊天不依赖语音服务。"""
+        return web.json_response(
+            {"ok": False, "error": {"code": "tts_failed", "message": message}},
+            status=status,
+            headers=_NO_CACHE,
+        )
+
+    async def _handle_tts(self, request) -> web.Response:
+        """把一段回复片段交给可选 TTS 服务，返回临时音频字节。
+
+        此端点不进入 MessageBus、不写会话；语音失败只影响本次播放请求。
+        """
+        if self.tts_service is None:
+            return self._tts_error("本实例尚未配置文字转语音服务。", 503)
+        if self._loop is None:
+            return self._tts_error("文字转语音服务尚未启动。", 503)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return self._tts_error("请求体不是合法 JSON。", 400)
+        if not isinstance(body, dict) or not isinstance(body.get("text"), str):
+            return self._tts_error("请求体必须包含文本字段 text。", 400)
+        text = body["text"].strip()
+        if not text:
+            return self._tts_error("朗读文本不能为空。", 400)
+
+        max_text_chars = getattr(self.tts_service, "max_text_chars", None)
+        try:
+            max_text_chars = int(max_text_chars)
+        except (TypeError, ValueError):
+            max_text_chars = None
+        if max_text_chars is not None and max_text_chars > 0 and len(text) > max_text_chars:
+            return self._tts_error("朗读文本超过允许长度。", 413)
+
+        future = asyncio.run_coroutine_threadsafe(
+            self.tts_service.synthesize(text), self._loop,
+        )
+        try:
+            result = await asyncio.wrap_future(future)
+        except asyncio.CancelledError:
+            future.cancel()
+            raise
+        except TTSError as exc:
+            logger.warning("文字转语音失败：%s", exc)
+            return self._tts_error(str(exc) or "文字转语音失败，请稍后重试。", 422)
+        except Exception:  # noqa: BLE001 - 不暴露上游服务/网络异常细节
+            logger.warning("文字转语音服务暂时不可用", exc_info=True)
+            return self._tts_error("文字转语音服务暂时不可用，请稍后重试。", 422)
+
+        audio = getattr(result, "audio", None)
+        if not isinstance(audio, bytes) or not audio:
+            logger.warning("文字转语音服务返回了无效音频结果")
+            return self._tts_error("文字转语音服务返回了无效音频结果。", 422)
+        # 第一版 edge-tts 的输出契约固定为 MP3；不把 Provider 返回的任意字符串
+        # 直接写入响应头，避免未来第三方 Provider 注入无效 Content-Type。
+        return web.Response(body=audio, content_type="audio/mpeg", headers=_NO_CACHE)
 
     # —— 图片回显（前端缩略图 / 历史回放用）——
     async def _handle_get_image(self, request) -> web.Response:
