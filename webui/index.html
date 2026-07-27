@@ -64,8 +64,9 @@
                border-radius:10px; padding:10px 12px; font-size:14px; outline:none; }
   #bar input[type=text]:focus { border-color:var(--accent); }
   #bar button { background:var(--accent); color:#fff; border:none; border-radius:10px; padding:0 18px; font-size:14px; cursor:pointer; }
-  #bar #attachBtn { background:var(--panel); color:var(--txt); border:1px solid var(--line); padding:0 12px; font-size:16px; }
-  #bar #attachBtn:hover { border-color:var(--accent); }
+  #bar #attachBtn, #bar #recordBtn { background:var(--panel); color:var(--txt); border:1px solid var(--line); padding:0 12px; font-size:16px; }
+  #bar #attachBtn:hover, #bar #recordBtn:hover { border-color:var(--accent); }
+  #bar #recordBtn.recording { background:#b13d4b; border-color:#e86b78; color:#fff; }
 
   /* —— 待发送图片预览条（粘贴/选择后、发送前）—— */
   #attach { display:none; gap:8px; padding:8px 16px 0; flex-wrap:wrap; }
@@ -169,6 +170,7 @@
     <div id="bar">
       <button id="attachBtn" title="上传图片（也可直接粘贴）">🖼</button>
       <input id="fileInput" type="file" accept="image/*" multiple style="display:none" />
+      <button id="recordBtn" title="开始录音">🎙</button>
       <input id="input" type="text" placeholder="输入消息，回车发送；可粘贴/上传图片；/new 开新会话，/clear 清当前" autocomplete="off" />
       <button id="sendBtn">发送</button>
     </div>
@@ -401,6 +403,7 @@
   // 提前上传的图会落错目录；发送瞬间 currentKey 一定是本条消息所属会话。
   var attachBar = document.getElementById('attach');
   var fileInput = document.getElementById('fileInput');
+  var recordBtn = document.getElementById('recordBtn');
   var pendingImages = [];   // [{file, url}]
 
   function renderAttach() {
@@ -463,6 +466,10 @@
 
   var sending = false;   // 上传期间防重复发送
   function send() {
+    if (recorder || recordingBusy) {
+      addSys(recorder ? '正在录音，请先停止录音。' : '正在转写语音，请稍候。');
+      return;
+    }
     if (sending) return;
     var text = input.value.trim();
     var hasImgs = pendingImages.length > 0;
@@ -503,6 +510,136 @@
   input.addEventListener('keydown', function (e) {
     if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) send();
   });
+
+  // —— 浏览器录音：仅把 ASR 成功的文本交给现有 WebSocket 文本入口 ——
+  var recorder = null;
+  var recordingStream = null;
+  var recordingChunks = [];
+  var recordingBusy = false;
+  var recordingSessionKey = null;
+
+  function stopRecordingTracks() {
+    if (recordingStream) {
+      recordingStream.getTracks().forEach(function (track) { track.stop(); });
+      recordingStream = null;
+    }
+  }
+
+  function setRecordingState(active, busy) {
+    recordingBusy = !!busy;
+    recordBtn.disabled = !!busy;
+    recordBtn.classList.toggle('recording', !!active);
+    recordBtn.textContent = active ? '■' : '🎙';
+    recordBtn.title = active ? '停止录音' : (busy ? '语音转写中…' : '开始录音');
+  }
+
+  function canChangeSession() {
+    if (!recorder && !recordingBusy) return true;
+    addSys(recorder ? '正在录音，请先停止录音。' : '正在转写语音，请稍候。');
+    return false;
+  }
+
+  function chooseRecorderOptions() {
+    if (!window.MediaRecorder) return null;
+    var types = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/ogg;codecs=opus'];
+    for (var i = 0; i < types.length; i++) {
+      if (!MediaRecorder.isTypeSupported || MediaRecorder.isTypeSupported(types[i])) {
+        return { mimeType: types[i] };
+      }
+    }
+    return {};
+  }
+
+  function uploadRecording(blob, filename) {
+    var fd = new FormData();
+    fd.append('file', blob, filename);
+    return fetch('/api/asr', { method: 'POST', body: fd })
+      .then(function (response) {
+        return response.json().catch(function () { return {}; }).then(function (body) {
+          if (!response.ok || !body.ok) {
+            var err = body && body.error;
+            throw new Error((err && err.message) || '语音转写失败');
+          }
+          return String(body.text || '').trim();
+        });
+      });
+  }
+
+  function startRecording() {
+    if (recordingBusy || recorder) return;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.MediaRecorder) {
+      addSys('当前浏览器不支持录音，请使用安全上下文（HTTPS 或 localhost）并换用现代浏览器。');
+      return;
+    }
+    if (!window.isSecureContext && location.hostname !== 'localhost') {
+      addSys('录音需要安全上下文：请使用 HTTPS 或 localhost 访问此页面。');
+      return;
+    }
+    // 即使 UI 已阻止切换，会话也可能因重连/服务端事件变化；完成转写前必须
+    // 仍属于开始录音时的同一会话，才允许走现有文本发送路径。
+    recordingSessionKey = currentKey;
+    setRecordingState(false, true);
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(function (stream) {
+      recordingStream = stream;
+      recordingChunks = [];
+      var options = chooseRecorderOptions();
+      recorder = options ? new MediaRecorder(stream, options) : new MediaRecorder(stream);
+      recorder.ondataavailable = function (event) {
+        if (event.data && event.data.size) recordingChunks.push(event.data);
+      };
+      recorder.onerror = function () {
+        addSys('录音发生错误，请检查麦克风后重试。');
+        recorder = null;
+        stopRecordingTracks();
+        recordingSessionKey = null;
+        setRecordingState(false, false);
+      };
+      recorder.onstop = function () {
+        var finished = recorder;
+        recorder = null;
+        stopRecordingTracks();
+        var mime = (finished && finished.mimeType) || 'audio/webm';
+        var blob = new Blob(recordingChunks, { type: mime });
+        recordingChunks = [];
+        if (!blob.size) {
+          addSys('没有录到声音，请检查麦克风权限后重试。');
+          recordingSessionKey = null;
+          setRecordingState(false, false);
+          return;
+        }
+        var ext = mime.indexOf('mp4') >= 0 ? 'm4a' : (mime.indexOf('ogg') >= 0 ? 'ogg' : 'webm');
+        uploadRecording(blob, 'recording.' + ext).then(function (text) {
+          if (!text) throw new Error('没有识别到可发送的文字，请重新录制。');
+          if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error('连接未就绪，未发送转写文本。');
+          if (currentKey !== recordingSessionKey) throw new Error('会话已变化，未发送转写文本。');
+          addUser(text);
+          cur = newTurn();
+          ws.send(text);
+        }).catch(function (err) {
+          addSys('语音转写失败：' + ((err && err.message) || err));
+        }).finally(function () {
+          recordingSessionKey = null;
+          setRecordingState(false, false);
+        });
+      };
+      recorder.start();
+      setRecordingState(true, false);
+    }).catch(function (err) {
+      stopRecordingTracks();
+      recordingSessionKey = null;
+      setRecordingState(false, false);
+      addSys('无法启用麦克风：' + ((err && err.message) || '请检查浏览器权限。'));
+    });
+  }
+
+  recordBtn.onclick = function () {
+    if (recorder && recorder.state !== 'inactive') {
+      setRecordingState(false, true);
+      recorder.stop();
+      return;
+    }
+    startRecording();
+  };
 
   cfgBtn.onclick = function () {
     cfgPanel.classList.toggle('show');
@@ -584,6 +721,7 @@
 
   // 打开历史会话：后端切到该标识 + 前端拉取并回放历史，之后可继续对话
   function openSession(key) {
+    if (!canChangeSession()) return;
     if (!ws || ws.readyState !== WebSocket.OPEN) { addSys('连接未就绪，无法打开会话'); return; }
     ws.send(JSON.stringify({ ctl: true, type: 'open', key: key }));
     fetch('/api/session?key=' + encodeURIComponent(key)).then(function (r) { return r.json(); }).then(function (d) {
@@ -597,6 +735,7 @@
 
   // 新建会话：后端生成新标识，前端清屏（收到 session_changed 后高亮）
   function newSession() {
+    if (!canChangeSession()) return;
     if (!ws || ws.readyState !== WebSocket.OPEN) { addSys('连接未就绪'); return; }
     ws.send(JSON.stringify({ ctl: true, type: 'new' }));
     chat.innerHTML = '';
@@ -606,6 +745,7 @@
 
   // 删除会话：同时删本地 JSONL 文件；若正打开则自动新建一个
   function deleteSession(key) {
+    if (!canChangeSession()) return;
     if (!confirm('确定删除该会话？本地记录也会一并删除，无法恢复。')) return;
     fetch('/api/session?key=' + encodeURIComponent(key), { method: 'DELETE' })
       .then(function (r) { return r.json(); }).then(function (d) {

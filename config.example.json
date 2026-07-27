@@ -33,5 +33,21 @@
       "strength": 0.0,
       "tags": []
     }
+  },
+  "asr_model": {
+    "enabled": false,
+    "provider": "openai_compatible",
+    "api_key": "",
+    "base_url": "https://api.openai.com/v1",
+    "model": "gpt-4o-mini-transcribe",
+    "timeout_sec": 90,
+    "max_retries": 1,
+    "max_audio_bytes": 10485760,
+    "max_duration_sec": 120,
+    "max_concurrency": 2,
+    "language": "",
+    "prompt": "",
+    "ffmpeg_path": "ffmpeg",
+    "ffprobe_path": "ffprobe"
   }
 }

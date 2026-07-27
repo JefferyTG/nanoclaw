@@ -26,12 +26,17 @@ from aiohttp import web
 
 from bus.queue import InboundMessage, OutboundMessage
 from channels.base import Channel
+from voice.asr.base import ASRError
 
 logger = logging.getLogger("nanoclaw.web")
 
 # 所有 HTTP 响应都禁止缓存，确保浏览器每次都拉取最新前端（避免流式上线后
 # 旧页面把 {"event":...} 帧当纯文本显示成「一堆 JSON」的缓存陷阱）。
 _NO_CACHE = {"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
+
+# 浏览器录音由本地 ASR 服务即时转写，不落盘。服务通常提供自己的上限；此值
+# 仅在注入的兼容服务没有声明 max_audio_bytes 时作为安全回退。
+_DEFAULT_ASR_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
 # 网页可编辑的配置字段白名单（GET 返回、POST 接受均限定在此范围内）
 _CONFIG_FIELDS = (
@@ -47,7 +52,7 @@ class WebChannel(Channel):
     """网页渠道（name 固定为 ``"web"``），在后台线程跑 aiohttp 服务。"""
 
     def __init__(self, name: str, bus, host: str, port: int, config, config_path: str,
-                 session_manager=None, image_store=None) -> None:
+                 session_manager=None, image_store=None, asr_service=None) -> None:
         super().__init__(name=name, bus=bus)
         self.host = host
         self.port = port
@@ -55,6 +60,9 @@ class WebChannel(Channel):
         self.config_path = config_path    # 本实例 config.json 路径（用于持久化）
         self.session_manager = session_manager  # 会话持久化管理器（侧边栏读写用，可空）
         self.image_store = image_store    # 图片存储（落盘/解析/清理），可空
+        # 语音转写服务；由 composition root 注入。None 表示本实例未启用 ASR。
+        # 服务属于主 asyncio loop，不能直接在本文件的 aiohttp 后台 loop 调用。
+        self.asr_service = asr_service
         self._loop = None                 # 网关主事件循环（跨线程投递用）
         self._web_loop = None             # aiohttp 所在事件循环（后台线程）
         self._thread = None               # 后台守护线程
@@ -104,6 +112,7 @@ class WebChannel(Channel):
             app.router.add_get("/", self._handle_index)
             app.router.add_get("/ws", self._handle_ws)
             app.router.add_post("/upload", self._handle_upload)
+            app.router.add_post("/api/asr", self._handle_asr)
             app.router.add_get("/image", self._handle_get_image)
             app.router.add_get("/api/config", self._handle_get_config)
             app.router.add_post("/api/config", self._handle_post_config)
@@ -206,6 +215,80 @@ class WebChannel(Channel):
         return web.json_response(
             {"ok": True, "image_id": ref.id, "mime": ref.mime}, headers=_NO_CACHE
         )
+
+    @staticmethod
+    def _asr_error(code: str, message: str, status: int) -> web.Response:
+        """返回稳定的 ASR 错误结构，方便前端给出明确提示。"""
+        return web.json_response(
+            {"ok": False, "error": {"code": code, "message": message}},
+            status=status,
+            headers=_NO_CACHE,
+        )
+
+    async def _handle_asr(self, request) -> web.Response:
+        """接收一段浏览器录音并在主事件循环调用本地 ASR 服务。
+
+        本接口只返回转写文本；前端确认成功后仍通过既有纯文本 WebSocket
+        入口发送消息，避免音频二进制进入 Bus、会话或图片存储。
+        """
+        if self.asr_service is None:
+            return self._asr_error("asr_unavailable", "本实例尚未配置语音转写服务。", 503)
+        if self._loop is None:
+            return self._asr_error("asr_unavailable", "语音转写服务尚未启动。", 503)
+
+        try:
+            data = await request.post()
+        except Exception as exc:  # noqa: BLE001
+            return self._asr_error("invalid_upload", f"解析录音上传失败：{exc}", 400)
+        upload = data.get("file")
+        if upload is None:
+            return self._asr_error("missing_file", "未收到录音文件字段 file。", 400)
+        try:
+            raw = upload.file.read()
+        except Exception as exc:  # noqa: BLE001
+            return self._asr_error("invalid_upload", f"读取录音文件失败：{exc}", 400)
+        if not raw:
+            return self._asr_error("empty_file", "录音文件为空，请重新录制。", 400)
+        max_audio_bytes = getattr(self.asr_service, "max_audio_bytes", _DEFAULT_ASR_MAX_UPLOAD_BYTES)
+        try:
+            max_audio_bytes = int(max_audio_bytes)
+        except (TypeError, ValueError):
+            max_audio_bytes = _DEFAULT_ASR_MAX_UPLOAD_BYTES
+        if max_audio_bytes <= 0:
+            max_audio_bytes = _DEFAULT_ASR_MAX_UPLOAD_BYTES
+        if len(raw) > max_audio_bytes:
+            return self._asr_error(
+                "file_too_large",
+                f"录音文件超过 {max_audio_bytes // (1024 * 1024)} MB 限制。",
+                413,
+            )
+
+        filename = getattr(upload, "filename", "") or "recording.webm"
+        media_type = getattr(upload, "content_type", None) or "application/octet-stream"
+        future = asyncio.run_coroutine_threadsafe(
+            self.asr_service.transcribe(raw, filename=filename, media_type=media_type),
+            self._loop,
+        )
+        try:
+            result = await asyncio.wrap_future(future)
+        except asyncio.CancelledError:
+            future.cancel()
+            raise
+        except Exception as exc:  # noqa: BLE001 - service owns detailed failure semantics
+            logger.warning("语音转写失败：%s", exc)
+            if isinstance(exc, ASRError):
+                message = str(exc) or "语音转写失败，请重试。"
+            else:
+                message = "语音转写服务暂时不可用，请稍后重试。"
+            return self._asr_error("asr_failed", message, 422)
+
+        if not hasattr(result, "text"):
+            logger.warning("语音转写服务返回了无效结果：%r", result)
+            return self._asr_error("asr_failed", "语音转写服务返回了无效结果。", 422)
+        text = str(result.text or "").strip()
+        if not text:
+            return self._asr_error("empty_transcript", "没有识别到可发送的文字，请重新录制。", 422)
+        return web.json_response({"ok": True, "text": text}, headers=_NO_CACHE)
 
     # —— 图片回显（前端缩略图 / 历史回放用）——
     async def _handle_get_image(self, request) -> web.Response:

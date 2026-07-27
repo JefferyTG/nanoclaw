@@ -20,6 +20,8 @@ import sys
 
 from config import load_config
 from providers.openai_compat import OpenAICompatProvider
+from voice.asr.openai_compat import OpenAICompatibleASRProvider
+from voice.asr.service import AudioTranscriptionService
 from agent.tools.registry import ToolRegistry
 from agent.tools.mcp import MCPClientManager
 from agent.tools.filesystem import ReadFileTool, WriteFileTool, ListDirTool
@@ -51,6 +53,49 @@ from channels.web import WebChannel
 CONFIG_PATH = "config.json"
 
 
+def build_asr_service(config):
+    """按启动期配置创建渠道无关的 ASR 服务；未启用或无效时返回 None。"""
+
+    settings = config.asr_model if isinstance(config.asr_model, dict) else {}
+    if not settings.get("enabled", False):
+        return None
+    if settings.get("provider", "openai_compatible") != "openai_compatible":
+        print("[!] ASR 未启用：当前仅支持 provider=openai_compatible")
+        return None
+
+    api_key = str(settings.get("api_key") or "").strip()
+    base_url = str(settings.get("base_url") or "").strip()
+    model = str(settings.get("model") or "").strip()
+    if not api_key or not base_url or not model:
+        print("[!] ASR 未启用：请配置 asr_model 的 api_key/base_url/model（密钥可用 ASR_API_KEY）")
+        return None
+
+    try:
+        provider = OpenAICompatibleASRProvider(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            timeout_sec=float(settings.get("timeout_sec", 90)),
+            max_retries=int(settings.get("max_retries", 1)),
+        )
+        service = AudioTranscriptionService(
+            provider=provider,
+            max_audio_bytes=int(settings.get("max_audio_bytes", 10 * 1024 * 1024)),
+            max_duration_sec=float(settings.get("max_duration_sec", 120)),
+            max_concurrency=int(settings.get("max_concurrency", 2)),
+            ffmpeg_path=str(settings.get("ffmpeg_path") or "ffmpeg"),
+            ffprobe_path=str(settings.get("ffprobe_path") or "ffprobe"),
+            language=str(settings.get("language") or "").strip() or None,
+            prompt=str(settings.get("prompt") or "").strip() or None,
+        )
+    except (TypeError, ValueError) as exc:
+        print(f"[!] ASR 未启用：配置值无效（{exc}）")
+        return None
+
+    print(f"（网页语音识别：已启用·模型 {model}）")
+    return service
+
+
 def build_shared() -> dict:
     """创建跨会话共享的组件，返回供 agent_factory 复用的配置字典。
 
@@ -69,6 +114,7 @@ def build_shared() -> dict:
 
     # 2) 创建模型 Provider（OpenAI 兼容，默认硅基流动）
     provider = OpenAICompatProvider(config.api_key, config.base_url, config.model)
+    asr_service = build_asr_service(config)
 
     # 3) 技能加载器（扫描 <workspace>/skills 下的 SKILL.md，供摘要注入与技能工具共用）
     skills_dir = os.path.join(config.workspace, "skills")
@@ -160,6 +206,7 @@ def build_shared() -> dict:
     return {
         "config": config,
         "provider": provider,
+        "asr_service": asr_service,
         "tools": tools,
         "context": context,
         "session_manager": session_manager,
@@ -309,6 +356,7 @@ async def amain() -> None:
             "web", bus, cfg.web_host, cfg.web_port, cfg, CONFIG_PATH,
             session_manager=shared["session_manager"],  # 侧边栏读写历史会话
             image_store=shared["image_store"],            # 图片上传落盘
+            asr_service=shared["asr_service"],             # Web 录音即时转写；音频不进入 Bus
         )
         web_channel._clear_callback = clear_callback  # 复用同一清空回调
         channels.append(web_channel)

@@ -6,7 +6,7 @@
 优先级（从低到高）：
 1. 代码内默认值；
 2. ``config.json`` 文件中的字段（存在即覆盖默认）；
-3. 环境变量 ``NANOCLAW_API_KEY``（最高优先级，覆盖一切来源的 api_key）。
+3. 对应的密钥环境变量（最高优先级，覆盖配置文件中的 api_key）。
 
 把敏感信息（API Key）走环境变量、其余走配置文件，是避免密钥误提交进版本库的
 常见做法。
@@ -42,6 +42,8 @@ _CONFIG_FIELDS = (
     # 生图模型：由 generate_image 工具调用，具体服务与模型由用户配置（见 image_gen_model）。
     # 三者皆空视为未配置；api_key 可走环境变量 IMAGE_GEN_API_KEY 覆盖。
     "image_gen_model",
+    # 语音识别：首版用于 Web 端录音转文字；api_key 可由 ASR_API_KEY 覆盖。
+    "asr_model",
 )
 
 
@@ -105,6 +107,26 @@ class NanoClawConfig:
             },
         }
     )
+    # 语音识别与主聊天模型使用独立配置和密钥。未启用或配置不完整时，
+    # 普通文字聊天不受影响，Web 录音接口返回明确的未配置错误。
+    asr_model: dict = field(
+        default_factory=lambda: {
+            "enabled": False,
+            "provider": "openai_compatible",
+            "api_key": "",
+            "base_url": "https://api.openai.com/v1",
+            "model": "gpt-4o-mini-transcribe",
+            "timeout_sec": 90,
+            "max_retries": 1,
+            "max_audio_bytes": 10 * 1024 * 1024,
+            "max_duration_sec": 120,
+            "max_concurrency": 2,
+            "language": "",
+            "prompt": "",
+            "ffmpeg_path": "ffmpeg",
+            "ffprobe_path": "ffprobe",
+        }
+    )
 
 
 def load_config(config_path: str = "config.json") -> NanoClawConfig:
@@ -127,7 +149,14 @@ def load_config(config_path: str = "config.json") -> NanoClawConfig:
             data = json.load(f)
         for key in _CONFIG_FIELDS:
             if key in data and data[key] is not None:
-                setattr(cfg, key, data[key])
+                # ASR 配置允许只覆盖少数字段；其余继续使用当前代码默认值，
+                # 方便未来新增可选参数而不要求用户立刻重写旧 config.json。
+                if key == "asr_model" and isinstance(data[key], dict):
+                    merged = dict(cfg.asr_model)
+                    merged.update(data[key])
+                    setattr(cfg, key, merged)
+                else:
+                    setattr(cfg, key, data[key])
     except FileNotFoundError:
         # 无配置文件：保持默认值即可
         pass
@@ -157,6 +186,12 @@ def load_config(config_path: str = "config.json") -> NanoClawConfig:
         cfg.image_gen_model = dict(cfg.image_gen_model)
         cfg.image_gen_model["api_key"] = env_img_key
 
+    # ASR 使用独立密钥，避免默认复用主聊天模型的权限与账单边界。
+    env_asr_key = os.environ.get("ASR_API_KEY")
+    if env_asr_key:
+        cfg.asr_model = dict(cfg.asr_model)
+        cfg.asr_model["api_key"] = env_asr_key
+
     return cfg
 
 
@@ -166,5 +201,10 @@ def save_config(cfg: NanoClawConfig, config_path: str = "config.json") -> None:
     只写出 ``_CONFIG_FIELDS`` 内的字段，避免把运行时派生状态误存。
     """
     data = {key: getattr(cfg, key) for key in _CONFIG_FIELDS}
+    # load_config 会把环境变量密钥覆盖到运行时配置对象。网页保存其它配置时，
+    # 不应把这份仅供进程使用的 ASR 密钥意外持久化到 config.json。
+    if os.environ.get("ASR_API_KEY") and isinstance(data.get("asr_model"), dict):
+        data["asr_model"] = dict(data["asr_model"])
+        data["asr_model"]["api_key"] = ""
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)

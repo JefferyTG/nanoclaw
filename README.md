@@ -11,6 +11,7 @@ NanoClaw 把「大模型推理」与「消息渠道」解耦：模型在本地�
 ## 特性
 
 - **多渠道接入**：飞书（WebSocket 长连接）、网页（aiohttp + WebSocket，含会话侧边栏、历史接回、断线自动重连）。
+- **网页语音输入**：浏览器录音经可替换 ASR Provider 转成文字后，继续复用原有文本消息、会话与 Agent 流程。
 - **ReAct 工具循环**：模型自主决定调用工具（文件读写、目录列举、执行命令、子 Agent 委派等），带单轮迭代上限与墙钟超时熔断，防卡死。
 - **MCP 扩展**：用 `MCPClientManager` 把任意 MCP Server 包装成本地工具（`{server}__{tool}` 命名），支持多 Server、超时容错、坏 Server 自动跳过。
 - **可插拔 Provider**：基于 OpenAI 兼容接口，硅基流动 / 本地模型均可，支持流式输出。
@@ -76,6 +77,7 @@ nanoclaw/
 ├── bus/                    # 消息总线
 ├── channels/               # 渠道：feishu.py / web.py / cli.py
 ├── providers/              # 模型 Provider（OpenAI 兼容，支持流式）
+├── voice/                  # 音频规范化与可替换 ASR Provider
 ├── session/                # 会话管理（JSONL 持久化）
 ├── skills/                 # 本地技能（SKILL.md）
 ├── mcp_servers/            # 示例 MCP Server（如 poetry_server.py）
@@ -92,6 +94,7 @@ nanoclaw/
 
 - Python 3.13+（推荐用 [uv](https://github.com/astral-sh/uv) 管理环境）
 - 一个 OpenAI 兼容的模型 API Key
+- 使用网页语音输入时需额外安装 `ffmpeg`/`ffprobe`，并配置支持 `/audio/transcriptions` 的 ASR 服务
 
 ### 2. 安装依赖
 
@@ -114,6 +117,7 @@ cp config.example.json config.json
 export NANOCLAW_API_KEY="sk-..."
 export FEISHU_APP_ID="cli_..."
 export FEISHU_APP_SECRET="..."
+export ASR_API_KEY="sk-..."       # 仅网页语音识别需要
 ```
 
 ### 4. 运行
@@ -143,6 +147,7 @@ uv run python main.py
 | `web_host` / `web_port` | 网页渠道监听地址 / 端口（`0`=不启用） | `0.0.0.0` / `0` |
 | `turn_timeout_sec` | 单轮墙钟超时（秒），超时强制终止 | `600` |
 | `mcp_servers` | 外部 MCP Server 配置 | `{}` |
+| `asr_model` | 网页语音识别 Provider、模型、地址、超时、大小与 FFmpeg 配置 | 默认关闭 |
 
 ---
 
@@ -158,7 +163,10 @@ uv run python main.py
 
 - 设 `web_port` 为非零端口，启动后访问 `http://<本机IP>:<端口>/`；
 - 支持流式思考过程、逐字输出、会话侧边栏（历史查看 / 接回 / 删除）；
+- 配置 `asr_model.enabled=true` 后，可点击录音按钮开始/停止录音并转写；音频仅作临时处理，成功后仍按普通文本消息发送；
 - 断线后自动重连并接回当前会话。
+
+浏览器麦克风要求安全上下文：本机开发可使用 `localhost`；从局域网其它设备访问时应通过 HTTPS 反向代理。ASR 的 `api_key` 建议只通过 `ASR_API_KEY` 注入，不在网页配置页展示。
 
 > 网页渠道默认**免登录、局域网信任**，请勿在公网裸暴露。需要访问码可在此基础上自行加固。
 
