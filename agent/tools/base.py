@@ -55,6 +55,10 @@ class Tool(ABC):
         # 直接传给 OpenAI 接口的 tools 参数
     """
 
+    # 注册表对普通工具施加的单次调用兜底超时（秒）。长生命周期工具可以
+    # 覆盖为更长的秒数；设为 None 表示其执行生命周期由工具自身管理。
+    execution_timeout_sec: float | None = 180
+
     @property
     @abstractmethod
     def name(self) -> str:

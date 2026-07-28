@@ -95,6 +95,7 @@ class NanoClawConfig:
             "base_url": "",
             "model": "",
             "timeout_sec": 120,
+            "total_timeout_sec": 600,
             # 图生图（img2img）专用配置；留空则回落到上面通用的 model / 默认装配。
             # 源图编码、键名、位置、强度、标签均由服务商约定，全部可配、不写死任何家。
             "img2img_model": "",

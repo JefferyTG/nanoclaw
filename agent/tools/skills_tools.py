@@ -6,8 +6,8 @@
 - ``ListSkillsTool``：列出当前所有已发现的技能（名称、描述、路径）。
 - ``LoadSkillTool``：读取指定技能 SKILL.md 的完整正文（详细操作指南）。
 
-两个工具都持有一个共享的 ``SkillsLoader`` 实例（由 main.py 在装配时传入），
-因此与注入 System Prompt 的技能摘要使用的是同一份技能目录扫描结果。
+两个工具都持有构造时注入的 ``SkillsLoader``：主 Agent 使用共享 Loader，
+场景 Agent 使用独立的白名单 Loader，因此清单、正文和 System Prompt 摘要一致。
 """
 
 from typing import Optional
@@ -77,4 +77,39 @@ class LoadSkillTool(Tool):
         if content is None:
             return f"错误：未找到技能 '{name}'。可用技能请调用 list_skills 查询。"
 
+        return content
+
+
+class ReadSkillResourceTool(Tool):
+    """Read a text resource from an allowed shared/private Skill, read-only."""
+
+    name = "read_skill_resource"
+    description = (
+        "读取当前 Agent 已授权 Skill 目录中的 UTF-8 文本资源。"
+        "不能访问未授权 Skill、绝对路径或越过 Skill 目录。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "已授权的 Skill 名称。"},
+            "resource_path": {
+                "type": "string",
+                "description": "相对于该 Skill 目录的资源路径。",
+            },
+        },
+        "required": ["name", "resource_path"],
+    }
+
+    def __init__(self, loader: SkillsLoader) -> None:
+        self.loader = loader
+
+    async def execute(self, **kwargs) -> str:
+        name = kwargs.get("name", "")
+        resource_path = kwargs.get("resource_path", "")
+        try:
+            content = self.loader.load_skill_resource(name, resource_path)
+        except ValueError as exc:
+            return f"错误：{exc}"
+        if content is None:
+            return "错误：资源不存在、不是 UTF-8 文本，或不在已授权 Skill 目录内。"
         return content

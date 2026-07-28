@@ -59,6 +59,8 @@ class AgentLoop:
         turn_timeout: int = 600,
         image_store=None,
         base_model_multimodal: bool = False,
+        generated_ids_sink: Optional[list] = None,
+        subagent_runs_sink: Optional[list] = None,
     ):
         self.provider = provider
         self.tools = tools
@@ -76,6 +78,14 @@ class AgentLoop:
         self.image_store = image_store
         # 基础模型是否自带视觉：true→图片直传；false→抽走图片、用 ask_image 工具
         self.base_model_multimodal = base_model_multimodal
+        # Child loops are normally ephemeral, but may contribute image/run
+        # replay metadata to the parent assistant tool-call record.
+        self.generated_ids_sink = generated_ids_sink
+        self.subagent_runs_sink = subagent_runs_sink
+        # The return value is deliberately user-facing text, so callers such as
+        # SpawnSubagentTool need a separate structured lifecycle outcome rather
+        # than guessing timeout/error state from localized message strings.
+        self.last_run_status = "idle"
 
         # 工具调用签名滑动窗口（防爆用），存 "name:args_json"
         self._tool_call_history: List[str] = []
@@ -207,8 +217,13 @@ class AgentLoop:
             new_content = self._user_content(text, msg["images"], base_mm)
             return {"role": "user", "content": new_content}
         # 剥掉渲染专用元数据（OpenAI 不认），避免回传 API 报 400；
-        # generated_images 是 generate_image 落盘图片的历史回放标记，仅前端用。
-        return {k: v for k, v in msg.items() if k not in ("images", "generated_images")}
+        # generated_images / subagent_runs 都是历史回放标记，仅前端用。
+        # 它们不能进入模型上下文，否则兼容 OpenAI 的 API 会拒绝未知字段。
+        return {
+            k: v
+            for k, v in msg.items()
+            if k not in ("images", "generated_images", "subagent_runs")
+        }
 
     async def run(self, user_message: str, images=None, stream_sink=None) -> str:
         """处理一轮用户消息，返回模型最终文本回复。
@@ -224,6 +239,7 @@ class AgentLoop:
 
         事件约定见 ``bus.queue.StreamEvent`` 的文档。
         """
+        self.last_run_status = "running"
         base_mm = self.base_model_multimodal
 
         # 1. 构建初始 messages（注入跨轮历史 + 当前输入）
@@ -276,6 +292,7 @@ class AgentLoop:
                 )
                 if stream_sink is not None:
                     await stream_sink({"type": "done", "content": msg})
+                self.last_run_status = "timed_out"
                 return msg
 
             if use_stream:
@@ -292,6 +309,7 @@ class AgentLoop:
                     msg = "模型响应超时，已终止本轮。"
                     if stream_sink is not None:
                         await stream_sink({"type": "done", "content": msg})
+                    self.last_run_status = "timed_out"
                     return msg
             else:
                 try:
@@ -305,6 +323,7 @@ class AgentLoop:
                     msg = "模型响应超时，已终止本轮。"
                     if stream_sink is not None:
                         await stream_sink({"type": "done", "content": msg})
+                    self.last_run_status = "timed_out"
                     return msg
                 # 离散路径：把整轮响应作为一次性事件推给 sink（无 sink 则返回正文）
                 final_content = await self._emit_discrete(response, stream_sink)
@@ -315,6 +334,7 @@ class AgentLoop:
                 reply = final_content or "未知错误"
                 if stream_sink is not None:
                     await stream_sink({"type": "done", "content": reply})
+                self.last_run_status = "error"
                 return reply
 
             # c. 模型请求调用工具
@@ -355,6 +375,7 @@ class AgentLoop:
                     # 流式路径必须补 done，否则网页端卡在「思考中」
                     if stream_sink is not None:
                         await stream_sink({"type": "done", "content": stop})
+                    self.last_run_status = "error"
                     return stop
                 continue
 
@@ -371,6 +392,7 @@ class AgentLoop:
             messages.append(final_msg)
             self._persist(final_msg)
             self._save_to_history(messages)
+            self.last_run_status = "completed"
             return final_content
 
         # 3. 跑满 max_iterations 仍未结束 → 超时
@@ -380,6 +402,7 @@ class AgentLoop:
         )
         if stream_sink is not None:
             await stream_sink({"type": "done", "content": timeout_msg})
+        self.last_run_status = "timed_out"
         return timeout_msg
 
     async def _run_streamed(self, messages: list, stream_sink) -> tuple:
@@ -456,8 +479,16 @@ class AgentLoop:
                 （而非调用方提前持久化），以便把 generate_image 生成的 image_id
                 写回元数据，供历史回放渲染图片。
         """
-        # 收集本轮 generate_image 生成的 image_id，执行完后写回 assistant_msg 元数据
-        gen_ids: list = []
+        # 收集本轮 generate_image 生成的 image_id 与子 Agent 运行摘要，执行完后
+        # 写回 assistant_msg 元数据，供网页历史回放。两者均不得进入模型上下文。
+        gen_ids: list = (
+            self.generated_ids_sink if isinstance(self.generated_ids_sink, list) else []
+        )
+        subagent_runs: list = (
+            self.subagent_runs_sink
+            if isinstance(self.subagent_runs_sink, list)
+            else []
+        )
 
         for tc in response.tool_calls:
             sig_args = json.dumps(tc.arguments, ensure_ascii=False)
@@ -504,9 +535,35 @@ class AgentLoop:
             if tc.name == "generate_image":
                 exec_args["stream_sink"] = stream_sink
                 exec_args["_generated_ids"] = gen_ids
+            elif tc.name == "spawn_subagent":
+                # 子 Agent 继承的是父会话归属，而不是临时 child session；这样其
+                # 生成的图片可由父会话的历史 API 稳定找回。stream sink 会在工具
+                # 内转换为隔离的 subagent_event，绝不会发送 child 的顶层 done。
+                exec_args["_parent_stream_sink"] = stream_sink
+                exec_args["_parent_session_key"] = self.session_key
+                exec_args["_parent_generated_ids"] = gen_ids
+                exec_args["_parent_subagent_runs"] = subagent_runs
+                exec_args["_parent_tool_call_id"] = tc.id
             # 记录工具执行耗时（毫秒），随 tool_result 事件推给网页端展示
             t_start = time.monotonic()
-            result = await self.tools.execute(tc.name, exec_args)
+            try:
+                result = await self.tools.execute(tc.name, exec_args)
+            except asyncio.CancelledError:
+                # A child run may already have emitted useful terminal metadata
+                # before cancellation reaches this parent loop. Persist a valid,
+                # standalone assistant record so historical Web sessions can
+                # replay that run without storing an unmatched tool_calls item.
+                if gen_ids or subagent_runs:
+                    interrupted_record = {
+                        "role": "assistant",
+                        "content": "（本轮工具执行已取消）",
+                    }
+                    if gen_ids:
+                        interrupted_record["generated_images"] = list(gen_ids)
+                    if subagent_runs:
+                        interrupted_record["subagent_runs"] = list(subagent_runs)
+                    self._persist(interrupted_record)
+                raise
             duration_ms = int((time.monotonic() - t_start) * 1000)
             self._print_tool_result(tc.name, result)
             if stream_sink is not None:
@@ -524,16 +581,15 @@ class AgentLoop:
             messages.append(tool_msg)
             self._persist(tool_msg)
 
-        # 正常执行完毕：把 assistant_msg 落盘；若本轮生成了图片，附上 image_id 元数据
+        # 正常执行完毕：把 assistant_msg 落盘；附加的展示元数据只写入持久化副本，
+        # 内存 messages 保持 OpenAI 兼容格式。
         if assistant_msg is not None:
+            record = dict(assistant_msg)
             if gen_ids:
-                record = dict(assistant_msg)
                 record["generated_images"] = gen_ids
-                self._persist(record)
-                # 内存副本保持干净，避免下一轮把 generated_images 回传给 API 触发 400
-                assistant_msg.pop("generated_images", None)
-            else:
-                self._persist(assistant_msg)
+            if subagent_runs:
+                record["subagent_runs"] = subagent_runs
+            self._persist(record)
         return None
 
     def _check_tool_loop(self, tool_name: str, tool_args_json: str) -> Optional[str]:

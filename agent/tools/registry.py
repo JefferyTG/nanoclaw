@@ -15,16 +15,17 @@
   返回，模型可以据此决定下一步（重试 / 换工具 / 直接回答）。
 """
 
-from typing import Dict, List
+from collections.abc import Iterable
+from typing import Dict, List, Optional
 
 import asyncio
 
 from agent.tools.base import Tool
 
 
-# 单个工具执行的兜底超时（秒）：任何工具（含没有自带超时的工具）的单次调用
-# 超过此值即被强制终止，转成错误字符串返回，避免「一个工具卡死」把整个回合
-# 无限拖住。Shell 工具有更紧的 60s 内部超时，会先于此值触发。
+# 普通工具的默认单次调用兜底超时（秒）。每个 Tool 可通过
+# execution_timeout_sec 覆盖；None 表示不使用 Registry 外层超时，由工具自身
+# 的生命周期和取消语义负责。Shell 工具有更紧的 60s 内部超时，会先于此值触发。
 TOOL_EXEC_TIMEOUT = 180
 
 
@@ -70,6 +71,18 @@ class ToolRegistry:
         """返回所有已注册工具的名称列表（按注册顺序）。"""
         return list(self._tools.keys())
 
+    def get(self, name: str) -> Optional[Tool]:
+        """按名称返回工具实例；不存在时返回 ``None``。"""
+        return self._tools.get(name)
+
+    def get_many(self, names: Iterable[str]) -> List[Tool]:
+        """按输入顺序返回存在的工具，忽略未知名称。"""
+        return [self._tools[name] for name in names if name in self._tools]
+
+    def iter_tools(self):
+        """按注册顺序迭代工具实例，不暴露内部映射。"""
+        return iter(self._tools.values())
+
     async def execute(self, name: str, arguments: dict) -> str:
         """按名称异步执行某个工具。
 
@@ -88,12 +101,19 @@ class ToolRegistry:
         if tool is None:
             return f"错误：未找到工具 '{name}'"
 
+        timeout = getattr(tool, "execution_timeout_sec", TOOL_EXEC_TIMEOUT)
+        if timeout is None:
+            # 不捕获 CancelledError：调用方关闭或回合取消时必须传递到工具，
+            # 由工具的 finally/上下文管理器释放自身资源。
+            try:
+                return await tool.execute(**arguments)
+            except Exception as exc:  # noqa: BLE001 - 统一把异常转成字符串反馈给模型
+                return f"工具 '{name}' 执行出错：{exc}"
+
         try:
-            return await asyncio.wait_for(
-                tool.execute(**arguments), timeout=TOOL_EXEC_TIMEOUT
-            )
+            return await asyncio.wait_for(tool.execute(**arguments), timeout=timeout)
         except asyncio.TimeoutError:
             # 兜底超时：避免无自带超时的工具卡死整轮
-            return f"工具 '{name}' 执行超时（{TOOL_EXEC_TIMEOUT}秒），已终止"
+            return f"工具 '{name}' 执行超时（{timeout}秒），已终止"
         except Exception as exc:  # noqa: BLE001 - 统一把异常转成字符串反馈给模型
             return f"工具 '{name}' 执行出错：{exc}"

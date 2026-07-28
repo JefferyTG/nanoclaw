@@ -148,6 +148,7 @@ uv run python main.py
 | `web_host` / `web_port` | 网页渠道监听地址 / 端口（`0`=不启用） | `0.0.0.0` / `0` |
 | `turn_timeout_sec` | 单轮墙钟超时（秒），超时强制终止 | `600` |
 | `mcp_servers` | 外部 MCP Server 配置 | `{}` |
+| `image_gen_model` | 生图服务配置；`timeout_sec` 是单次 HTTP 请求上限，`total_timeout_sec` 是包含重试、退避与下载的整次任务预算 | 单次 `120` 秒 / 总计 `600` 秒 |
 | `asr_model` | 网页语音识别 Provider、模型、地址、超时、大小与 FFmpeg 配置 | 默认关闭 |
 | `tts_model` | 网页自动朗读的 Provider、音色、语速、超时与资源上限 | Edge TTS 后端就绪，页面默认关闭 |
 
@@ -165,6 +166,7 @@ uv run python main.py
 
 - 设 `web_port` 为非零端口，启动后访问 `http://<本机IP>:<端口>/`；
 - 支持流式思考过程、逐字输出、会话侧边栏（历史查看 / 接回 / 删除）；
+- 子 Agent 执行过程会显示为独立的可折叠面板，包括层级、状态、内部工具和耗时；重新打开历史会话时仍可查看结果，旧版会话也会从已有工具记录尽量恢复；
 - 配置 `asr_model.enabled=true` 后，可点击录音按钮开始/停止录音并转写；音频仅作临时处理，成功后仍按普通文本消息发送；
 - 喇叭按钮默认关闭；开启后按自然语义片段朗读 Agent 后续的新回复，再次点击会立即停止当前朗读；
 - 断线后自动重连并接回当前会话。
@@ -217,10 +219,15 @@ uv run python main.py
 
 ## 开发
 
+跨会话协作、验证矩阵和完成标准见 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md)；接手项目前先阅读 [`AGENTS.md`](AGENTS.md) 和 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。历史决策与当前遗留问题统一维护在 [`docs/DECISIONS.md`](docs/DECISIONS.md)。
+
 ```bash
-uv run python -m pytest          # 运行测试（如已补充）
-uv run python main.py            # 本地调试
+uv run python -m compileall -q agent bus channels providers session  # 基础语法检查
+uv run python -c "import main"                                      # 导入链冒烟
+uv run python main.py                                                # 本地调试
 ```
+
+仓库当前尚未建立正式测试套件；新增功能和 Bug 修复应按开发流程补充可重复的回归测试。
 
 新增内置工具：在 `agent/tools/` 下继承 `Tool` 基类并实现 `name` / `description` / `parameters` / `execute` / `to_function_definition`。
 

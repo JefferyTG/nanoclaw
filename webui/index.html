@@ -53,6 +53,21 @@
   .tool-card.expanded .tc-args { display:block; }                      /* 展开才看入参 */
   .tool-card.expanded.has-result .tc-result { display:block; }         /* 有结果才展示出参 */
 
+  /* —— 子 Agent：嵌在父回合内，事件和正文均不混入主回答 —— */
+  .subagents { display:flex; flex-direction:column; gap:6px; }
+  .subagent { border:1px solid #37506e; border-radius:10px; background:#121923; overflow:hidden; }
+  .subagent .sa-head { cursor:pointer; padding:7px 10px; color:#9bc9ff; font-size:12px; display:flex; gap:6px; align-items:center; }
+  .subagent .sa-head::before { content:"▸"; font-size:10px; }
+  .subagent.expanded .sa-head::before { content:"▾"; }
+  .subagent .sa-name { font-weight:600; }
+  .subagent .sa-depth, .subagent .sa-dur { color:#7fa5d0; white-space:nowrap; }
+  .subagent .sa-status { margin-left:auto; white-space:nowrap; color:var(--muted); }
+  .subagent.live .sa-status { color:var(--accent); }
+  .subagent .sa-body { display:none; padding:0 10px 10px; border-top:1px dashed #37506e; }
+  .subagent.expanded .sa-body { display:block; }
+  .subagent .sa-output { color:#b9cce1; white-space:pre-wrap; word-break:break-word; font-size:12px; line-height:1.5; max-height:150px; overflow:auto; }
+  .subagent .sa-tools { display:flex; flex-direction:column; gap:5px; margin-top:7px; }
+
   /* —— 正式回答：与思考过程明显分隔 —— */
   .answer-wrap { border:1px solid var(--line); border-radius:10px; background:var(--panel); overflow:hidden; }
   .answer-label { padding:6px 11px; font-size:11px; color:var(--muted); border-bottom:1px solid var(--line); letter-spacing:.04em; }
@@ -481,6 +496,7 @@
                     + '<div class="think-body"></div>';
 
     var activity = document.createElement('div'); activity.className = 'activity';
+    var subagents = document.createElement('div'); subagents.className = 'subagents';
 
     // 机器人回合内联图片条（生图工具 generate_image 的 image 事件会往这里塞 <img>）
     var botImages = document.createElement('div'); botImages.className = 'img-strip bot-images';
@@ -491,6 +507,7 @@
 
     root.appendChild(think);
     root.appendChild(activity);
+    root.appendChild(subagents);
     root.appendChild(botImages);
     root.appendChild(ansWrap);
     chat.appendChild(root); chat.scrollTop = chat.scrollHeight;
@@ -498,7 +515,7 @@
              thinkBody: think.querySelector('.think-body'),
              thinkPreview: think.querySelector('.sum-preview'),
              thinkDur: think.querySelector('.sum-dur'),
-             activity: activity, botImages: botImages, answer: answer,
+             activity: activity, subagents: subagents, subagentRuns: {}, botImages: botImages, answer: answer,
              answerStarted: false, lastTool: null,
              ttsEligible: ttsEnabled, ttsGeneration: ttsGeneration,
              ttsReplyId: ++ttsReplySeq, ttsBuffer: '', ttsSegmentCount: 0,
@@ -514,6 +531,125 @@
       c.thinkPreview.textContent = '（模型未返回思考内容）';
     }
     c.thinkDur.textContent = fmtDur(performance.now() - c.thinkStart);
+  }
+
+  function subagentLabel(depth) {
+    return depth > 0 ? ('第 ' + depth + ' 层') : '子 Agent';
+  }
+  function newSubagentPanel(turn, run) {
+    var runId = String(run.run_id || run.id || ('history-' + Object.keys(turn.subagentRuns).length));
+    if (turn.subagentRuns[runId]) return turn.subagentRuns[runId];
+    var depth = Number(run.depth || 0);
+    var root = document.createElement('div'); root.className = 'subagent live';
+    // 仅作轻量视觉层级，不让异常 depth 把面板推到屏幕外。
+    root.style.marginLeft = (Math.min(Math.max(depth, 0), 4) * 12) + 'px';
+    root.innerHTML = '<div class="sa-head"><span class="sa-name"></span><span class="sa-depth"></span>'
+                   + '<span class="sa-status">⏳ 运行中</span><span class="sa-dur"></span></div>'
+                   + '<div class="sa-body"><div class="sa-output"></div><div class="sa-tools"></div></div>';
+    root.querySelector('.sa-name').textContent = '🤖 ' + (run.agent_name || run.name || '子 Agent');
+    root.querySelector('.sa-depth').textContent = subagentLabel(depth);
+    turn.subagents.appendChild(root);
+    var panel = { id: runId, root: root, output: root.querySelector('.sa-output'), tools: root.querySelector('.sa-tools'),
+                  status: root.querySelector('.sa-status'), dur: root.querySelector('.sa-dur'), lastTool: null,
+                  start: performance.now(), ended: false };
+    panel.timer = setInterval(function () {
+      if (!panel.ended) panel.dur.textContent = fmtDur(performance.now() - panel.start);
+    }, 100);
+    turn.subagentRuns[runId] = panel;
+    return panel;
+  }
+  function appendSubagentTool(panel, ev) {
+    var card = document.createElement('div'); card.className = 'tool-card';
+    card.innerHTML = '<div class="tc-head"><span class="tc-name"></span><span class="tc-status">⏳ 执行中</span><span class="tc-dur"></span></div>'
+                   + '<div class="tc-args"></div><div class="tc-result"></div>';
+    card.querySelector('.tc-name').textContent = '🔧 ' + (ev.name || '工具');
+    card.querySelector('.tc-args').textContent = ev.args != null ? String(ev.args) : '';
+    card._start = performance.now();
+    card._timer = setInterval(function () { card.querySelector('.tc-dur').textContent = fmtDur(performance.now() - card._start); }, 100);
+    panel.tools.appendChild(card); panel.lastTool = card;
+    return card;
+  }
+  function finishSubagentTool(card, ev) {
+    if (!card) return;
+    if (card._timer) { clearInterval(card._timer); card._timer = null; }
+    card.classList.add('has-result');
+    card.querySelector('.tc-result').textContent = ev.content != null ? String(ev.content) : '';
+    var ms = typeof ev.duration_ms === 'number' ? ev.duration_ms : performance.now() - card._start;
+    card.querySelector('.tc-dur').textContent = fmtDur(ms);
+    var toolStatus = String(ev.status || (ev.error ? 'error' : 'completed')).toLowerCase();
+    if (toolStatus === 'running') card.querySelector('.tc-status').textContent = '⏳ 执行中';
+    else if (toolStatus === 'timed_out' || toolStatus === 'timeout') card.querySelector('.tc-status').textContent = '⏱ 超时';
+    else if (toolStatus === 'cancelled' || toolStatus === 'canceled') card.querySelector('.tc-status').textContent = '⚪ 已取消';
+    else if (toolStatus === 'error' || toolStatus === 'failed' || ev.error) card.querySelector('.tc-status').textContent = '❌ 失败';
+    else card.querySelector('.tc-status').textContent = '✅ 完成';
+  }
+  function finishSubagentPanel(panel, ev) {
+    if (panel.ended) return;
+    panel.ended = true;
+    if (panel.timer) { clearInterval(panel.timer); panel.timer = null; }
+    panel.tools.querySelectorAll('.tool-card').forEach(function (card) {
+      if (card._timer) { clearInterval(card._timer); card._timer = null; }
+    });
+    panel.root.classList.remove('live');
+    var ms = typeof ev.duration_ms === 'number' ? ev.duration_ms : performance.now() - panel.start;
+    panel.dur.textContent = fmtDur(ms);
+    var status = String(ev.status || (ev.type === 'error' ? 'error' : '')).toLowerCase();
+    if (status === 'success' || status === 'succeeded' || status === 'completed' || (!status && ev.ok !== false)) {
+      panel.status.textContent = '✅ 成功';
+    } else if (status === 'timed_out' || status === 'timeout') {
+      panel.status.textContent = '⏱ 超时';
+    } else if (status === 'cancelled' || status === 'canceled') {
+      panel.status.textContent = '⚪ 已取消';
+    } else if (status === 'error' || status === 'failed' || ev.ok === false) {
+      panel.status.textContent = '❌ 失败';
+    } else {
+      panel.status.textContent = '⚠ 已结束';
+    }
+    // 后端终态会携带 final_result，但流式 token 往往已经显示过相同内容。
+    var finalContent = ev.content != null ? String(ev.content) : '';
+    if (finalContent && panel.output.textContent.indexOf(finalContent) === -1) {
+      panel.output.textContent += (panel.output.textContent ? '\n' : '') + finalContent;
+    }
+  }
+  function onSubagentEvent(turn, wrapped) {
+    var ev = wrapped.event || {};
+    if (typeof ev === 'string') ev = { type: ev, content: wrapped.content };
+    var panel = newSubagentPanel(turn, wrapped);
+    var type = ev.type || ev.event || 'thinking';
+    if (type === 'start') {
+      if (ev.content) panel.output.textContent += String(ev.content);
+    } else if (type === 'thinking' || type === 'token') {
+      // 子 Agent 的 token 只显示在此面板，绝不能进入父答案或 TTS。
+      panel.output.textContent += String(ev.content || '');
+    } else if (type === 'tool_call') {
+      appendSubagentTool(panel, ev);
+    } else if (type === 'tool_result') {
+      finishSubagentTool(panel.lastTool, ev);
+    } else if (type === 'image') {
+      // 图片归属仍由 generated_images 统一持久化；这里只做实时预览。
+      var im = document.createElement('img');
+      im.src = ev.url || ('/image?key=' + encodeURIComponent(currentKey) + '&id=' + encodeURIComponent(ev.id || ''));
+      im.loading = 'lazy'; turn.botImages.appendChild(im);
+    } else if (type === 'done' || type === 'error') {
+      finishSubagentPanel(panel, ev);
+    }
+    chat.scrollTop = chat.scrollHeight;
+  }
+  function clearSubagentTimers(turn) {
+    if (!turn || !turn.subagentRuns) return;
+    Object.keys(turn.subagentRuns).forEach(function (id) {
+      var panel = turn.subagentRuns[id];
+      if (panel.timer) { clearInterval(panel.timer); panel.timer = null; }
+      panel.tools.querySelectorAll('.tool-card').forEach(function (card) {
+        if (card._timer) { clearInterval(card._timer); card._timer = null; }
+      });
+      if (!panel.ended) {
+        panel.ended = true;
+        panel.root.classList.remove('live');
+        panel.status.textContent = '⚠ 已结束';
+        panel.dur.textContent = fmtDur(performance.now() - panel.start);
+      }
+    });
   }
 
   function onEvent(ev) {
@@ -534,8 +670,13 @@
       loadSessions();
       return;
     }
-    if (!cur) cur = newTurn();
     var t = ev.type;
+    if (t === 'subagent_event') {
+      if (!cur) cur = newTurn();
+      onSubagentEvent(cur, ev);
+      return;
+    }
+    if (!cur) cur = newTurn();
     if (t === 'thinking') {
       // 全文累积到 body（仅展开时可见），单行预览随思考流式刷新
       cur.thinkBody.textContent += (ev.content || '');
@@ -591,6 +732,7 @@
       if (cur.activity) cur.activity.querySelectorAll('.tool-card').forEach(function (tc) {
         if (tc._timer) { clearInterval(tc._timer); tc._timer = null; }
       });
+      clearSubagentTimers(cur);
       cur.think.classList.remove('live');
       finishThink(cur);   // 兜底：无论是否出 token，回合结束都记录思考时长
       if (!cur.answerStarted && ev.content) {
@@ -609,12 +751,14 @@
       loadSessions();   // 刷新侧边栏：新会话出现 / 预览与末次时间更新
     }
   }
-  // 点标题折叠/展开：思考面板 (.sum) 与 工具卡片 (.tc-head)
+  // 点标题折叠/展开：思考面板 (.sum)、子 Agent (.sa-head) 与工具卡片 (.tc-head)
   chat.addEventListener('click', function (e) {
     var tgt = e.target;
     if (!tgt || !tgt.classList || !tgt.closest) return;
     var sumEl = tgt.closest('.sum');
     if (sumEl) { sumEl.parentNode.classList.toggle('collapsed'); return; }
+    var subagentHead = tgt.closest('.sa-head');
+    if (subagentHead) { subagentHead.parentNode.classList.toggle('expanded'); return; }
     var head = tgt.closest('.tc-head');
     if (head) { head.parentNode.classList.toggle('expanded'); }
   });
@@ -642,6 +786,7 @@
       // 旧连接不会再送达 done；直接废弃其回合，避免“静音到 done”状态污染重连后的首条回复。
       stopTts();
       ttsDiscardUntilDone = false;
+      clearSubagentTimers(cur);
       cur = null;
       statusEl.textContent = '已断开 · 重连中…';
       statusEl.style.color = '#d98c00';
@@ -1004,6 +1149,7 @@
     if (!canChangeSession()) return;
     if (!ws || ws.readyState !== WebSocket.OPEN) { addSys('连接未就绪，无法打开会话'); return; }
     stopTtsForTransition();
+    clearSubagentTimers(cur);
     ws.send(JSON.stringify({ ctl: true, type: 'open', key: key }));
     fetch('/api/session?key=' + encodeURIComponent(key)).then(function (r) { return r.json(); }).then(function (d) {
       currentKey = key;
@@ -1019,6 +1165,7 @@
     if (!canChangeSession()) return;
     if (!ws || ws.readyState !== WebSocket.OPEN) { addSys('连接未就绪'); return; }
     stopTtsForTransition();
+    clearSubagentTimers(cur);
     ws.send(JSON.stringify({ ctl: true, type: 'new' }));
     chat.innerHTML = '';
     cur = null;
@@ -1039,8 +1186,58 @@
       }).catch(function (e) { alert('删除失败：' + e); });
   }
 
+  function restoreSubagentRun(turn, run, fallback, toolResults) {
+    run = run || {};
+    var panel = newSubagentPanel(turn, {
+      run_id: run.run_id || run.id || (fallback && fallback.run_id),
+      agent_name: run.agent_name || run.name || (fallback && fallback.agent_name) || '子 Agent',
+      depth: run.depth || (fallback && fallback.depth) || 0
+    });
+    var events = Array.isArray(run.events) ? run.events : [];
+    events.forEach(function (event) {
+      onSubagentEvent(turn, { run_id: panel.id, agent_name: run.agent_name || run.name, depth: run.depth, event: event });
+    });
+    // 新记录可以只保存摘要，不必保留完整流事件；照样恢复工具和最终结果。
+    var toolSteps = Array.isArray(run.tool_steps) ? run.tool_steps : (Array.isArray(run.tools) ? run.tools : []);
+    toolSteps.forEach(function (tool) {
+      var card = appendSubagentTool(panel, tool);
+      finishSubagentTool(card, tool);
+    });
+    // 子 Agent 完整结果本来就是父 spawn 工具的 tool 消息；优先用它，
+    // run.final_result 只是为快速回放保留的有界摘要。
+    var result = run.tool_call_id && toolResults ? toolResults[run.tool_call_id] : null;
+    if (result == null) result = run.final_result;
+    if (result == null) result = run.result;
+    if (result == null) result = run.content;
+    if (result != null && !events.length) panel.output.textContent = String(result);
+    finishSubagentPanel(panel, {
+      type: run.status === 'error' || run.error ? 'error' : 'done',
+      status: run.status,
+      ok: run.ok,
+      content: events.length ? result : '',
+      duration_ms: run.duration_ms
+    });
+  }
+  function oldSpawnFallback(turn, call, toolResults) {
+    var fn = call && call.function;
+    if (!fn || fn.name !== 'spawn_subagent') return;
+    var args = {};
+    try { args = JSON.parse(fn.arguments || '{}') || {}; } catch (_err) { args = {}; }
+    var result = toolResults[call.id];
+    restoreSubagentRun(turn, {
+      run_id: 'legacy-' + (call.id || Object.keys(turn.subagentRuns).length),
+      agent_name: args.agent_name || args.name || '子 Agent',
+      depth: 0,
+      status: 'success',
+      final_result: result != null ? result : '（历史记录未保存子 Agent 结果）'
+    }, null, toolResults);
+  }
   // 历史回放：把磁盘消息重建为聊天视图（思考折叠、正式回答展开）
   function renderHistory(records) {
+    var toolResults = {};
+    (records || []).forEach(function (m) {
+      if (m && m.role === 'tool' && m.tool_call_id) toolResults[m.tool_call_id] = m.content || '';
+    });
     (records || []).forEach(function (m) {
       var role = m.role;
       if (role === 'user') {
@@ -1068,6 +1265,12 @@
         }
         c.think.classList.remove('live');
         finishThink(c);
+        if (Array.isArray(m.subagent_runs) && m.subagent_runs.length) {
+          m.subagent_runs.forEach(function (run) { restoreSubagentRun(c, run, null, toolResults); });
+        } else if (Array.isArray(m.tool_calls)) {
+          // 升级前没有 subagent_runs：从 spawn 的 tool_call 与对应 tool 结果复原最小面板。
+          m.tool_calls.forEach(function (call) { oldSpawnFallback(c, call, toolResults); });
+        }
         // 回放本轮生成的图片（generate_image 落盘 + generated_images 元数据）
         if (m.generated_images && m.generated_images.length && currentKey) {
           m.generated_images.forEach(function (iid) {

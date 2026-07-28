@@ -17,6 +17,7 @@ memory/USER.md、memory/MEMORY.md）与时间里的信息，统一收敛成模�
 
 import os
 from datetime import datetime
+from collections.abc import Callable
 from typing import List, Optional
 
 # 文件缺失时使用的默认人设
@@ -35,10 +36,14 @@ class ContextBuilder:
         workspace: str,
         identity_file: str = "identity.md",
         skills_summary: str = "",
+        agents_summary: str = "",
+        agents_summary_provider: Optional[Callable[[], str]] = None,
     ):
         self.workspace = os.path.abspath(workspace)
         self.identity_file = identity_file
         self.skills_summary = skills_summary
+        self.agents_summary = agents_summary
+        self.agents_summary_provider = agents_summary_provider
         # 注意：MEMORY.md 路径按第六章约定放在 <workspace>/memory/ 下
         self.memory_path = os.path.join(self.workspace, "workspace", "memory", "MEMORY.md")
         # USER.md：用户长期稳定信息（身份/兴趣/偏好），与 MEMORY.md 同级
@@ -109,7 +114,7 @@ class ContextBuilder:
         """拼接完整 System Prompt。
 
         顺序：人设 → 工作区 → 用户信息(USER,可选) → 长期记忆(MEMORY,可选)
-              → 记忆指引 → 可用技能（可选）→ 当前时间（末尾）。
+              → 记忆指引 → 可用技能（可选）→ 子 Agent 摘要 → 当前时间（末尾）。
 
         说明：当前时间刻意放到最后，使前面的人设/工作区/记忆/技能等
         固定内容始终处于前缀位置，避免每次时间变化导致整段前缀无法命中
@@ -136,6 +141,21 @@ class ContextBuilder:
         # 若注入了技能摘要，追加「可用技能」段
         if self.skills_summary:
             prompt += "\n\n## 可用技能\n" + self.skills_summary
+
+        prompt += (
+            "\n\n## 子 Agent 派遣\n"
+            "复杂通用任务可以直接调用 spawn_subagent(task)，无需指定 agent_name。\n"
+            "只有明确需要某个场景能力时，才调用 "
+            "spawn_subagent(agent_name=..., task=...)。"
+        )
+        agents_summary = self.agents_summary
+        if self.agents_summary_provider is not None:
+            try:
+                agents_summary = self.agents_summary_provider()
+            except Exception:  # noqa: BLE001 - Profile 损坏不应阻断主对话
+                pass
+        if agents_summary:
+            prompt += "\n\n## 可派遣的场景 Agent\n" + agents_summary
 
         # 当前时间放到最后：避免每次时间变化导致前缀（人设/工作区/记忆/技能）无法命中缓存
         prompt += f"\n\n【当前时间】\n{now}"

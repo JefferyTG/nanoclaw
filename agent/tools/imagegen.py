@@ -22,8 +22,9 @@
 - 图片字节**下载后落本地 ImageStore**（与 ask_image 同目录，随 /clear 清理）。
 - 显示：**新增 ``image`` 流事件**——生图成功后通过 ``stream_sink`` 推给网页端，
   在对话气泡里内联显示（非网页渠道 stream_sink 为 None，退化为仅落盘 + 文本结果）。
-- 超时防护：**工具内 HTTP 超时（默认 120s，可配 image_gen_model.timeout_sec）+ 429/5xx
-  有限重试**；超时/限流返回文本给主模型优雅收尾，不抛异常、不拖垮整轮。
+- 超时防护：**单次 HTTP 超时**（默认 120s，可配 ``image_gen_model.timeout_sec``）与
+  **整次生图任务预算**（默认 600s，可配 ``image_gen_model.total_timeout_sec``）分离。
+  429/5xx/短暂网络错误会在总预算内有限重试；超时/取消会关闭 HTTP 资源。
 - HTTP 客户端用 **httpx**（项目已依赖）：直接打图像端点，精确控制 timeout 与重试。
 """
 
@@ -46,6 +47,8 @@ _GEN_PATH = "/images/generations"
 _MAX_ATTEMPTS = 3
 _RETRY_429_WAIT = 8
 _RETRY_5XX_WAIT = 5
+_DEFAULT_TOTAL_TIMEOUT = 600.0
+_CLEANUP_GRACE_SECONDS = 5.0
 
 
 class GenerateImageTool(Tool):
@@ -97,7 +100,7 @@ class GenerateImageTool(Tool):
         "required": ["prompt"],
     }
 
-    def __init__(self, image_store, config) -> None:
+    def __init__(self, image_store, config, *, client_factory=None) -> None:
         """初始化。
 
         参数：
@@ -108,6 +111,8 @@ class GenerateImageTool(Tool):
         """
         self.image_store = image_store
         self.config = config
+        # 仅测试时注入；生产环境每次执行都创建独立 client，便于取消时确定关闭连接。
+        self._client_factory = client_factory or httpx.AsyncClient
         # 本地读图的边界根目录：与 read_file / ask_image 等文件系统工具保持一致的工作区隔离
         self.workspace = os.path.abspath(getattr(config, "workspace", "."))
 
@@ -124,12 +129,37 @@ class GenerateImageTool(Tool):
         return bool(c.get("api_key") and c.get("base_url") and c.get("model"))
 
     def _timeout(self) -> float:
-        """生图 HTTP 超时（秒）：取自 image_gen_model.timeout_sec，缺省回落 120。"""
+        """单次 HTTP 请求超时（秒）：取自配置，缺省回落 120。"""
         c = self._gen_cfg()
         t = c.get("timeout_sec")
         if isinstance(t, (int, float)) and t > 0:
             return float(t)
         return 120.0
+
+    def _total_timeout(self) -> float:
+        """整次生图任务的墙钟预算，包含退避等待和图片下载。"""
+        t = self._gen_cfg().get("total_timeout_sec")
+        if isinstance(t, (int, float)) and t > 0:
+            return float(t)
+        return _DEFAULT_TOTAL_TIMEOUT
+
+    @property
+    def execution_timeout_sec(self) -> float:
+        """让内部 deadline 先触发，预留短暂时间给 async context manager 清理资源。"""
+        return self._total_timeout() + _CLEANUP_GRACE_SECONDS
+
+    @staticmethod
+    def _remaining(deadline: float) -> float:
+        return deadline - asyncio.get_running_loop().time()
+
+    @classmethod
+    async def _sleep_with_deadline(cls, seconds: float, deadline: float) -> bool:
+        """在剩余预算内退避；取消必须原样向上传播。"""
+        remaining = cls._remaining(deadline)
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(seconds, remaining))
+        return cls._remaining(deadline) > 0
 
     def _img2img_model(self) -> str:
         """图生图模型：优先 img2img_model，缺省回落到通用 model。"""
@@ -351,73 +381,110 @@ class GenerateImageTool(Tool):
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
-        timeout = httpx.Timeout(self._timeout())
+        deadline = asyncio.get_running_loop().time() + self._total_timeout()
 
-        # —— 调生图服务：超时 + 429/5xx 有限重试，失败优雅收尾 ——
+        # 单次请求、退避和下载都服从同一个绝对 deadline。内部 deadline 比 Registry
+        # 的 execution_timeout_sec 略早，确保 async with 有机会关闭客户端和连接。
         raw = None
+        resp = None
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                for attempt in range(_MAX_ATTEMPTS):
+            async with asyncio.timeout(self._total_timeout()):
+                async with self._client_factory() as client:
                     try:
-                        resp = await client.post(url, json=payload, headers=headers)
-                    except (httpx.TimeoutException, httpx.RequestError) as exc:
-                        if attempt == _MAX_ATTEMPTS - 1:
+                        for attempt in range(_MAX_ATTEMPTS):
+                            remaining = self._remaining(deadline)
+                            if remaining <= 0:
+                                return "⚠️ 生图任务超时：已完成资源释放，请稍后重试。"
+                            try:
+                                resp = await client.post(
+                                    url,
+                                    json=payload,
+                                    headers=headers,
+                                    timeout=httpx.Timeout(min(self._timeout(), remaining)),
+                                )
+                            except (httpx.TimeoutException, httpx.RequestError) as exc:
+                                if attempt == _MAX_ATTEMPTS - 1:
+                                    return (
+                                        f"⚠️ 生图请求失败（{type(exc).__name__}），已重试 "
+                                        f"{_MAX_ATTEMPTS} 次仍未成功。你可以稍后再试，或检查网络。"
+                                    )
+                                if not await self._sleep_with_deadline(
+                                    min(2 * (attempt + 1), 10), deadline
+                                ):
+                                    return "⚠️ 生图任务超时：已完成资源释放，请稍后重试。"
+                                continue
+
+                            if resp.status_code == 429 or resp.status_code >= 500:
+                                status = resp.status_code
+                                await resp.aclose()
+                                resp = None
+                                if attempt == _MAX_ATTEMPTS - 1:
+                                    if status == 429:
+                                        return "⚠️ 生图接口限流（429），重试后仍未成功，请稍后再试。"
+                                    return (
+                                        f"⚠️ 生图接口服务端错误（{status}），"
+                                        f"重试 {_MAX_ATTEMPTS} 次仍未成功，请稍后再试。"
+                                    )
+                                wait = _RETRY_429_WAIT if status == 429 else _RETRY_5XX_WAIT
+                                if not await self._sleep_with_deadline(wait, deadline):
+                                    return "⚠️ 生图任务超时：已完成资源释放，请稍后重试。"
+                                continue
+                            break
+                        else:
+                            return "⚠️ 生图失败：未知原因（重试耗尽）。"
+
+                        if resp.status_code >= 400:
                             return (
-                                f"⚠️ 生图请求失败（{type(exc).__name__}），已重试 "
-                                f"{_MAX_ATTEMPTS} 次仍未成功。你可以稍后再试，或检查网络。"
+                                f"⚠️ 生图失败：接口返回 {resp.status_code}。"
+                                f"{_safe_err_text(resp) or '无更多错误信息。'}"
                             )
-                        await asyncio.sleep(min(2 * (attempt + 1), 10))
-                        continue
-                    if resp.status_code == 429:
-                        if attempt == _MAX_ATTEMPTS - 1:
-                            return "⚠️ 生图接口限流（429），重试后仍未成功，请稍后再试。"
-                        await asyncio.sleep(_RETRY_429_WAIT)
-                        continue
-                    if resp.status_code >= 500:
-                        if attempt == _MAX_ATTEMPTS - 1:
-                            return (
-                                f"⚠️ 生图接口服务端错误（{resp.status_code}），"
-                                f"重试 {_MAX_ATTEMPTS} 次仍未成功，请稍后再试。"
-                            )
-                        await asyncio.sleep(_RETRY_5XX_WAIT)
-                        continue
-                    break
-                else:
-                    return "⚠️ 生图失败：未知原因（重试耗尽）。"
 
-                if resp.status_code >= 400:
-                    return (
-                        f"⚠️ 生图失败：接口返回 {resp.status_code}。"
-                        f"{_safe_err_text(resp) or '无更多错误信息。'}"
-                    )
+                        try:
+                            data = resp.json()
+                        except Exception:  # noqa: BLE001
+                            return "⚠️ 生图失败：接口返回的不是合法 JSON。"
 
-                try:
-                    data = resp.json()
-                except Exception:  # noqa: BLE001
-                    return "⚠️ 生图失败：接口返回的不是合法 JSON。"
-
-                item = (data.get("data") or [None])[0]
-                if not isinstance(item, dict):
-                    return "⚠️ 生图失败：返回结构异常（缺少 data[0]）。"
-                img_url = item.get("url")
-                b64 = item.get("b64_json")
-                if img_url:
-                    try:
-                        dl = await client.get(img_url)
-                        dl.raise_for_status()
-                        raw = dl.content
-                        ct = dl.headers.get("content-type", "")
-                        ext, mime = self._ext_mime_from_content_type(ct)
-                    except Exception as exc:  # noqa: BLE001
-                        return f"⚠️ 生图成功但图片下载失败：{exc}。"
-                elif b64:
-                    try:
-                        raw = base64.b64decode(b64)
-                        ext, mime = "png", "image/png"
-                    except (binascii.Error, ValueError) as exc:
-                        return f"⚠️ 生图成功但图片解码失败：{exc}。"
-                else:
-                    return "⚠️ 生图失败：返回中既没有 url 也没有 b64_json。"
+                        item = (data.get("data") or [None])[0]
+                        if not isinstance(item, dict):
+                            return "⚠️ 生图失败：返回结构异常（缺少 data[0]）。"
+                        img_url = item.get("url")
+                        b64 = item.get("b64_json")
+                        if img_url:
+                            remaining = self._remaining(deadline)
+                            if remaining <= 0:
+                                return "⚠️ 生图任务超时：已完成资源释放，请稍后重试。"
+                            dl = None
+                            try:
+                                dl = await client.get(
+                                    img_url,
+                                    timeout=httpx.Timeout(min(self._timeout(), remaining)),
+                                )
+                                dl.raise_for_status()
+                                raw = dl.content
+                                ct = dl.headers.get("content-type", "")
+                                ext, mime = self._ext_mime_from_content_type(ct)
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as exc:  # noqa: BLE001
+                                return f"⚠️ 生图成功但图片下载失败：{exc}。"
+                            finally:
+                                if dl is not None:
+                                    await dl.aclose()
+                        elif b64:
+                            try:
+                                raw = base64.b64decode(b64)
+                                ext, mime = "png", "image/png"
+                            except (binascii.Error, ValueError) as exc:
+                                return f"⚠️ 生图成功但图片解码失败：{exc}。"
+                        else:
+                            return "⚠️ 生图失败：返回中既没有 url 也没有 b64_json。"
+                    finally:
+                        if resp is not None:
+                            await resp.aclose()
+        except asyncio.TimeoutError:
+            return "⚠️ 生图任务超时：已完成资源释放，请稍后重试。"
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:  # noqa: BLE001
             return f"⚠️ 生图过程出错：{exc}。"
 

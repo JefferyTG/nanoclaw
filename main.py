@@ -30,9 +30,21 @@ from agent.tools.filesystem import ReadFileTool, WriteFileTool, ListDirTool
 from agent.tools.shell import ExecTool
 from agent.tools.web_search import WebSearchTool
 from agent.tools.web_fetch import WebFetchTool
-from agent.tools.skills_tools import ListSkillsTool, LoadSkillTool
+from agent.tools.skills_tools import ListSkillsTool, LoadSkillTool, ReadSkillResourceTool
 from agent.tools.spawn import SpawnSubagentTool
+from agent.tools.agent_profiles import (
+    CreateAgentPrivateTool,
+    CreateAgentSkillTool,
+    CreateAgentTool,
+    ListAgentAssetsTool,
+    ListAgentsTool,
+    UpdateAgentPrivateTool,
+    UpdateAgentSkillTool,
+)
 from agent.skills import SkillsLoader
+from agent.profiles import AgentProfileLoader
+from agent.scene_assets import SceneSkillAssets, SceneToolAssets
+from agent.tool_factories import ToolFactoryRegistry
 from agent.context import ContextBuilder
 from agent.loop import AgentLoop
 from session.manager import SessionManager
@@ -161,6 +173,12 @@ def build_shared() -> dict:
     # 3) 技能加载器（扫描 <workspace>/skills 下的 SKILL.md，供摘要注入与技能工具共用）
     skills_dir = os.path.join(config.workspace, "skills")
     skills_loader = SkillsLoader(skills_dir)
+    profile_loader = AgentProfileLoader(
+        os.path.join(config.workspace, "workspace", "agents")
+    )
+    scene_skill_assets = SceneSkillAssets(config.workspace)
+    scene_tool_assets = SceneToolAssets(config.workspace)
+    tool_factories = ToolFactoryRegistry()
 
     # 4) 注册工具（全部以 workspace 为边界，防止越权访问）
     tools = ToolRegistry()
@@ -173,21 +191,34 @@ def build_shared() -> dict:
     # 技能工具：让模型能主动枚举与读取技能正文
     tools.register(ListSkillsTool(skills_loader))
     tools.register(LoadSkillTool(skills_loader))
-    # 子 Agent 衍生工具：允许主 Agent 把复杂任务派给独立子 Agent 处理。
-    # provider_factory 闭包接收可选 model，省略时回退到 config.model；
-    # 子 Agent 的默认模型可由 config.subagent_model 另行指定。
-    def provider_factory(model=None):
-        return OpenAICompatProvider(
-            config.api_key, config.base_url, model or config.model
-        )
+    tools.register(ReadSkillResourceTool(skills_loader))
+    # 场景 Agent 管理工具。创建时按当前完整 registry / Skill 清单校验白名单；
+    # registry 是共享对象，后续注册的内置/MCP 工具也会在执行时可见。
     tools.register(
-        SpawnSubagentTool(
-            provider_factory=provider_factory,
+        CreateAgentTool(
+            profile_loader=profile_loader,
             tools_registry=tools,
-            workspace=config.workspace,
-            config=config,
+            skills_loader=skills_loader,
         )
     )
+    tools.register(ListAgentsTool(profile_loader))
+    tools.register(
+        CreateAgentSkillTool(profile_loader, scene_skill_assets, skills_loader)
+    )
+    tools.register(
+        UpdateAgentSkillTool(profile_loader, scene_skill_assets, skills_loader)
+    )
+    tools.register(
+        CreateAgentPrivateTool(
+            profile_loader, scene_tool_assets, tool_factories, tools_registry=tools
+        )
+    )
+    tools.register(
+        UpdateAgentPrivateTool(
+            profile_loader, scene_tool_assets, tool_factories, tools_registry=tools
+        )
+    )
+    tools.register(ListAgentAssetsTool(profile_loader, tool_factories))
 
     # 5) 生成技能摘要并注入 System Prompt
     skills_summary = skills_loader.build_skills_summary()
@@ -199,8 +230,13 @@ def build_shared() -> dict:
         print(f"已加载技能：{skill_count} 个")
 
     # 6) 上下文构建器（人设 + 时间 + 工作区 + 长期记忆 + 技能摘要）
+    agents_summary = profile_loader.build_summary()
     context = ContextBuilder(
-        config.workspace, config.identity_file, skills_summary=skills_summary
+        config.workspace,
+        config.identity_file,
+        skills_summary=skills_summary,
+        agents_summary=agents_summary,
+        agents_summary_provider=profile_loader.build_summary,
     )
 
     # 7) 会话持久化管理器（跨进程保存对话历史，数据落在 workspace/ 下，不进项目根）
@@ -233,6 +269,27 @@ def build_shared() -> dict:
     # 未配置 image_gen_model 时仍注册，工具内部返回友好提示，由主模型用文字继续。
     tools.register(GenerateImageTool(image_store, config))
 
+    # 子 Agent 工具最后注册，确保 Profile 创建/派遣时可见完整的内置工具集合。
+    # MCP 工具稍后仍会注入同一个 registry，因此执行时同样可被校验和选用。
+    def provider_factory(model=None):
+        return OpenAICompatProvider(
+            config.api_key, config.base_url, model or config.model
+        )
+
+    tools.register(
+        SpawnSubagentTool(
+            provider_factory=provider_factory,
+            tools_registry=tools,
+            skills_loader=skills_loader,
+            profile_loader=profile_loader,
+            scene_skill_assets=scene_skill_assets,
+            scene_tool_assets=scene_tool_assets,
+            tool_factories=tool_factories,
+            workspace=config.workspace,
+            config=config,
+        )
+    )
+
     # 8) 每日记忆：按天把重要事件追加到 workspace/memory/daily/YYYY-MM-DD.md
     #    供 /clear 与压缩前两个触发点写入；不暴露为工具。
     daily_memory = DailyMemory(os.path.join(WORKSPACE, "workspace", "memory"))
@@ -258,6 +315,11 @@ def build_shared() -> dict:
         "daily_memory": daily_memory,
         "searcher": searcher,
         "skills_summary": skills_summary,
+        "profile_loader": profile_loader,
+        "scene_skill_assets": scene_skill_assets,
+        "scene_tool_assets": scene_tool_assets,
+        "tool_factories": tool_factories,
+        "agents_summary": agents_summary,
     }
 
 
@@ -277,7 +339,11 @@ def make_agent_factory(shared: dict, registry: dict) -> callable:
         cfg = shared["config"]
         provider = OpenAICompatProvider(cfg.api_key, cfg.base_url, cfg.model)
         context = ContextBuilder(
-            cfg.workspace, cfg.identity_file, skills_summary=shared["skills_summary"]
+            cfg.workspace,
+            cfg.identity_file,
+            skills_summary=shared["skills_summary"],
+            agents_summary=shared["profile_loader"].build_summary(),
+            agents_summary_provider=shared["profile_loader"].build_summary,
         )
         agent = AgentLoop(
             provider,
