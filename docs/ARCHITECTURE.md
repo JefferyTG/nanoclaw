@@ -76,6 +76,7 @@ nanoclaw/
 ├── agent/
 │   ├── loop.py             # 核心 ReAct、工具循环、流式事件、持久化
 │   ├── context.py          # System Prompt 与 messages 构建
+│   ├── identity.py         # 缺失人设时的跨渠道首次引导与原子落盘
 │   ├── memory.py           # 超预算历史压缩与 HISTORY.md
 │   ├── daily.py            # /clear 或压缩前的 best-effort 每日摘要
 │   ├── search.py           # SQLite + LIKE 记忆/会话检索
@@ -89,6 +90,7 @@ nanoclaw/
 ├── channels/               # CLI、飞书、Web 渠道适配器
 ├── providers/              # 模型抽象和 OpenAI-compatible 实现
 ├── voice/                  # 音频校验/规范化、ASR/TTS 抽象与 Provider
+├── bin/nanoclawctl         # Linux 后台进程启动、停止、重启与状态查询
 ├── session/manager.py      # 一会话一 JSONL、恢复和自愈
 ├── skills/                 # 运行时实际扫描的技能目录
 ├── mcp_servers/            # 示例 FastMCP Server
@@ -113,6 +115,10 @@ nanoclaw/
 4. MCPClientManager 按配置拉起 stdio Server，并把远端工具包装进同一个 ToolRegistry。
 5. 根据终端、飞书凭证和 `web_port` 启用 Channel。
 6. 启动渠道任务及 Gateway 的入站、出站、流事件三个消费循环。
+
+若配置的人设文件不存在或为空，Gateway 会在创建会话 Agent 前调用实例级 `IdentityBootstrapper`。首条消息只触发询问，同一会话下一条文本生成工作区内的人设文件；引导消息不调用模型、不进入会话历史。人设创建后 ContextBuilder 每轮重读文件，因此无需重启。多渠道并发由 Bootstrapper 的实例级锁协调，任一渠道完成后其它渠道直接进入正常流程。
+
+Linux 后台控制脚本通过 `setsid` 建立独立进程组，并用 PID 文件校验 `/proc` 中的工作目录和命令行，避免陈旧 PID 误杀其它进程。`SIGTERM` 在 `main.py` 中转换为 asyncio 停止事件；Gateway 先取消并等待已登记的在途消息任务，再停止渠道并关闭 MCP 连接。
 
 ASR 在启动期按 `asr_model` 配置装配并只注入 WebChannel。浏览器把完整录音上传到独立 HTTP 端点，WebChannel 在主事件循环调用共享转写服务；成功且非空的文本再通过原有 WebSocket 文本入口进入 MessageBus。音频字节、临时路径和 Provider 原始响应均不进入 Bus 或会话持久化。
 

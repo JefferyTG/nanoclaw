@@ -7,6 +7,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .uv/
+.run/
 
 # 敏感配置与凭证（切勿提交）
 config.json

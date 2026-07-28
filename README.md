@@ -17,7 +17,7 @@ NanoClaw 把「大模型推理」与「消息渠道」解耦：模型在本地�
 - **MCP 扩展**：用 `MCPClientManager` 把任意 MCP Server 包装成本地工具（`{server}__{tool}` 命名），支持多 Server、超时容错、坏 Server 自动跳过。
 - **可插拔 Provider**：基于 OpenAI 兼容接口，硅基流动 / 本地模型均可，支持流式输出。
 - **会话持久化**：对话落盘为 JSONL，重启后可侧边栏查看、接上、删除。
-- **人设可定制**：通过 `identity.md`（不随仓库发布，缺省回退内置默认人设）定义语气与角色。
+- **人设可定制**：通过 `identity.md`（不随仓库发布）定义语气与角色；首次缺失时会在聊天渠道中引导用户创建。
 - **长上下文优化**：System Prompt 把易变内容（当前时间）置于末尾，固定前缀稳定命中 Prompt Cache。
 
 ---
@@ -203,15 +203,42 @@ uv run python main.py
 
 ## 人设定制
 
-在 `workspace/identity.md`（或其它 `identity_file` 指向的文件）中定义角色、语气与交互风格。文件缺失时回退到内置默认人设，因此仓库无需携带个人人设。
+在 `<workspace>/identity.md`（或其它 `identity_file` 指向的工作区内文件）中定义角色、语气与交互风格。人设属于本机实例数据，不随仓库发布。
+
+如果启动后没有找到非空人设文件，Web、飞书或 CLI 收到第一条普通消息时会先询问用户；用户下一条回复会被整理并原子写入人设文件。回复 `/default` 可生成默认人设。引导期间不会调用模型，也不会把人设描述写入会话历史；创建成功后需要重新发送原任务。
+
+---
+
+## Linux 后台管理
+
+仓库提供 `bin/nanoclawctl`，用于 Linux 下后台启动、停止、重启和查看状态。脚本从自身位置推导项目目录，无需写死安装路径；PID 和日志默认保存在被 Git 忽略的 `.run/`。
+
+```bash
+./bin/nanoclawctl start
+./bin/nanoclawctl status
+./bin/nanoclawctl restart
+./bin/nanoclawctl stop
+./bin/nanoclawctl logs       # 可选：持续查看日志
+```
+
+脚本依赖 `bash`、`uv` 和 Linux `setsid`（通常由 `util-linux` 提供）。`stop` 会向独立进程组发送 `SIGTERM`，默认最多等待 30 秒让 NanoClaw 释放渠道和 MCP 资源，超时后才强制结束。通过环境变量注入的 API Key 必须在执行 `start` 的同一 shell 中可见；写在被忽略的 `config.json` 中则不受影响。
+
+更新代码后推荐：
+
+```bash
+git pull --ff-only
+uv sync --frozen
+./bin/nanoclawctl restart
+```
 
 ---
 
 ## 常驻运行
 
-- **防止空闲睡眠**：用 `caffeinate -i uv run python main.py`（插电时常开）；
-- **登录自启 + 崩溃拉起**：用系统 `launchd 服务` 托管（需自行编写 plist，注意用本机绝对路径）；
-- **合盖离线**：macOS 合盖会睡眠、断开连接；要保证 7×24 在线，建议跑在常开机器（云服务器 / 旧 Mac mini / 树莓派）。飞书模式只需出网 WebSocket，无需公网 IP。
+- **Linux 手动后台运行**：使用上面的 `bin/nanoclawctl`；如需开机自启和崩溃拉起，后续可再交给 systemd 托管；
+- **macOS 防止空闲睡眠**：用 `caffeinate -i uv run python main.py`（插电时常开）；
+- **macOS 登录自启**：用系统 `launchd` 托管（需自行编写 plist，注意用本机绝对路径）；
+- **合盖离线**：macOS 合盖会睡眠、断开连接；要保证 7×24 在线，建议跑在常开机器（云服务器 / 旧 Mac mini / ARM64 Linux 设备）。飞书模式只需出网 WebSocket，无需公网 IP。
 
 > 睡眠期间飞书推送的消息可能漏收（WS 模式不持久化队列）。需零漏消息请改用飞书 Webhook 回调 + 内网穿透。
 

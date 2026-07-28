@@ -16,6 +16,7 @@
 
 import asyncio
 import os
+import signal
 import sys
 
 from config import load_config
@@ -46,6 +47,7 @@ from agent.profiles import AgentProfileLoader
 from agent.scene_assets import SceneSkillAssets, SceneToolAssets
 from agent.tool_factories import ToolFactoryRegistry
 from agent.context import ContextBuilder
+from agent.identity import IdentityBootstrapper
 from agent.loop import AgentLoop
 from session.manager import SessionManager
 from agent.memory import MemoryConsolidation
@@ -238,6 +240,9 @@ def build_shared() -> dict:
         agents_summary=agents_summary,
         agents_summary_provider=profile_loader.build_summary,
     )
+    identity_bootstrapper = IdentityBootstrapper(
+        config.workspace, config.identity_file
+    )
 
     # 7) 会话持久化管理器（跨进程保存对话历史，数据落在 workspace/ 下，不进项目根）
     WORKSPACE = config.workspace
@@ -309,6 +314,7 @@ def build_shared() -> dict:
         "tts_service": tts_service,
         "tools": tools,
         "context": context,
+        "identity_bootstrapper": identity_bootstrapper,
         "session_manager": session_manager,
         "image_store": image_store,
         "memory": memory,
@@ -478,7 +484,12 @@ async def amain() -> None:
         print("错误：没有任何启用渠道（CLI 需终端，网页需 web_port>0，飞书需凭证），退出。")
         return
 
-    gateway = Gateway(bus, channels, factory)
+    gateway = Gateway(
+        bus,
+        channels,
+        factory,
+        identity_bootstrapper=shared["identity_bootstrapper"],
+    )
 
     # 并发启动各渠道的 start() + 入站消费 + 出站分发协程。
     # CLI 的 start() 是长循环（/exit 时返回）；飞书/网页的 start() 仅拉起
@@ -488,21 +499,44 @@ async def amain() -> None:
     outbound_task = asyncio.create_task(gateway._dispatch_outbound())
     stream_task = asyncio.create_task(gateway._dispatch_stream())
 
+    # Linux 管理脚本使用 SIGTERM 停止进程；显式转成 asyncio 事件后，渠道、
+    # Agent 与 MCP 都会走下方的统一清理流程，而不是被操作系统直接截断。
+    shutdown_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    installed_signals = []
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, shutdown_event.set)
+            installed_signals.append(sig)
+        except (NotImplementedError, RuntimeError):
+            pass
+
+    shutdown_waiter = asyncio.create_task(shutdown_event.wait())
+    watched = {inbound_task, shutdown_waiter}
     if cli_task_index is not None:
-        await start_tasks[cli_task_index]   # 阻塞至终端 /exit
-        for i, t in enumerate(start_tasks):
-            if i != cli_task_index:
-                t.cancel()
-    else:
-        # 无 CLI（纯网页/飞书部署）：永久运行，直到 Ctrl-C
-        await inbound_task
+        watched.add(start_tasks[cli_task_index])
+    await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
+
+    if shutdown_event.is_set():
+        print("\n收到停止信号，正在释放资源……")
+    for i, task in enumerate(start_tasks):
+        if cli_task_index is None or i != cli_task_index or not task.done():
+            task.cancel()
+    shutdown_waiter.cancel()
 
     inbound_task.cancel()     # 结束网关入站/出站循环
     outbound_task.cancel()
     stream_task.cancel()
     await asyncio.gather(
-        *start_tasks, inbound_task, outbound_task, stream_task, return_exceptions=True
+        *start_tasks,
+        inbound_task,
+        outbound_task,
+        stream_task,
+        shutdown_waiter,
+        return_exceptions=True,
     )
+    for sig in installed_signals:
+        loop.remove_signal_handler(sig)
     await gateway.shutdown()
 
     # 关闭所有 MCP Server 连接，回收子进程

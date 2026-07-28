@@ -106,6 +106,7 @@ flowchart LR
 | MCP | 临时 Server 的 stdio 握手、list_tools、调用、shutdown | 坏 Server、超时、同名、子进程回收 |
 | 图片/视觉/生图 | 临时图片 + fake endpoint；真实服务另行授权 | MIME、大小、路径、多个来源、历史回放 |
 | 并发/生命周期 | 多 session 并发、同 session 排队、shutdown | task 泄漏、锁、后台线程、队列背压 |
+| Linux 控制脚本 | `bash -n bin/nanoclawctl` + 未运行时 status/stop；Linux 真机 start/stop 冒烟 | PID 复用、进程组、SIGTERM 清理、日志路径 |
 
 不需要 API Key 的文档/静态审计不应启动真实模型。需要真实外部服务的验证必须说明成本、数据和副作用，并取得授权。
 

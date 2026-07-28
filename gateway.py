@@ -17,6 +17,7 @@ from typing import Callable, Dict, List
 
 from bus.queue import MessageBus, InboundMessage, OutboundMessage, StreamEvent
 from channels.base import Channel
+from agent.identity import IdentityBootstrapper
 from agent.loop import AgentLoop
 
 
@@ -28,10 +29,12 @@ class Gateway:
         bus: MessageBus,
         channels: List[Channel],
         agent_factory: Callable[[str], AgentLoop],
+        identity_bootstrapper: IdentityBootstrapper | None = None,
     ) -> None:
         self.bus = bus
         self.channels = channels
         self.agent_factory = agent_factory
+        self.identity_bootstrapper = identity_bootstrapper
         # 按渠道名索引，出站分发时 O(1) 查找
         self._channel_map: Dict[str, Channel] = {ch.name: ch for ch in channels}
         # 按 session_key 缓存 Agent 实例（同一会话复用，互不干扰）
@@ -40,6 +43,9 @@ class Gateway:
         self._session_locks: Dict[str, asyncio.Lock] = {}
         # 保护 _agents / _session_locks 的并发创建
         self._reg_lock = asyncio.Lock()
+        # _process_inbound 为每条消息创建的在途任务。显式登记后，SIGTERM
+        # 关闭可以先取消并等待它们，让子 Agent / 工具的 finally 正常回收资源。
+        self._inflight_tasks: set[asyncio.Task] = set()
 
     async def run(self) -> None:
         """并发启动所有渠道、入站消费循环与出站分发循环。"""
@@ -67,7 +73,9 @@ class Gateway:
                     lock = asyncio.Lock()
                     self._session_locks[session_key] = lock
 
-            asyncio.create_task(self._handle_one(msg, session_key, lock))
+            task = asyncio.create_task(self._handle_one(msg, session_key, lock))
+            self._inflight_tasks.add(task)
+            task.add_done_callback(self._inflight_tasks.discard)
 
     async def _handle_one(self, msg: InboundMessage, session_key: str, lock: asyncio.Lock) -> None:
         """处理单条入站消息：取/建 Agent → 持锁跑 → 回投出站队列。
@@ -75,21 +83,28 @@ class Gateway:
         同一 ``session_key`` 的多个任务会竞争同一把锁，从而天然串行；
         不同会话的锁互不影响，可并发执行。锁用 ``async with`` 保证异常时释放。
         """
-        # 取缓存；不存在则惰性创建并纳入缓存
-        async with self._reg_lock:
-            agent = self._agents.get(session_key)
-            if agent is None:
-                agent = self.agent_factory(session_key)
-                self._agents[session_key] = agent
-
-        # 仅网页渠道挂载流式事件接收方：把 Agent 的逐步事件实时推给网页端
-        # 渲染（思考过程/工具调用/逐字回答）。飞书/CLI 走原 OutboundMessage
-        # 路径，不挂 sink。sink 把事件发布到总线流的 stream_queue，由
-        # _dispatch_stream 转发给 web 渠道。
-        stream_sink = self._make_stream_sink(msg) if msg.channel == "web" else None
-
-        # 同一会话串行跑（持锁）；Agent 内部任何异常都兜底，避免单条消息拖垮整个网关
+        stream_sink = None
+        # 同一会话串行跑（持锁）；首次人设引导也在锁内完成，避免连续两条消息
+        # 竞态地都被当成“第一条”。不同会话还会由 Bootstrapper 的实例级锁协调。
         async with lock:
+            if self.identity_bootstrapper is not None:
+                bootstrap_reply = await self.identity_bootstrapper.handle(
+                    session_key, msg.content
+                )
+                if bootstrap_reply is not None:
+                    await self.outbound_safe(bootstrap_reply, msg, None)
+                    return
+
+            # 人设就绪后才惰性创建 Agent，避免把首次引导文本写入会话历史或
+            # 在缺少人设时发起模型请求。
+            async with self._reg_lock:
+                agent = self._agents.get(session_key)
+                if agent is None:
+                    agent = self.agent_factory(session_key)
+                    self._agents[session_key] = agent
+
+            # 仅网页渠道挂载流式事件接收方：把 Agent 的逐步事件实时推给网页端。
+            stream_sink = self._make_stream_sink(msg) if msg.channel == "web" else None
             try:
                 # 把随消息附带的图片引用一并交给 Agent；纯文本消息 images 为 None
                 reply = await agent.run(
@@ -154,7 +169,13 @@ class Gateway:
             await channel.send(msg)
 
     async def shutdown(self) -> None:
-        """停止所有渠道并清空 Agent 缓存。"""
+        """取消在途消息，停止所有渠道并清空 Agent 缓存。"""
+        pending = list(self._inflight_tasks)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._inflight_tasks.clear()
         for ch in self.channels:
             await ch.stop()
         self._agents.clear()

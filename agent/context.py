@@ -20,12 +20,7 @@ from datetime import datetime
 from collections.abc import Callable
 from typing import List, Optional
 
-# 文件缺失时使用的默认人设
-_DEFAULT_IDENTITY = (
-    "你是一个务实、可靠、乐于助人的 AI 助手。\n"
-    "你会优先用已有信息解决问题，遇到不确定会主动澄清，而不是猜测。\n"
-    "你使用中文与用户交流，回答简洁、准确、可执行。"
-)
+from agent.identity import DEFAULT_IDENTITY
 
 
 class ContextBuilder:
@@ -56,9 +51,9 @@ class ContextBuilder:
             with open(path, "r", encoding="utf-8") as f:
                 return f.read().strip()
         except FileNotFoundError:
-            return _DEFAULT_IDENTITY
+            return DEFAULT_IDENTITY
         except Exception as exc:  # noqa: BLE001 - 读取异常时降级为默认人设
-            return _DEFAULT_IDENTITY + f"\n（人设文件读取失败：{exc}）"
+            return DEFAULT_IDENTITY + f"\n（人设文件读取失败：{exc}）"
 
     def _load_memory(self) -> str:
         """读取长期记忆（MEMORY.md）；不存在或读取失败返回空字符串。"""

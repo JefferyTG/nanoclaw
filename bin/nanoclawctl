@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# NanoClaw Linux process controller. All paths are derived from this checkout,
+# so the repository can be cloned anywhere without editing the script.
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+RUN_DIR="${NANOCLAW_RUN_DIR:-${PROJECT_DIR}/.run}"
+PID_FILE="${NANOCLAW_PID_FILE:-${RUN_DIR}/nanoclaw.pid}"
+LOG_FILE="${NANOCLAW_LOG_FILE:-${RUN_DIR}/nanoclaw.log}"
+UV_BIN="${NANOCLAW_UV_BIN:-uv}"
+START_WAIT_SEC="${NANOCLAW_START_WAIT_SEC:-2}"
+STOP_TIMEOUT_SEC="${NANOCLAW_STOP_TIMEOUT_SEC:-30}"
+
+usage() {
+  cat <<'EOF'
+用法：bin/nanoclawctl {start|stop|restart|status|logs}
+
+  start    后台启动 NanoClaw
+  stop     发送 SIGTERM，等待资源释放后停止
+  restart  停止后重新启动
+  status   查看运行状态和进程信息
+  logs     持续查看运行日志（Ctrl-C 退出）
+
+可选环境变量：
+  NANOCLAW_RUN_DIR、NANOCLAW_PID_FILE、NANOCLAW_LOG_FILE
+  NANOCLAW_UV_BIN、NANOCLAW_START_WAIT_SEC、NANOCLAW_STOP_TIMEOUT_SEC
+EOF
+}
+
+require_uint() {
+  local name="$1" value="$2"
+  if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+    echo "错误：${name} 必须是非负整数，当前值：${value}" >&2
+    exit 2
+  fi
+}
+
+read_pid() {
+  [[ -r "$PID_FILE" ]] || return 1
+  local pid
+  pid="$(tr -d '[:space:]' < "$PID_FILE")"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  printf '%s\n' "$pid"
+}
+
+process_matches() {
+  local pid="$1"
+  kill -0 "$pid" 2>/dev/null || return 1
+
+  # Linux /proc 校验可以防止陈旧 PID 文件误指向无关进程。
+  if [[ -d "/proc/${pid}" ]]; then
+    local cwd cmdline
+    cwd="$(readlink -f "/proc/${pid}/cwd" 2>/dev/null || true)"
+    [[ "$cwd" == "$PROJECT_DIR" ]] || return 1
+    cmdline="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)"
+    [[ "$cmdline" == *"main.py"* ]] || return 1
+  fi
+}
+
+running_pid() {
+  local pid
+  pid="$(read_pid)" || return 1
+  process_matches "$pid" || return 1
+  printf '%s\n' "$pid"
+}
+
+start_nanoclaw() {
+  local pid
+  if pid="$(running_pid)"; then
+    echo "NanoClaw 已在运行（PID ${pid}）"
+    return 0
+  fi
+
+  rm -f -- "$PID_FILE"
+  mkdir -p -- "$RUN_DIR"
+  command -v "$UV_BIN" >/dev/null 2>&1 || {
+    echo "错误：找不到 uv，请先安装 uv 或设置 NANOCLAW_UV_BIN。" >&2
+    return 1
+  }
+  command -v setsid >/dev/null 2>&1 || {
+    echo "错误：找不到 setsid（通常由 util-linux 提供）。" >&2
+    return 1
+  }
+
+  (
+    cd -- "$PROJECT_DIR"
+    exec setsid "$UV_BIN" run python main.py >>"$LOG_FILE" 2>&1
+  ) </dev/null &
+  pid=$!
+  printf '%s\n' "$pid" > "$PID_FILE"
+
+  sleep "$START_WAIT_SEC"
+  if process_matches "$pid"; then
+    echo "NanoClaw 已启动（PID ${pid}）"
+    echo "日志：${LOG_FILE}"
+    return 0
+  fi
+
+  rm -f -- "$PID_FILE"
+  echo "错误：NanoClaw 启动后立即退出，最近日志如下：" >&2
+  tail -n 30 -- "$LOG_FILE" >&2 2>/dev/null || true
+  return 1
+}
+
+stop_nanoclaw() {
+  local pid elapsed=0
+  if ! pid="$(running_pid)"; then
+    rm -f -- "$PID_FILE"
+    echo "NanoClaw 未运行"
+    return 0
+  fi
+
+  echo "正在停止 NanoClaw（PID ${pid}）……"
+  # setsid 让 NanoClaw 及 uv/python 子进程处于独立进程组；优先停止整个组。
+  kill -TERM -- "-${pid}" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  while process_matches "$pid"; do
+    if (( elapsed >= STOP_TIMEOUT_SEC )); then
+      echo "超过 ${STOP_TIMEOUT_SEC} 秒，强制结束进程组。" >&2
+      kill -KILL -- "-${pid}" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+      break
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  rm -f -- "$PID_FILE"
+  echo "NanoClaw 已停止"
+}
+
+status_nanoclaw() {
+  local pid
+  if pid="$(running_pid)"; then
+    echo "NanoClaw 正在运行"
+    ps -p "$pid" -o pid=,etime=,stat=,cmd=
+    echo "日志：${LOG_FILE}"
+    return 0
+  fi
+  rm -f -- "$PID_FILE"
+  echo "NanoClaw 未运行"
+  return 3
+}
+
+require_uint "NANOCLAW_START_WAIT_SEC" "$START_WAIT_SEC"
+require_uint "NANOCLAW_STOP_TIMEOUT_SEC" "$STOP_TIMEOUT_SEC"
+
+case "${1:-}" in
+  start) start_nanoclaw ;;
+  stop) stop_nanoclaw ;;
+  restart) stop_nanoclaw; start_nanoclaw ;;
+  status) status_nanoclaw ;;
+  logs)
+    mkdir -p -- "$RUN_DIR"
+    touch -- "$LOG_FILE"
+    exec tail -n 100 -F -- "$LOG_FILE"
+    ;;
+  *) usage; exit 2 ;;
+esac
