@@ -89,28 +89,103 @@ class SessionManager:
                 msg.pop("reasoning_content", None)
                 messages.append(msg)
 
-        # 自愈：若历史里出现 assistant(tool_calls) 却缺少对应 tool 回复
-        # （例如此前熔断早退、或进程在「写 assistant」与「写 tool 结果」之间被
-        # 中断导致持久化不完整），为缺失的 tool_call_id 补占位 tool 消息，
-        # 避免回放时 API 报 400 "tool_calls must be followed by tool messages"。
-        # 这样即便磁盘上的 jsonl 已经损坏，重启也能自愈、永不死锁。
-        open_ids: list[str] = []
-        for m in messages:
-            if m.get("role") == "assistant" and m.get("tool_calls"):
-                for tc in m["tool_calls"]:
-                    open_ids.append(tc.get("id"))
-            elif m.get("role") == "tool":
-                tcid = m.get("tool_call_id")
-                if tcid in open_ids:
-                    open_ids.remove(tcid)
-        for tcid in open_ids:
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tcid,
-                "content": "（历史记录中缺失对应的工具结果，已由会话管理器自动补全）",
-            })
+        return self._normalize_tool_history(messages)
 
-        return messages
+    @staticmethod
+    def _normalize_tool_history(messages: list[dict]) -> list[dict]:
+        """把旧版或中断产生的工具消息恢复成合法的 API 顺序。
+
+        支持三类损坏：
+
+        - 旧版把 tool 写在 assistant(tool_calls) 前面：识别相邻的前置结果并重排；
+        - assistant 声明了工具但结果缺失：在下一条普通消息前补占位结果；
+        - 找不到任何对应 tool_calls 的孤立 tool：从模型历史中丢弃。
+
+        原始 JSONL 不在读取时覆盖，避免破坏时间戳和 Web 历史展示元数据；返回给
+        Agent 的内存历史始终满足 ``assistant(tool_calls) → tool...`` 契约。
+        """
+        normalized: list[dict] = []
+        # 旧版错误顺序中，若干 tool 会紧邻出现在其 assistant 前面。
+        leading_tools: list[dict] = []
+        pending_ids: list[str] = []
+        pending_tools: dict[str, dict] = {}
+
+        def close_pending() -> None:
+            nonlocal pending_ids, pending_tools
+            for tool_call_id in pending_ids:
+                tool_msg = pending_tools.get(tool_call_id)
+                if tool_msg is None:
+                    tool_msg = {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": (
+                            "（历史记录中缺失对应的工具结果，"
+                            "已由会话管理器自动补全）"
+                        ),
+                    }
+                normalized.append(tool_msg)
+            pending_ids = []
+            pending_tools = {}
+
+        for message in messages:
+            role = message.get("role")
+
+            if pending_ids:
+                if role == "tool":
+                    tool_call_id = message.get("tool_call_id")
+                    if (
+                        tool_call_id in pending_ids
+                        and tool_call_id not in pending_tools
+                    ):
+                        pending_tools[tool_call_id] = message
+                    if all(tcid in pending_tools for tcid in pending_ids):
+                        close_pending()
+                    continue
+                # OpenAI 协议不允许其它角色插在未完成的工具交换中间。
+                close_pending()
+
+            if role == "tool":
+                # 暂存连续的前置 tool；只有紧随其后的 assistant 引用了相同 id
+                # 才会恢复，否则它就是不可归属的孤立结果并被丢弃。
+                leading_tools.append(message)
+                continue
+
+            if role == "assistant" and message.get("tool_calls"):
+                expected_ids = []
+                for tool_call in message.get("tool_calls") or []:
+                    tool_call_id = tool_call.get("id")
+                    if tool_call_id and tool_call_id not in expected_ids:
+                        expected_ids.append(tool_call_id)
+                if not expected_ids:
+                    # tool_calls 结构本身无有效 id，去掉无效字段，保留可见正文。
+                    cleaned = dict(message)
+                    cleaned.pop("tool_calls", None)
+                    normalized.append(cleaned)
+                    leading_tools = []
+                    continue
+
+                normalized.append(message)
+                pending_ids = expected_ids
+                pending_tools = {}
+                for tool_message in leading_tools:
+                    tool_call_id = tool_message.get("tool_call_id")
+                    if (
+                        tool_call_id in pending_ids
+                        and tool_call_id not in pending_tools
+                    ):
+                        pending_tools[tool_call_id] = tool_message
+                leading_tools = []
+                if all(tcid in pending_tools for tcid in pending_ids):
+                    close_pending()
+                continue
+
+            # 普通消息构成边界；边界前仍未找到 assistant 的 tool 无法安全归属。
+            leading_tools = []
+            normalized.append(message)
+
+        if pending_ids:
+            close_pending()
+        return normalized
 
     def clear(self, session_key: str) -> None:
         """删除某会话的 JSONL 文件（若不存在则静默忽略）。"""

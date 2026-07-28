@@ -10,7 +10,7 @@ NanoClaw 把「大模型推理」与「消息渠道」解耦：模型在本地�
 
 ## 特性
 
-- **多渠道接入**：飞书（WebSocket 长连接）、网页（aiohttp + WebSocket，含会话侧边栏、历史接回、断线自动重连）。
+- **多渠道接入**：飞书（WebSocket 长连接，支持收图与发送生成图片）、网页（aiohttp + WebSocket，含会话侧边栏、历史接回、断线自动重连）。
 - **网页语音输入**：浏览器录音经可替换 ASR Provider 转成文字后，继续复用原有文本消息、会话与 Agent 流程。
 - **网页自动朗读**：可选开启 `edge-tts`，按自然语义片段合成并顺序朗读 Agent 的新回复，默认关闭且不回放历史。
 - **ReAct 工具循环**：模型自主决定调用工具（文件读写、目录列举、执行命令、子 Agent 委派等），带单轮迭代上限与墙钟超时熔断，防卡死。
@@ -145,6 +145,7 @@ uv run python main.py
 | `max_iterations` | 单轮最大工具迭代次数 | `32` |
 | `identity_file` | 人设文件名（位于 workspace 下） | `identity.md` |
 | `feishu_app_id` / `feishu_app_secret` | 飞书自建应用凭证（留空则不启用飞书） | 空 |
+| `feishu_image_merge_window_sec` | 飞书图片等待后续文字说明的秒数；连续图片会重置计时，`0` 表示立即处理 | `10` |
 | `web_host` / `web_port` | 网页渠道监听地址 / 端口（`0`=不启用） | `0.0.0.0` / `0` |
 | `turn_timeout_sec` | 单轮墙钟超时（秒），超时强制终止 | `600` |
 | `mcp_servers` | 外部 MCP Server 配置 | `{}` |
@@ -160,7 +161,10 @@ uv run python main.py
 
 1. 在[飞书开放平台](https://open.feishu.cn/)创建**自建应用**，开启「机器人」能力；
 2. 把 `App ID` / `App Secret` 填入 `config.json`（或环境变量）；
-3. 运行后应用会建立 WebSocket 长连接，自动重连。
+3. 在应用权限中开通接收消息、以应用身份发送消息、读取消息资源和上传图片资源等权限，并订阅“接收消息”事件；
+4. 运行后应用会建立 WebSocket 长连接，自动重连。
+
+飞书私聊支持直接发送 PNG、JPEG、GIF、WEBP 或 BMP 图片，图片会复用网页端已有的视觉理解流程；Agent 或子 Agent 通过 `generate_image` 产生的图片会作为飞书图片消息发送。收到图片后默认等待 10 秒：同一用户随后发送的文字会与图片合并，连续发送图片会重置等待时间；超时后才使用默认图片分析提示。可通过 `feishu_image_merge_window_sec` 调整或关闭等待，修改后需重启实例。入站图片当前限制 20 MB，出站图片遵循飞书上传接口的 10 MB 限制。群聊仍遵守“仅被 @ 时响应”的规则，因此第一版建议在私聊中使用纯图片消息。
 
 ### 网页
 

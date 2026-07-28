@@ -31,6 +31,7 @@ _CONFIG_FIELDS = (
     "identity_file",
     "feishu_app_id",
     "feishu_app_secret",
+    "feishu_image_merge_window_sec",
     "web_host",
     "web_port",
     "turn_timeout_sec",
@@ -74,6 +75,8 @@ class NanoClawConfig:
     identity_file: str = "identity.md"
     feishu_app_id: str = ""          # 飞书自建应用 App ID（留空则不启用飞书渠道）
     feishu_app_secret: str = ""      # 飞书自建应用 App Secret
+    # 飞书图片消息等待后续文字说明的时间；连续图片会重新计时，0 表示立即处理。
+    feishu_image_merge_window_sec: float = 10.0
     web_host: str = "0.0.0.0"        # 网页渠道监听地址（0.0.0.0 同局域网可达）
     web_port: int = 0                # 网页渠道端口；0 表示不启用网页渠道
     turn_timeout_sec: int = 600      # 单轮对话墙钟超时（秒）；超时强制终止，防卡死

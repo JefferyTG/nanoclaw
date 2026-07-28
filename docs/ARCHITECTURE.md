@@ -13,7 +13,7 @@ NanoClaw 是一个本地优先、单进程、多渠道的个人 AI Agent 网关�
 | 运行时 | Python 3.13+、`asyncio`、`uv` | 单体应用、异步编排、依赖与锁文件管理 |
 | 模型 | `openai.AsyncOpenAI` | 调用 OpenAI-compatible Chat Completions，支持流式和工具调用 |
 | Web | `aiohttp`、原生 HTML/CSS/JS | HTTP 配置/会话/图片 API、WebSocket 聊天与单页 UI |
-| 飞书 | `lark-oapi` | WebSocket 长连接收消息、IM API 发消息 |
+| 飞书 | `lark-oapi` | WebSocket 长连接收文本/图片、IM API 发文本/图片 |
 | 工具扩展 | 自定义 Tool API、MCP stdio | 内置工具注册和外部 MCP Server 接入 |
 | 网络工具 | `httpx`、`ddgs`、`html2text` | 网页抓取、搜索、生图服务请求 |
 | 语音输入 | MediaRecorder、FFmpeg/ffprobe、`httpx` | Web 录音、格式规范化、云端 ASR |
@@ -124,6 +124,8 @@ ASR 在启动期按 `asr_model` 配置装配并只注入 WebChannel。浏览器�
 
 TTS 同样在启动期按 `tts_model` 装配并只注入 WebChannel，但不进入 MessageBus。网页仅在用户主动开启朗读后，从实时 Agent `token/done` 事件按标点和长度切分新回复，经独立 HTTP 端点合成短 MP3；当前片段播放时预合成下一片段。关闭朗读、发送新消息、切换会话或断线会取消请求并清空播放状态，历史回放不会触发 TTS。
 
+飞书图片沿用同一套渠道无关协议。入站 `image` 事件先建立按 chat、会话序号和发送者隔离的待处理批次，再用消息 ID 与 `image_key` 调飞书鉴权资源接口下载；校验通过后保存到共享 `ImageStore`。批次默认等待 10 秒接收后续文字，连续图片会重置计时；文字到达或计时结束后，整批图片作为一条 `InboundMessage.images` 进入既有视觉链路。下载期间即使用户切换会话，图片仍归属事件到达时的会话序号。出站时 `AgentLoop` 汇总本轮（含子 Agent）生成的图片 ID，Gateway 在原会话中解析为 `ImageRef` 并放入 `OutboundMessage.images`；飞书 Channel 上传图片取得 `image_key` 后发送 `image` 消息。Web 上传本身就是单条图文消息，不使用飞书的等待合并机制；Web 的图片展示继续使用流事件，不重复消费最终出站图片。
+
 ### 5.2 消息与并发
 
 ```mermaid
@@ -141,8 +143,8 @@ sequenceDiagram
     G->>A: run(text, images, stream_sink?)
     A->>P: 模型调用 / 工具执行
     P-->>A: 响应 / 结果
-    A-->>G: 最终文本
-    G->>B: OutboundMessage
+    A-->>G: 最终文本 + 本轮生成图片 ID
+    G->>B: OutboundMessage(text, images?)
     B->>C: send
 ```
 
@@ -227,9 +229,8 @@ workspace/
 完整状态与证据见 [DECISIONS.md](DECISIONS.md)。最需要优先处理的是：
 
 1. Web 管理面免认证，配置 GET 原样返回 API Key/飞书 Secret，且启用时通常监听 `0.0.0.0`。
-2. 工具调用的 JSONL 落盘顺序当前为 `tool → assistant(tool_calls)`，离线已复现；重启恢复会产生无效/重复 tool 消息。
-3. 注释所称 workspace 边界不是真实沙箱：符号链接、Shell 绝对路径/`cd ..` 和网络工具仍可越界。
-4. 当前没有正式测试、CI、lint 或类型检查基线。
-5. 工具循环在第 10 次重复时停止累计，导致计划中的第 20 次硬熔断不可达。
-6. 会话 key 使用 `:`/`_` 互换，映射有损且可能碰撞；飞书 ID 常含下划线。
-7. 队列、任务和会话缓存没有背压/回收策略；Channel 的 stop 也未真正关闭后台服务。
+2. 注释所称 workspace 边界不是真实沙箱：符号链接、Shell 绝对路径/`cd ..` 和网络工具仍可越界。
+3. 当前没有 CI、lint 或类型检查基线，自动化回归仍需继续扩充。
+4. 工具循环在第 10 次重复时停止累计，导致计划中的第 20 次硬熔断不可达。
+5. 会话 key 使用 `:`/`_` 互换，映射有损且可能碰撞；飞书 ID 常含下划线。
+6. 队列、任务和会话缓存没有背压/回收策略；Channel 的 stop 也未真正关闭后台服务。

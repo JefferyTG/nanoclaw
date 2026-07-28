@@ -51,6 +51,9 @@ class OutboundMessage:
     # 标记该回包是否已由流式事件（StreamEvent）完整覆盖。网页渠道在收到
     # streamed=True 的回包时直接跳过，避免与流式事件里的思考/最终回答重复显示。
     streamed: bool = False
+    # Agent 本轮生成、准备随回复发送的图片引用。渠道自行决定如何呈现：
+    # 飞书会上传后发送 image 消息；Web 已由流事件展示；CLI 可忽略。
+    images: Optional[List[ImageRef]] = None
 
 
 @dataclass

@@ -118,9 +118,24 @@ class Gateway:
                     except Exception:
                         pass
 
-        await self.outbound_safe(reply, msg, stream_sink)
+        reply_images = []
+        image_store = getattr(agent, "image_store", None)
+        if image_store is not None:
+            for image_id in getattr(agent, "last_generated_image_ids", []):
+                try:
+                    ref = image_store.resolve(session_key, image_id)
+                except Exception:  # noqa: BLE001 - 图片回包失败不能影响文字回复
+                    ref = None
+                if ref is not None:
+                    reply_images.append(ref)
 
-    async def outbound_safe(self, reply: str, msg: InboundMessage, stream_sink) -> None:
+        await self.outbound_safe(
+            reply, msg, stream_sink, images=reply_images or None
+        )
+
+    async def outbound_safe(
+        self, reply: str, msg: InboundMessage, stream_sink, images=None
+    ) -> None:
         """把回复安全地回投出站队列（锁外执行，避免持锁期间阻塞分发）。"""
         try:
             await self.bus.publish_outbound(OutboundMessage(
@@ -129,6 +144,7 @@ class Gateway:
                 content=reply,
                 reply_to=None,
                 streamed=(stream_sink is not None),
+                images=images,
             ))
         except Exception as exc:  # noqa: BLE001
             print(f"⚠️ 出站投递失败：{exc}")

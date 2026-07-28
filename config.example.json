@@ -8,6 +8,7 @@
   "identity_file": "identity.md",
   "feishu_app_id": "",
   "feishu_app_secret": "",
+  "feishu_image_merge_window_sec": 10,
   "web_host": "0.0.0.0",
   "web_port": 0,
   "turn_timeout_sec": 600,

@@ -171,6 +171,13 @@ class SubagentStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(assistant["generated_images"], ["child-image"])
         self.assertEqual(assistant["subagent_runs"][0]["tool_call_id"], "spawn-id")
         self.assertEqual(assistant["subagent_runs"][0]["status"], "completed")
+        self.assertEqual(parent.last_generated_image_ids, ["child-image"])
+        assistant_index = session.records.index(assistant)
+        tool_index = next(
+            index for index, record in enumerate(session.records)
+            if record.get("tool_call_id") == "spawn-id"
+        )
+        self.assertLess(assistant_index, tool_index)
         self.assertTrue(any(event["type"] == "subagent_event" for event in events))
 
     async def test_nested_events_are_forwarded_once_without_rewrapping(self):

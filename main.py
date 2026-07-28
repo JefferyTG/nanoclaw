@@ -457,7 +457,12 @@ async def amain() -> None:
     # 飞书渠道：配置了凭证时启用
     if cfg.feishu_app_id and cfg.feishu_app_secret:
         feishu_channel = FeishuChannel(
-            "feishu", bus, cfg.feishu_app_id, cfg.feishu_app_secret
+            "feishu",
+            bus,
+            cfg.feishu_app_id,
+            cfg.feishu_app_secret,
+            image_store=shared["image_store"],
+            image_merge_window_sec=cfg.feishu_image_merge_window_sec,
         )
         feishu_channel._clear_callback = clear_callback  # 复用同一清空回调
         channels.append(feishu_channel)

@@ -86,6 +86,9 @@ class AgentLoop:
         # SpawnSubagentTool need a separate structured lifecycle outcome rather
         # than guessing timeout/error state from localized message strings.
         self.last_run_status = "idle"
+        # 当前一轮由 generate_image（含子 Agent）产出的图片 ID。Gateway 在
+        # run() 返回后把它们解析为 ImageRef，交给支持图片出站的渠道。
+        self.last_generated_image_ids: list[str] = []
 
         # 工具调用签名滑动窗口（防爆用），存 "name:args_json"
         self._tool_call_history: List[str] = []
@@ -240,6 +243,7 @@ class AgentLoop:
         事件约定见 ``bus.queue.StreamEvent`` 的文档。
         """
         self.last_run_status = "running"
+        self.last_generated_image_ids = []
         base_mm = self.base_model_multimodal
 
         # 1. 构建初始 messages（注入跨轮历史 + 当前输入）
@@ -489,6 +493,10 @@ class AgentLoop:
             if isinstance(self.subagent_runs_sink, list)
             else []
         )
+        # 工具结果先只进入本轮内存消息；整组执行结束后再按
+        # assistant(tool_calls) → tool 的协议顺序一次性追加到会话文件。
+        # 旧实现边执行边持久化 tool，最后才写 assistant，导致重启恢复时报 400。
+        tool_records: dict[str, dict] = {}
 
         for tc in response.tool_calls:
             sig_args = json.dumps(tc.arguments, ensure_ascii=False)
@@ -497,15 +505,22 @@ class AgentLoop:
             # 熔断：强制终止本轮（先补齐所有 tool 消息，保证落盘自洽）
             if verdict is not None and "熔断" in verdict:
                 for t in response.tool_calls:
+                    if t.id in tool_records:
+                        continue
                     close_msg = {
                         "role": "tool",
                         "tool_call_id": t.id,
                         "content": "（会话因工具调用熔断被强制终止，工具结果缺失）",
                     }
                     messages.append(close_msg)
-                    self._persist(close_msg)
-                if assistant_msg is not None:
-                    self._persist(assistant_msg)
+                    tool_records[t.id] = close_msg
+                self._persist_tool_exchange(
+                    assistant_msg,
+                    response.tool_calls,
+                    tool_records,
+                    gen_ids,
+                    subagent_runs,
+                )
                 self._save_to_history(messages)
                 return verdict
 
@@ -517,7 +532,7 @@ class AgentLoop:
                     "content": verdict,
                 }
                 messages.append(warn_msg)
-                self._persist(warn_msg)
+                tool_records[tc.id] = warn_msg
                 continue
 
             # 防爆通过：真正执行工具并回填结果
@@ -549,6 +564,7 @@ class AgentLoop:
             try:
                 result = await self.tools.execute(tc.name, exec_args)
             except asyncio.CancelledError:
+                self._remember_generated_ids(gen_ids)
                 # A child run may already have emitted useful terminal metadata
                 # before cancellation reaches this parent loop. Persist a valid,
                 # standalone assistant record so historical Web sessions can
@@ -564,6 +580,7 @@ class AgentLoop:
                         interrupted_record["subagent_runs"] = list(subagent_runs)
                     self._persist(interrupted_record)
                 raise
+            self._remember_generated_ids(gen_ids)
             duration_ms = int((time.monotonic() - t_start) * 1000)
             self._print_tool_result(tc.name, result)
             if stream_sink is not None:
@@ -579,18 +596,48 @@ class AgentLoop:
                 "content": result,
             }
             messages.append(tool_msg)
-            self._persist(tool_msg)
+            tool_records[tc.id] = tool_msg
 
-        # 正常执行完毕：把 assistant_msg 落盘；附加的展示元数据只写入持久化副本，
-        # 内存 messages 保持 OpenAI 兼容格式。
-        if assistant_msg is not None:
-            record = dict(assistant_msg)
-            if gen_ids:
-                record["generated_images"] = gen_ids
-            if subagent_runs:
-                record["subagent_runs"] = subagent_runs
-            self._persist(record)
+        # 正常执行完毕：按 OpenAI 协议顺序落盘整组交换。展示元数据只附加在
+        # assistant 的持久化副本上，内存 messages 保持 API 兼容格式。
+        self._persist_tool_exchange(
+            assistant_msg,
+            response.tool_calls,
+            tool_records,
+            gen_ids,
+            subagent_runs,
+        )
         return None
+
+    def _persist_tool_exchange(
+        self,
+        assistant_msg: Optional[dict],
+        tool_calls: list,
+        tool_records: dict[str, dict],
+        generated_ids: list,
+        subagent_runs: list,
+    ) -> None:
+        """以 ``assistant(tool_calls) → tool...`` 顺序持久化一次工具交换。"""
+        if assistant_msg is None:
+            # 没有前置 assistant 时绝不能单独保存 tool；这只可能出现在外部
+            # 直接调用私有方法的兼容场景，正常 run() 始终会传 assistant_msg。
+            return
+        record = dict(assistant_msg)
+        if generated_ids:
+            record["generated_images"] = list(generated_ids)
+        if subagent_runs:
+            record["subagent_runs"] = list(subagent_runs)
+        self._persist(record)
+        for tool_call in tool_calls:
+            tool_record = tool_records.get(tool_call.id)
+            if tool_record is not None:
+                self._persist(tool_record)
+
+    def _remember_generated_ids(self, image_ids: list) -> None:
+        """把本轮新增图片汇总到稳定、去重的出站列表。"""
+        for image_id in image_ids:
+            if image_id and image_id not in self.last_generated_image_ids:
+                self.last_generated_image_ids.append(image_id)
 
     def _check_tool_loop(self, tool_name: str, tool_args_json: str) -> Optional[str]:
         """工具调用防爆检测。

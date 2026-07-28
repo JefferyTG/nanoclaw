@@ -28,6 +28,8 @@
 | Skill 与人设解耦 | 有效 | Skill 写行为机制，具体口吻由 identity 决定 |
 | 视觉双路径 | 有效 | 基础模型多模态则直传；否则用 `ask_image` 调独立视觉模型 |
 | 生图服务完全配置化 | 有效 | 不在代码绑定特定服务商/模型；一个工具覆盖文生图、图生图、多源图 |
+| 飞书图片复用 ImageRef 消息协议 | 有效 | 入站图片进入共享 ImageStore/视觉链路；出站图片由 Gateway 解析后交渠道上传，不复制 Agent 逻辑 |
+| 飞书图片采用短窗口图文合并 | 有效 | 图片事件缺少用户说明；默认等待 10 秒，同用户连续图片重置计时，文字到达后只触发一次 Agent |
 | Web 前端无构建步骤 | 有效 | 单文件 HTML/CSS/JS，配合 no-cache 和页面版本握手 |
 | Web ASR 只向核心投递转写文本 | 有效 | 音频在渠道边界临时处理；Bus、Gateway、AgentLoop 与会话协议保持文本语义 |
 | ASR 与主模型配置/凭证分离 | 有效 | Chat Completions 兼容不代表支持 Audio Transcriptions；便于替换供应商并隔离权限与账单 |
@@ -56,6 +58,8 @@
 - Web 旧页显示 JSON、断线不重连、`web:web:` 双前缀、流式挂起无超时等问题已有对应修复，不能仅凭旧日志当作当前 Bug。
 - 历史日志对统一工具超时互相冲突；当前普通工具由 `ToolRegistry.execute()` 使用 180 秒兜底，Shell 另有 60 秒超时。子 Agent 由自身回合上限管理，生图由单请求超时和整次任务预算管理，避免普通工具上限提前截断长任务和重试。
 - 历史日志称最后提交无法 push；当前 Git 实测 `HEAD` 与 `origin/main` 均为 `0daefc4`，领先/落后为 `0/0`，此项已核销。
+- “飞书不支持图片”已核销：当前支持私聊图片入站，以及 Agent/子 Agent 生成图片出站；群聊仍要求事件包含 @ 提醒。
+- 工具消息重启后可能触发 400 已核销：新记录按 `assistant(tool_calls) → tool` 落盘；读取旧会话时会重排历史前置 tool、补齐缺失结果并丢弃孤立 tool。飞书因稳定复用 `chat_id` 更容易暴露旧问题，Web 的新连接默认产生新 ID，但接回旧会话时同样受修复保护。
 
 ## 5. 当前遗留问题清单
 
@@ -67,14 +71,6 @@
 - **影响**：同网段非可信访问者可读取密钥、会话与图片，并修改配置。README 的“可信局域网”提示不足以防止误暴露。
 - **建议验收**：默认只绑定 loopback，或加入认证；秘密字段只返回是否已配置，空值不得覆盖已有秘密；对会话/图片/配置端点统一鉴权。
 - **证据**：`channels/web.py` 的 `_handle_get_config/_handle_post_config`，`config.py` 的 `_CONFIG_FIELDS` 和 `web_host`。
-
-#### NC-BUG-002 工具调用持久化顺序回归
-
-- **现状**：`AgentLoop._execute_tools()` 先 `_persist(tool_msg)`，循环结束后才持久化 `assistant(tool_calls)`。磁盘顺序成为 `user → tool → assistant`，不符合 OpenAI 要求的 `assistant(tool_calls) → tool`。
-- **复现**：2026-07-26 离线调用 `_execute_tools`，得到 `disk_roles=['tool','assistant']`；`SessionManager.get_history()` 自愈后成为 `['tool','assistant','tool']`，同一 `tool_call_id` 重复两次。
-- **影响**：包含工具调用的会话在重启/续接后可能 API 400，且当前自愈会留下前置孤儿 tool 消息。
-- **建议验收**：保留生成图片元数据能力的同时原子地按协议顺序落盘；为普通工具、多个工具、生图、执行中断和坏历史各留回归测试。
-- **证据**：`agent/loop.py::_execute_tools`、`session/manager.py::get_history`。
 
 #### NC-SEC-001 workspace 边界不是真实沙箱
 
@@ -90,14 +86,13 @@
 
 | ID | 问题 | 当前影响 / 建议 |
 |---|---|---|
-| NC-TEST-001 | 无正式测试、CI、lint、类型检查 | 历史验证多为已删除临时脚本；先建立 pytest 回归基线，优先覆盖 P0、Gateway 并发、Provider 流式、路径边界 |
+| NC-TEST-001 | 无 CI、lint、类型检查基线 | 当前已有 unittest 回归集，但尚未自动化运行；应建立 CI，并逐步加入静态检查与关键并发覆盖 |
 | NC-BUG-003 | 工具循环硬熔断不可达 | 重复签名达到 10 次后直接返回警告且不再累计，永远到不了 20 次硬熔断；调整计数语义并测试 10/20 边界 |
 | NC-BUG-004 | session_key 文件名映射有损 | `:` 写为 `_`，列表再把所有 `_` 还原成 `:`；原 key 含下划线时失真/碰撞，飞书 chat_id 正常会含 `_`；需可逆编码或显式元数据 |
 | NC-BUG-005 | 当前进程的会话检索索引陈旧 | `rebuild_all()` 只在启动执行，搜索仅刷新 memory 文件；新会话内容重启前搜不到；需增量更新或刷新策略 |
 | NC-ARCH-001 | 配置热更新对象分裂 | 新会话只更新部分 Provider/Context；MCP、skills、workspace、共享 memory provider、工具注册仍是启动值；UI 需明确每字段生效方式或统一重载 |
 | NC-ARCH-002 | 无背压且缓存不回收 | Queue 无 maxsize，每消息无界 create_task，Agent/lock 永久缓存；需并发上限、队列策略和会话回收 |
 | NC-ARCH-003 | Channel 停止不是优雅关闭 | Web/飞书后台守护线程未真正 stop；测试、热重启和嵌入式运行可能泄漏资源 |
-| NC-FEAT-001 | 飞书不支持图片 | `_on_message` 只处理 text；当前完整图片链路只覆盖 Web |
 
 ### P2：明确边界或后续优化
 
