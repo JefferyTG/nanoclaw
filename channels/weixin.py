@@ -28,6 +28,25 @@ logger = logging.getLogger("nanoclaw.weixin")
 _PROTOCOL_VERSION = 1
 _MAX_LINE_BYTES = 1024 * 1024
 _MAX_IMAGE_BYTES = 20 * 1024 * 1024
+_CHANNEL_ERROR_CODES = frozenset({
+    "api_rejected",
+    "cancelled",
+    "context_missing",
+    "invalid_request",
+    "media_invalid",
+    "network_error",
+    "protocol_error",
+    "timeout",
+    "unsupported_message",
+    "verification_required",
+})
+_CHANNEL_ERROR_REASONS = frozenset({
+    "invalid_json_response",
+    "response_too_large",
+    "invalid_acceptance",
+    "invalid_messages",
+    "provider_protocol_error",
+})
 _IMAGE_MIMES = {
     "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif",
     "image/webp": "webp", "image/bmp": "bmp",
@@ -448,7 +467,23 @@ class WeixinChannel(Channel):
             self._started = False
             logger.info("Weixin bridge stopped")
         elif event == "channel_error":
-            logger.warning("Weixin bridge channel error: %s", data.get("code", "unknown"))
+            code = data.get("code", "unknown")
+            reason = data.get("reason")
+            safe_code = (
+                code
+                if isinstance(code, str) and code in _CHANNEL_ERROR_CODES
+                else "unknown"
+            )
+            if (
+                safe_code == "protocol_error"
+                and isinstance(reason, str)
+                and reason in _CHANNEL_ERROR_REASONS
+            ):
+                logger.warning("Weixin bridge channel error: %s (%s)", safe_code, reason)
+            else:
+                # The child process is an IPC trust boundary.  Never reflect an
+                # arbitrary provider message/body into ordinary application logs.
+                logger.warning("Weixin bridge channel error: %s", safe_code)
         elif event == "session_expired":
             self._started = False
             logger.warning("Weixin session expired")

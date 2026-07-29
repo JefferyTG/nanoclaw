@@ -53,6 +53,12 @@ const MAX_OUTBOUND_IMAGE_BYTES = positiveInt(
   20 * 1024 * 1024,
 );
 const MAX_QR_REFRESHES = 3;
+const PROTOCOL_DIAGNOSTICS = new Set([
+  'invalid_json_response',
+  'response_too_large',
+  'invalid_acceptance',
+  'invalid_messages',
+]);
 
 const stateDir = process.env.NANOCLAW_WEIXIN_STATE_DIR;
 const mediaRoot = process.env.NANOCLAW_WEIXIN_MEDIA_ROOT;
@@ -83,7 +89,13 @@ function emit(message) {
 function normalizedError(err) {
   if (err?.structured_error) return err.structured_error;
   if (typeof err?.code === 'string' && !['ETIMEDOUT', 'ECONNRESET'].includes(err.code)) {
-    return error(err.code, 'operation failed', Boolean(err.retryable), err.providerCode);
+    const result = error(err.code, 'operation failed', Boolean(err.retryable), err.providerCode);
+    if (err.code === 'protocol_error') {
+      result.reason = PROTOCOL_DIAGNOSTICS.has(err.diagnostic)
+        ? err.diagnostic
+        : 'provider_protocol_error';
+    }
+    return result;
   }
   return classify(err);
 }
@@ -125,14 +137,14 @@ async function readJsonResponse(response) {
   try {
     const declared = Number(response.headers.get('content-length'));
     if (Number.isFinite(declared) && declared > MAX_LINE_BYTES) {
-      throw bridgeError('protocol_error', 'provider JSON response exceeds limit');
+      throw bridgeError('protocol_error', 'provider JSON response exceeds limit', {diagnostic: 'response_too_large'});
     }
     const text = await boundedResponseBytes(response, MAX_LINE_BYTES)
       .then(bytes => bytes.toString('utf8'));
     return JSON.parse(text);
   } catch (err) {
     if (err?.code === 'protocol_error') throw err;
-    throw bridgeError('protocol_error', 'provider returned invalid JSON');
+    throw bridgeError('protocol_error', 'provider returned invalid JSON', {diagnostic: 'invalid_json_response'});
   }
 }
 
@@ -148,7 +160,7 @@ async function boundedResponseBytes(response, maxBytes) {
       size += value.byteLength;
       if (size > maxBytes) {
         await reader.cancel();
-        throw bridgeError('protocol_error', 'provider response exceeds limit');
+        throw bridgeError('protocol_error', 'provider response exceeds limit', {diagnostic: 'response_too_large'});
       }
       chunks.push(Buffer.from(value));
     }
@@ -492,7 +504,7 @@ async function pollLoop(signal) {
       const cursor = response.get_updates_buf ?? response.cursor ?? state.cursor;
       const rawMessages = response.msgs ?? response.messages ?? [];
       if (!Array.isArray(rawMessages)) {
-        throw bridgeError('protocol_error', 'provider messages field is invalid');
+        throw bridgeError('protocol_error', 'provider messages field is invalid', {diagnostic: 'invalid_messages'});
       }
 
       const messages = [];

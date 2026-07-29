@@ -57,24 +57,23 @@ export function splitText(text, max = MAX_TEXT) {
   return chunks;
 }
 
-/** HTTP success alone is not an iLink send/update acknowledgement. */
+/** A valid JSON object succeeds unless iLink explicitly supplies a non-zero rejection. */
 export function assertAccepted(json) {
-  if (!json || typeof json !== 'object') {
+  if (!json || typeof json !== 'object' || Array.isArray(json)) {
     throw Object.assign(new Error('provider response is not an object'), {
       code: 'protocol_error',
-    });
-  }
-  if (json.ret === undefined && json.errcode === undefined) {
-    throw Object.assign(new Error('provider acceptance field missing'), {
-      code: 'protocol_error',
+      diagnostic: 'invalid_acceptance',
     });
   }
   for (const raw of [json.ret, json.errcode]) {
     if (raw === undefined || raw === null) continue;
-    const code = Number(raw);
+    const numeric = typeof raw === 'number'
+      || (typeof raw === 'string' && /^-?\d+$/.test(raw));
+    const code = numeric ? Number(raw) : Number.NaN;
     if (!Number.isFinite(code)) {
       throw Object.assign(new Error('provider acceptance field is invalid'), {
         code: 'protocol_error',
+        diagnostic: 'invalid_acceptance',
       });
     }
     if (code !== 0) {

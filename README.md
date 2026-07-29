@@ -151,6 +151,7 @@ uv run python main.py
 ```
 
 默认只启用命令行渠道。要开网页渠道，把 `config.json` 里的 `web_port` 设为非零（如 `8080`）；微信渠道需完成上面的 Bridge 构建并配置 `weixin.enabled=true`。
+命令行中输入 `/exit` 可正常退出；`Ctrl+C` 也会立即取消终端输入并执行统一清理，不需要再按回车。
 
 ---
 
@@ -187,9 +188,9 @@ uv run python main.py
 1. 安装并构建 `integrations/weixin_bridge/`，确认本机 `node --version` 为 20 或更高；
 2. 在 `config.json` 的 `weixin.allowed_user_ids` 中填写允许的微信 iLink `user_id`。空列表会拒绝所有用户；只有显式 `"*"` 才允许任意私聊用户；
 3. 设置 `weixin.enabled=true` 后重启 NanoClaw。首次启动会在本机终端显示扫码内容；手机确认后，Bridge 把凭据保存到被 Git 忽略的 `workspace/weixin/`；
-4. 后续启动会恢复凭据、长轮询 cursor、`account_id + user_id` 对应的 context token 和去重状态，无需把 token 写入 `config.json`。
+4. 后续启动会恢复凭据、长轮询 cursor、`account_id + user_id` 对应的 context token 和去重状态，无需把 token 写入 `config.json`，正常情况下也不会再次显示二维码。状态目录丢失、主动强制登录或收到 `-14` 会话失效时才会重新进入扫码流程。
 
-V1 只处理单账号私聊文本和 PNG/JPEG/GIF/WEBP/BMP 图片。群聊、语音、视频、文件和多账号暂不支持。入站与出站都经过 allowlist；可靠回执表示 iLink HTTP 和 JSON `ret/errcode` 已接受，不表示用户已读。一个用户至少入站交互一次后，Bridge 才有该用户的 context token；此后可用稳定的 `account_id + user_id` 主动发送，重启不丢失这项能力。
+V1 只处理单账号私聊文本和 PNG/JPEG/GIF/WEBP/BMP 图片。群聊、语音、视频、文件和多账号暂不支持。入站与出站都经过 allowlist；可靠回执表示 iLink HTTP 成功、响应是有效 JSON，且服务端没有通过非零 `ret/errcode` 明确拒绝，不表示用户已读。腾讯当前成功响应允许省略 `ret/errcode`。一个用户至少入站交互一次后，Bridge 才有该用户的 context token；此后可用稳定的 `account_id + user_id` 主动发送，重启不丢失这项能力。
 
 Bridge stdout 只承载 JSONL 协议，敏感凭据、cursor 和 context token 始终留在权限为 `0700/0600` 的状态目录。若收到 `-14` 会话失效，Bridge 会停止轮询、清除当前凭据代次的 context/去重状态并要求重新扫码；重新登录后，对端需再次交互才能恢复主动发送。当前真实微信扫码/收发属于有外部副作用的手工验收，不在自动测试中执行。
 

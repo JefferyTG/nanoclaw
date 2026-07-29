@@ -12,6 +12,7 @@
 """
 
 import asyncio
+import threading
 
 from channels.base import Channel
 from bus.queue import InboundMessage, OutboundMessage
@@ -40,14 +41,53 @@ class CLIChannel(Channel):
         """当前活动会话对应的 sender_id（Gateway 据此推导 session_key）。"""
         return f"local{self._current_session}"
 
+    async def _read_line(self) -> str:
+        """Read one terminal line without borrowing asyncio's default executor.
+
+        ``input()`` cannot be cancelled.  ``asyncio.to_thread`` therefore left
+        a default-executor worker blocked after SIGINT, and ``asyncio.run``
+        waits for that worker while shutting down.  A one-shot daemon thread is
+        intentionally not joined: cancellation can finish the application
+        immediately, while normal input/EOF/KeyboardInterrupt is delivered
+        back to the event loop exactly once.
+        """
+        loop = asyncio.get_running_loop()
+        result = loop.create_future()
+
+        def deliver(value=None, error=None) -> None:
+            if result.done():
+                return
+            if error is not None:
+                result.set_exception(error)
+            else:
+                result.set_result(value)
+
+        def read_from_stdin() -> None:
+            try:
+                value = input("你> ")
+            except BaseException as exc:  # forward EOFError/KeyboardInterrupt
+                try:
+                    loop.call_soon_threadsafe(deliver, None, exc)
+                except RuntimeError:  # loop has already closed after SIGINT
+                    pass
+            else:
+                try:
+                    loop.call_soon_threadsafe(deliver, value, None)
+                except RuntimeError:  # loop has already closed after SIGINT
+                    pass
+
+        threading.Thread(
+            target=read_from_stdin, name="nanoclaw-cli-input", daemon=True
+        ).start()
+        return await result
+
     async def start(self) -> None:
         """终端交互循环：读输入、处理命令、投递消息、等待回复。"""
         print("（CLI 渠道已启动｜/exit 退出｜/clear 清当前会话｜/new 新会话"
               "｜/sessions 列表｜/switch <n> 切换｜/tools 看工具）")
         while True:
             try:
-                # input() 是阻塞调用，用 to_thread 包一层避免卡住事件循环
-                line = await asyncio.to_thread(input, "你> ")
+                line = await self._read_line()
             except (EOFError, KeyboardInterrupt):
                 print("\n👋 再见")
                 break

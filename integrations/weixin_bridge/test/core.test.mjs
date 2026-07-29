@@ -8,7 +8,17 @@ test('client IDs are stable and text splits', () => { assert.equal(clientId('x',
 test('classification and cancellable retry', async () => { assert.equal(classify({providerCode:-14}).code,'session_expired'); let n=0; const r=await retry(async()=>{ if(++n<2) throw Object.assign(new Error(),{code:'ETIMEDOUT'}); return 3; },{sleep:async()=>{}}); assert.equal(r,3); });
 test('send response rejects JSON ret and errcode despite HTTP transport success', () => { assert.deepEqual(assertAccepted({ret:0}),{ret:0}); assert.throws(()=>assertAccepted({ret:123}), /rejected/); assert.throws(()=>assertAccepted({errcode:-14}), /rejected/); });
 test('ret success cannot mask errcode rejection', () => assert.throws(()=>assertAccepted({ret:0,errcode:-14}),/rejected/));
-test('missing provider acceptance field is a protocol failure', () => assert.throws(()=>assertAccepted({}),/acceptance/));
+test('empty valid JSON is accepted by the Tencent send compatibility rule', () => assert.deepEqual(assertAccepted({}), {}));
+test('poll and send compatibility reject explicit nonzero acceptance fields', () => {
+  assert.deepEqual(assertAccepted({msgs: []}), {msgs: []});
+  assert.deepEqual(assertAccepted({ret: '0'}), {ret: '0'});
+  assert.throws(() => assertAccepted({ret: -14}), /rejected/);
+  assert.throws(() => assertAccepted({errcode: 'not-a-number'}), /invalid/);
+  for (const invalid of ['', ' ', false, [], {}]) {
+    assert.throws(() => assertAccepted({ret: invalid}), /invalid/);
+  }
+  assert.throws(() => assertAccepted([]), /not an object/);
+});
 test('QR/status structures use required fields rather than send acceptance fields', () => { assert.equal(requireFields({qrcode:'q',qrcode_img_content:'img'},['qrcode','qrcode_img_content']).qrcode,'q'); assert.throws(()=>requireFields({status:'confirmed'},['bot_token']),/required/); });
 test('AES CDN payload round trips', () => { const key=crypto.randomBytes(16), plain=Buffer.from('image bytes'); assert.deepEqual(decryptEcb(encryptEcb(plain,key),key),plain); });
 test('QR renderer returns local ASCII without writing protocol stdout', () => assert.ok(asciiQRCode('https://example.invalid/qr').trim().length>0));

@@ -109,6 +109,25 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("scan-this", output.call_args.args[0])
         self.assertNotIn("opaque-handle", output.call_args.args[0])
 
+    async def test_channel_error_logs_only_allowlisted_diagnostic_reason(self):
+        with self.assertLogs("nanoclaw.weixin", level="WARNING") as captured:
+            await self.channel._handle_event("channel_error", {
+                "code": "protocol_error", "reason": "invalid_messages",
+                "message": "provider body with secret-token",
+            })
+            await self.channel._handle_event("channel_error", {
+                "code": "secret-code", "reason": "secret-token",
+            })
+            await self.channel._handle_event("channel_error", {
+                "code": {"secret": "code"}, "reason": ["secret-token"],
+            })
+        output = "\n".join(captured.output)
+        self.assertIn("invalid_messages", output)
+        self.assertIn("channel error: unknown", output)
+        self.assertNotIn("provider body", output)
+        self.assertNotIn("secret-code", output)
+        self.assertNotIn("secret-token", output)
+
     async def test_start_performs_hello_login_then_poll_and_passes_no_parent_secrets(self):
         self.channel.auto_login = True
         with patch.dict("channels.weixin.os.environ", {"NANOCLAW_API_KEY": "parent-secret"}):
