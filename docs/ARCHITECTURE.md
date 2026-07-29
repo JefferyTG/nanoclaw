@@ -234,9 +234,12 @@ workspace/
 ### 5.5 主动提醒与定时 Agent
 
 `create_reminder`、`list_reminders`、`cancel_reminder` 是所有普通 Agent 会话共享的
-工具。工具不接受 `chat_id`；ReminderService 只从数据库中当前有效的 `target_id`
-解析发送目标。目标只能由 FeishuChannel 在 p2p 中识别确定性命令
-`/bind-reminders`、`/unbind-reminders` 后写入，并以 `open_id` 保持实例所有权。
+工具。工具不接受 channel、chat/user ID；ReminderService 只从数据库中当前有效的
+`target_id` 解析发送目标。目标只能由 FeishuChannel 或 WeixinChannel 在私聊中识别
+确定性命令 `/bind-reminders`、`/unbind-reminders` 后写入。首次绑定的
+`(channel, owner_id)` 永久锁定实例，飞书与微信在 V1 中二选一；解绑只暂停，不释放
+所有权。微信 recipient/owner 都使用稳定可逆的 account/user target，context token
+继续仅由 Bridge 持有。
 
 任务保存本地 `DTSTART`、IANA timezone、规范 RFC 5545 RRULE 和
 `next_run_at_utc`。ReminderScheduler 不做秒级轮询，也不为每个任务保留协程：它读取
@@ -250,7 +253,7 @@ sequenceDiagram
     participant R as SQLite Repository
     participant A as AgentLoop (scheduled session)
     participant B as MessageBus/Gateway
-    participant F as FeishuChannel/API
+    participant C as Bound Channel/API
     S->>R: atomic claim + lease
     alt message
         S->>R: persist delivery_text as output
@@ -259,17 +262,19 @@ sequenceDiagram
         A-->>S: generated text
         S->>R: persist exact output before delivery
     end
-    S->>B: OutboundMessage + delivery_future
-    B->>F: send once
-    F-->>B: DeliveryResult
+    S->>B: OutboundMessage + delivery_future + stable correlation_id
+    B->>C: send once
+    C-->>B: DeliveryResult
     B-->>S: resolve acknowledgement
     S->>R: success / retry_wait / failed + next occurrence
 ```
 
 动态任务使用 `scheduled:<task_id>:<execution_id>` 独立临时会话；生成后立即保存输出
 并清理 SessionManager/ImageStore。发送失败只重发该输出，不重复调用 Agent。回执表示
-飞书 API 已接受，不表示用户已读。第一版采用 at-least-once：若进程在飞书接受后、
-SQLite 成功提交前崩溃，重启后存在极小概率重复发送。
+目标渠道 API 已接受，不表示用户已读。微信使用 `reminder:<execution_id>` 作为稳定
+correlation ID。目标解绑、微信会话过期或 context 缺失会释放 claim 并暂停，而不是
+消耗三次发送机会；同一 owner 重绑后恢复。第一版采用 at-least-once：若进程在渠道
+接受后、SQLite 成功提交前崩溃，重启后仍存在极小概率重复发送。
 
 ## 6. 配置生效边界
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import logging
 import os
@@ -86,6 +87,10 @@ class _UnsupportedInbound(ValueError):
     """A syntactically valid delivery V1 intentionally declines to consume."""
 
 
+class _ReminderCommandError(RuntimeError):
+    """A binding callback failed without exposing its error to the bridge."""
+
+
 def encode_weixin_target(account_id: str, user_id: str) -> str:
     """Return a stable reversible target without delimiter-collision hazards."""
     if not isinstance(account_id, str) or not isinstance(user_id, str) or not account_id or not user_id:
@@ -136,6 +141,9 @@ class WeixinChannel(Channel):
         restart_backoff_sec: float = 1.0,
         image_merge_window_sec: float = 10.0,
         auto_login: bool = False,
+        bind_callback=None,
+        unbind_callback=None,
+        suspend_callback=None,
     ) -> None:
         super().__init__(name=name, bus=bus)
         if not bridge_command:
@@ -172,6 +180,12 @@ class WeixinChannel(Channel):
         self._pending_image_batches: dict[tuple[str, str], _PendingImageBatch] = {}
         self._inbound_lock = asyncio.Lock()
         self._pending_batches_restored = False
+        # ReminderService owns authorization and persistence.  This adapter
+        # only recognizes deterministic private-message commands and forwards
+        # the stable, credential-free target identity.
+        self._bind_callback = bind_callback
+        self._unbind_callback = unbind_callback
+        self._suspend_callback = suspend_callback
 
     def target(self, account_id: str, user_id: str) -> str:
         return encode_weixin_target(account_id, user_id)
@@ -533,6 +547,7 @@ class WeixinChannel(Channel):
         elif event == "session_expired":
             self._started = False
             logger.warning("Weixin session expired")
+            await self._suspend_reminders()
             if not self._stopping:
                 self._schedule_reauth()
 
@@ -559,6 +574,9 @@ class WeixinChannel(Channel):
             logger.warning("discarded unsupported Weixin inbound message: %s", exc)
             await self._ack_inbound(delivery_id)
             return
+        except _ReminderCommandError:
+            logger.warning("failed to persist Weixin reminder command")
+            return
         except Exception as exc:
             # ImageStore, persistence and Bus failures are recoverable.  Do
             # not acknowledge: Bridge redelivery is the at-least-once path.
@@ -577,6 +595,14 @@ class WeixinChannel(Channel):
         """
         target = encode_weixin_target(account_id, user_id)
         session_key = f"{self.name}:{target}"
+        text = data.get("text") if isinstance(data.get("text"), str) else ""
+        text = text.strip()
+        # These are deliberately exact, text-only commands.  In particular a
+        # command with an image remains an ordinary image turn, so it cannot
+        # unexpectedly bind a reminder target or consume a pending batch.
+        if not data.get("images") and text in {"/bind-reminders", "/unbind-reminders"}:
+            await self._handle_reminder_command(target, text)
+            return True
         batch = self._pending_image_batches.get((account_id, user_id))
         if batch is not None and delivery_id in batch.delivery_ids:
             for descriptor in data.get("images") or []:
@@ -590,8 +616,6 @@ class WeixinChannel(Channel):
                 raise _UnsupportedInbound(str(exc)) from exc
             if image is not None:
                 images.append(image)
-        text = data.get("text") if isinstance(data.get("text"), str) else ""
-        text = text.strip()
         if not text and not images:
             logger.info("discarded empty or unsupported Weixin inbound message")
             return True
@@ -638,6 +662,52 @@ class WeixinChannel(Channel):
             old_batch.timer.cancel()
         self._schedule_image_batch_timer_locked(key, new_batch)
         return True
+
+    async def _handle_reminder_command(self, target: str, command: str) -> None:
+        """Persist a reminder binding before acknowledging its inbound command."""
+
+        callback = (
+            self._bind_callback
+            if command == "/bind-reminders"
+            else self._unbind_callback
+        )
+        if callback is None:
+            outcome = "⚠️ 当前实例未启用主动提醒服务。"
+        else:
+            try:
+                result = callback(target, target)
+                outcome = await result if inspect.isawaitable(result) else result
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise _ReminderCommandError from exc
+            default = (
+                "✅ 已绑定主动提醒。"
+                if command == "/bind-reminders"
+                else "✅ 已解绑主动提醒。"
+            )
+            outcome = outcome if isinstance(outcome, str) and outcome else default
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=self.name,
+            chat_id=target,
+            content=outcome,
+        ))
+
+    async def _suspend_reminders(self) -> None:
+        """Best-effort pause after session expiry without exposing bridge data."""
+
+        if self._suspend_callback is None:
+            return
+        try:
+            result = self._suspend_callback()
+            if inspect.isawaitable(result):
+                await result
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # The callback may touch the reminder DB; it must not delay or
+            # disable the credential-free QR reauthentication path.
+            logger.warning("failed to suspend Weixin reminders after session expiry")
 
     async def _flush_image_batch_after_window(
         self, key: tuple[str, str], batch: _PendingImageBatch

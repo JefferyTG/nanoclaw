@@ -1,4 +1,4 @@
-"""Application service shared by reminder tools and Feishu binding commands."""
+"""Application service shared by reminder tools and channel binding commands."""
 
 from __future__ import annotations
 
@@ -14,7 +14,12 @@ from reminders.models import DeliveryResult, TaskKind
 from reminders.schedule import ScheduleService, ScheduleSpec
 
 
-_BIND_GUIDE = "尚未绑定提醒目标。请先在与机器人的飞书私聊中发送 /bind-reminders。"
+_BIND_GUIDE = (
+    "尚未绑定提醒目标。请先在希望接收提醒的飞书或微信私聊中发送 "
+    "/bind-reminders。"
+)
+_TARGET_CHANNELS = frozenset({"feishu", "weixin"})
+_CHANNEL_LABELS = {"feishu": "飞书", "weixin": "微信"}
 _WEEKDAYS = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
 
 
@@ -142,6 +147,23 @@ class AsyncReminderRepository:
             lease_owner=self.lease_owner,
             now_utc=self.clock(),
         )
+
+    async def defer_delivery(self, execution_id: str, reason: str) -> None:
+        """Release an inactive-target claim without consuming a send attempt."""
+
+        execution_key = int(execution_id)
+        if execution_key not in self._claims:
+            return
+        await asyncio.to_thread(
+            self.repository.defer_delivery,
+            execution_key,
+            lease_owner=self.lease_owner,
+            now_utc=self.clock(),
+            reason=reason,
+        )
+        # False means a concurrent cancellation or completion already removed
+        # the claim.  Either way this scheduler must forget its volatile view.
+        self._forget(execution_key)
 
     async def schedule_agent_retry(
         self, execution_id: str, retry_at: datetime, error: str
@@ -312,39 +334,91 @@ class ReminderService:
             raise ValueError("reminder clock must return a timezone-aware datetime")
         return value.astimezone(UTC)
 
-    async def bind_feishu(self, chat_id: str, open_id: str) -> str:
-        if not chat_id or not open_id:
-            return "⚠️ 飞书事件缺少私聊或用户标识，无法绑定提醒。"
+    async def bind_target(
+        self, channel: str, recipient_id: str, owner_id: str
+    ) -> str:
+        if channel not in _TARGET_CHANNELS:
+            return "⚠️ 当前渠道不支持主动提醒绑定。"
+        label = _CHANNEL_LABELS[channel]
+        if not recipient_id or not owner_id:
+            return f"⚠️ {label}事件缺少私聊或用户标识，无法绑定提醒。"
         try:
             target = await self._repo(
-                "bind_feishu_target",
-                chat_id=chat_id,
-                open_id=open_id,
+                "bind_target",
+                channel=channel,
+                recipient_id=recipient_id,
+                owner_id=owner_id,
                 now_utc=self._now_utc(),
             )
         except PermissionError:
-            return "⚠️ 当前实例已绑定其他飞书用户，只有原绑定用户可以重新绑定。"
+            return (
+                "⚠️ 当前实例的提醒目标已由其他渠道或用户持有；"
+                "V1 只支持首次绑定的渠道与用户重新绑定。"
+            )
         except (OSError, ValueError):
             return "⚠️ 绑定提醒失败，请检查本实例的提醒数据库配置。"
         self._wake()
-        return f"✅ 已绑定主动提醒到当前飞书私聊（目标 {target.target_id}）。"
+        return f"✅ 已绑定主动提醒到当前{label}私聊（目标 {target.target_id}）。"
 
-    async def unbind_feishu(self, chat_id: str, open_id: str) -> str:
-        del chat_id  # open_id is the ownership boundary; chat_id may have changed.
-        if not open_id:
-            return "⚠️ 飞书事件缺少用户标识，无法解绑提醒。"
+    async def unbind_target(
+        self, channel: str, recipient_id: str, owner_id: str
+    ) -> str:
+        del recipient_id  # owner_id is stable if the provider's recipient changes.
+        if channel not in _TARGET_CHANNELS:
+            return "⚠️ 当前渠道不支持主动提醒解绑。"
+        label = _CHANNEL_LABELS[channel]
+        if not owner_id:
+            return f"⚠️ {label}事件缺少用户标识，无法解绑提醒。"
         try:
             changed = await self._repo(
-                "unbind_feishu_target", open_id=open_id, now_utc=self._now_utc()
+                "unbind_target",
+                channel=channel,
+                owner_id=owner_id,
+                now_utc=self._now_utc(),
             )
         except PermissionError:
-            return "⚠️ 只有当前绑定的飞书用户可以解绑提醒。"
+            return f"⚠️ 只有当前绑定的{label}用户可以解绑提醒。"
         except (OSError, ValueError):
             return "⚠️ 解绑提醒失败，请稍后重试。"
         if not changed:
             return "当前没有由你绑定的提醒目标。"
         self._wake()
         return "✅ 已解绑主动提醒；已有任务会保留，并在同一用户重新绑定后恢复调度。"
+
+    async def bind_feishu(self, chat_id: str, open_id: str) -> str:
+        return await self.bind_target("feishu", chat_id, open_id)
+
+    async def unbind_feishu(self, chat_id: str, open_id: str) -> str:
+        return await self.unbind_target("feishu", chat_id, open_id)
+
+    async def bind_weixin(self, recipient_id: str, owner_id: str) -> str:
+        return await self.bind_target("weixin", recipient_id, owner_id)
+
+    async def unbind_weixin(self, recipient_id: str, owner_id: str) -> str:
+        return await self.unbind_target("weixin", recipient_id, owner_id)
+
+    async def suspend_target_id(self, target_id: str) -> bool:
+        """Pause a provider target while retaining its tasks and ownership."""
+
+        try:
+            changed = await self._repo(
+                "suspend_target", target_id=target_id, now_utc=self._now_utc()
+            )
+        except (OSError, ValueError):
+            return False
+        if changed:
+            self._wake()
+        return bool(changed)
+
+    async def suspend_weixin(self) -> None:
+        """Pause the selected Weixin target after the Bridge loses its context."""
+
+        try:
+            target = await self._repo("get_active_target")
+        except OSError:
+            return
+        if target is not None and target.channel == "weixin":
+            await self.suspend_target_id(target.target_id)
 
     async def create_reminder(self, **kwargs) -> str:
         try:

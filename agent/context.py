@@ -120,8 +120,9 @@ class ContextBuilder:
             "message 任务的 delivery_text 是到点直接发送的最终正文：创建时就按当前"
             "人设写成克制、准确、自包含的成稿，不要包含内部说明。agent 任务只保存"
             "明确、可独立执行的 agent_prompt，到点才运行 Agent。\n"
-            "提醒只能投递到用户通过飞书私聊 /bind-reminders 显式绑定的目标；不得"
-            "编造、索取或向工具传入 chat_id。未绑定时原样转达工具给出的绑定指引。"
+            "提醒只能投递到用户通过飞书或微信私聊 /bind-reminders 显式绑定的唯一"
+            "目标；首次绑定的渠道和用户会锁定当前实例。不得编造、索取或向工具传入"
+            "channel、chat_id、user_id。未绑定时原样转达工具给出的绑定指引。"
         )
 
     def build_system_prompt(self) -> str:

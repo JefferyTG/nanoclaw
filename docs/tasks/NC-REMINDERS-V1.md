@@ -1,5 +1,8 @@
 # NC-REMINDERS-V1：主动提醒与定时 Agent 任务
 
+> 本任务记录的是最初仅飞书投递的 V1；后续微信单目标扩展与通用目标迁移见
+> `docs/tasks/NC-WEIXIN-REMINDERS-V1.md`。
+
 ## 任务卡
 
 - 状态：实现与验证完成，待用户决定是否提交

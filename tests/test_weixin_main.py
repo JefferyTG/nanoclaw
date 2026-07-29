@@ -17,6 +17,9 @@ class WeixinCompositionTests(unittest.TestCase):
 
     def test_enabled_channel_receives_startup_only_settings(self):
         with tempfile.TemporaryDirectory() as tmp:
+            bind = object()
+            unbind = object()
+            suspend = object()
             cfg = NanoClawConfig(workspace=tmp)
             cfg.weixin = {
                 **cfg.weixin,
@@ -26,13 +29,23 @@ class WeixinCompositionTests(unittest.TestCase):
                 "image_merge_window_sec": 3.5,
                 "request_timeout_sec": 12,
             }
-            channel = build_weixin_channel(cfg, MessageBus(), object())
+            channel = build_weixin_channel(
+                cfg,
+                MessageBus(),
+                object(),
+                bind_callback=bind,
+                unbind_callback=unbind,
+                suspend_callback=suspend,
+            )
 
         self.assertEqual(channel.bridge_command, ("node", "bridge.mjs"))
         self.assertEqual(channel.allowed_user_ids, frozenset({"user-1"}))
         self.assertEqual(channel.command_timeout_sec, 12)
         self.assertEqual(channel.image_merge_window_sec, 3.5)
         self.assertTrue(channel.auto_login)
+        self.assertIs(channel._bind_callback, bind)
+        self.assertIs(channel._unbind_callback, unbind)
+        self.assertIs(channel._suspend_callback, suspend)
         self.assertEqual(
             channel.state_dir,
             Path(os.path.realpath(os.path.join(tmp, "workspace/weixin"))),

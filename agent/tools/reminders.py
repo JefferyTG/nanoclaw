@@ -10,10 +10,11 @@ class CreateReminderTool(Tool):
 
     name = "create_reminder"
     description = (
-        "创建会主动发送到已绑定飞书私聊的定时任务。用户说法有歧义时必须先确认，"
+        "创建会主动发送到当前实例唯一已绑定私聊目标的定时任务。目标可以是飞书或"
+        "微信，但由绑定状态解析，模型不得选择渠道或传目标 ID。用户说法有歧义时必须先确认，"
         "尤其是‘每隔一天/每隔两天’；不要猜测。一次性任务使用 count=1。"
         "message 类型必须传入创建时已写好的最终 delivery_text，到点不调用模型；"
-        "agent 类型必须传入到点才执行的 agent_prompt。不得传 chat_id。"
+        "agent 类型必须传入到点才执行的 agent_prompt。不得传 channel、chat_id 或 user_id。"
     )
     parameters = {
         "type": "object",
@@ -95,7 +96,7 @@ class ListRemindersTool(Tool):
     """List reminder tasks belonging to the instance's bound target."""
 
     name = "list_reminders"
-    description = "查询当前实例已绑定飞书私聊的定时任务；默认只列仍活动的任务。"
+    description = "查询当前实例唯一已绑定私聊目标的定时任务；默认只列仍活动的任务。"
     parameters = {
         "type": "object",
         "properties": {
@@ -121,7 +122,7 @@ class CancelReminderTool(Tool):
     """Cancel one task after checking target ownership in the repository."""
 
     name = "cancel_reminder"
-    description = "取消当前已绑定飞书目标下的一个定时任务；不会影响其它任务。"
+    description = "取消当前实例唯一已绑定目标下的一个定时任务；不会影响其它任务。"
     parameters = {
         "type": "object",
         "properties": {

@@ -34,6 +34,7 @@ class Execution:
 class Result:
     success: bool
     retryable: bool = False
+    code: str | None = None
     error: str | None = None
     message: str | None = None
 
@@ -42,6 +43,7 @@ class Repository:
     def __init__(self, clock, executions=()):
         self.clock, self.executions = clock, list(executions)
         self.calls, self.outputs, self.retries, self.failed, self.advanced = [], {}, [], [], []
+        self.deferred = []
         self.recovered = 0
 
     async def recover_expired_leases(self, now): self.recovered += 1
@@ -54,6 +56,7 @@ class Repository:
     async def mark_failed(self, execution_id, error): self.failed.append((execution_id, error))
     async def is_cancelled(self, execution_id): return execution_id in getattr(self, "cancelled", set())
     async def begin_delivery(self, execution_id): return execution_id not in getattr(self, "cancelled", set())
+    async def defer_delivery(self, execution_id, reason): self.deferred.append((execution_id, reason))
     async def schedule_agent_retry(self, execution_id, retry_at, error): self.calls.append(("agent-retry", execution_id, error))
     async def advance_schedule(self, task_id, scheduled_for, now): self.advanced.append(task_id)
 
@@ -158,7 +161,31 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         await scheduler._drain_due()
         self.assertEqual(repo.failed, [("e1", "target unavailable")])
 
-    async def test_message_bypasses_agent_and_cancelled_claim_has_no_external_effect(self):
+    async def test_begin_delivery_refusal_defers_claim_without_delivery_failure(self):
+        clock = FakeClock(); repo = Repository(clock, [Execution("e1", output_text="saved")])
+        async def agent(_, __): self.fail("agent must not run")
+        async def delivery(_, __): self.fail("delivery must not run")
+        async def begin_delivery(_): return False
+        repo.begin_delivery = begin_delivery
+        scheduler = self.make(repo, clock, agent, delivery)
+        await scheduler._drain_due()
+        self.assertEqual(repo.deferred, [("e1", "target_unbound")])
+        self.assertEqual(repo.retries, [])
+        self.assertEqual(repo.failed, [])
+
+    async def test_unavailable_target_delivery_results_defer_without_counting_failure(self):
+        clock = FakeClock()
+        codes = ("target_unbound", "context_missing", "session_expired")
+        repo = Repository(clock, [Execution(code, output_text="saved") for code in codes])
+        async def agent(_, __): self.fail("agent must not run")
+        async def delivery(execution, _): return Result(False, retryable=False, code=execution.id)
+        scheduler = self.make(repo, clock, agent, delivery)
+        await scheduler._drain_due()
+        self.assertEqual(repo.deferred, [(code, code) for code in codes])
+        self.assertEqual(repo.retries, [])
+        self.assertEqual(repo.failed, [])
+
+    async def test_message_bypasses_agent_and_cancelled_claim_releases_without_external_effect(self):
         clock = FakeClock(); message = Execution("message", task_kind="message", delivery_text="直接提醒")
         cancelled = Execution("cancelled", task_kind="message", delivery_text="不得发送")
         repo = Repository(clock, [message, cancelled]); repo.cancelled = {"cancelled"}; delivered = []
@@ -169,6 +196,22 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(delivered, [("message", "直接提醒")])
         self.assertEqual(repo.outputs["message"], "直接提醒")
         self.assertNotIn("cancelled", repo.outputs)
+        self.assertEqual(repo.deferred, [("cancelled", "target_unbound")])
+
+    async def test_cancelled_claim_ignores_best_effort_defer_failure(self):
+        clock = FakeClock(); repo = Repository(clock, [Execution("cancelled")]); repo.cancelled = {"cancelled"}
+        deferred = []
+        async def agent(_, __): self.fail("agent must not run")
+        async def delivery(_, __): self.fail("delivery must not run")
+        async def defer_delivery(execution_id, reason):
+            deferred.append((execution_id, reason))
+            raise RuntimeError("already released")
+        repo.defer_delivery = defer_delivery
+        scheduler = self.make(repo, clock, agent, delivery)
+        await scheduler._drain_due()
+        self.assertEqual(deferred, [("cancelled", "target_unbound")])
+        self.assertEqual(repo.retries, [])
+        self.assertEqual(repo.failed, [])
 
     async def test_configured_attempt_limits_bound_agent_and_delivery_retries(self):
         clock = FakeClock(); repo = Repository(clock, [Execution("agent", agent_attempts=1), Execution("delivery", output_text="saved", delivery_attempts=1)])

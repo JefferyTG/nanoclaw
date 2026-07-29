@@ -47,6 +47,7 @@ class Clock(Protocol):
 class DeliveryResult(Protocol):
     success: bool
     retryable: bool
+    code: str | None
     error: str | None
     message: str | None
 
@@ -61,6 +62,7 @@ class ReminderRepository(Protocol):
     async def mark_failed(self, execution_id: str, error: str) -> None: ...
     async def is_cancelled(self, execution_id: str) -> bool: ...
     async def begin_delivery(self, execution_id: str) -> bool: ...
+    async def defer_delivery(self, execution_id: str, reason: str) -> None: ...
     async def schedule_agent_retry(self, execution_id: str, retry_at: datetime, error: str) -> None: ...
     async def advance_schedule(self, task_id: str, scheduled_for: datetime, now: datetime) -> None: ...
 
@@ -81,6 +83,10 @@ async def _default_wait(event: asyncio.Event, timeout: float) -> None:
 
 class ReminderScheduler:
     """Wake only for persisted work, with an Event for prompt external wakes."""
+
+    _DEFERRED_DELIVERY_CODES = frozenset(
+        {"target_unbound", "context_missing", "session_expired"}
+    )
 
     def __init__(
         self,
@@ -194,6 +200,16 @@ class ReminderScheduler:
         execution_id = str(getattr(execution, "id"))
         if output is None:
             if await self.repository.is_cancelled(execution_id):
+                # ``is_cancelled`` also covers a target becoming inactive
+                # before output generation.  Best-effort release prevents its
+                # claim from waiting for lease expiry; a truly cancelled task
+                # may already be terminal, so a no-op/rejection is harmless.
+                try:
+                    await self.repository.defer_delivery(execution_id, "target_unbound")
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
                 return
             if getattr(execution, "task_kind") == "message":
                 output = str(getattr(execution, "delivery_text"))
@@ -207,6 +223,10 @@ class ReminderScheduler:
                     return
 
         if not await self.repository.begin_delivery(execution_id):
+            # A target may have been unbound after this execution was claimed.
+            # Release the lease instead of counting this as a delivery failure,
+            # so a later rebind can deliver the already-persisted output.
+            await self.repository.defer_delivery(execution_id, "target_unbound")
             return
         await self._deliver(execution, output)
 
@@ -251,6 +271,13 @@ class ReminderScheduler:
             await self.repository.advance_schedule(
                 str(getattr(execution, "task_id")), getattr(execution, "scheduled_for"), now
             )
+            return
+        code = getattr(result, "code", None)
+        if code in self._DEFERRED_DELIVERY_CODES:
+            # These outcomes mean delivery is temporarily impossible because
+            # the persisted target/session is unavailable.  They deliberately
+            # do not consume a Scheduler delivery attempt or become terminal.
+            await self.repository.defer_delivery(execution_id, code)
             return
         await self._handle_delivery_failure(
             execution,

@@ -1,10 +1,12 @@
 """Composition-level tests for reminder configuration and prompt rules."""
 
+import asyncio
 import json
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 from agent.context import ContextBuilder
 from agent.tools.reminders import (
@@ -13,7 +15,9 @@ from agent.tools.reminders import (
     ListRemindersTool,
 )
 from config import NanoClawConfig, load_config
-from main import build_reminder_service
+from bus.queue import MessageBus
+from channels.weixin import encode_weixin_target
+from main import build_reminder_service, publish_reminder_delivery
 from reminders.models import DeliveryResult, TaskKind
 from reminders.repository import ReminderRepository
 from reminders.scheduler import ReminderScheduler
@@ -64,6 +68,7 @@ class ReminderIntegrationTests(unittest.TestCase):
         self.assertIn("cancel_reminder", prompt)
         self.assertIn("每隔一天/每隔两天", prompt)
         self.assertIn("/bind-reminders", prompt)
+        self.assertIn("飞书或微信私聊", prompt)
 
 
 class _FakeReminderService:
@@ -118,8 +123,8 @@ class ReminderRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.repository = ReminderRepository(
             Path(self.tempdir.name) / "reminders.sqlite3"
         )
-        self.target = self.repository.bind_feishu_target(
-            "chat", "owner", self.now
+        self.target = self.repository.bind_target(
+            "feishu", "chat", "owner", self.now
         )
 
     async def asyncTearDown(self):
@@ -160,7 +165,7 @@ class ReminderRuntimeTests(unittest.IsolatedAsyncioTestCase):
         return scheduler
 
     async def test_service_requires_binding_then_creates_lists_and_cancels(self):
-        self.repository.unbind_feishu_target("owner", self.now)
+        self.repository.unbind_target("feishu", "owner", self.now)
         cleaned = []
 
         async def cleanup(task_id):
@@ -200,6 +205,80 @@ class ReminderRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await service.cancel_reminder(task_id), f"已取消任务 #{task_id}。")
         self.assertEqual(cleaned, [task_id])
         self.assertIn("cancelled", await service.list_reminders(include_inactive=True))
+
+    async def test_first_binding_locks_channel_and_owner(self):
+        self.repository.unbind_target("feishu", "owner", self.now)
+        service = ReminderService(self.repository, now=lambda: self.now)
+
+        refused = await service.bind_weixin(
+            encode_weixin_target("account", "user"),
+            encode_weixin_target("account", "user"),
+        )
+        self.assertIn("首次绑定", refused)
+        rebound = await service.bind_feishu("new-chat", "owner")
+        self.assertIn("飞书私聊", rebound)
+
+    async def test_weixin_delivery_routes_by_persisted_target_and_stable_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = ReminderRepository(Path(directory) / "reminders.sqlite3")
+            recipient = encode_weixin_target("account", "user")
+            target = repository.bind_target(
+                "weixin", recipient, recipient, self.now
+            )
+            service = ReminderService(repository, now=lambda: self.now)
+            adapter = AsyncReminderRepository(repository, clock=lambda: self.now)
+            bus = MessageBus()
+            execution = SimpleNamespace(id=41, target_id=target.target_id)
+
+            delivery = asyncio.create_task(publish_reminder_delivery(
+                execution,
+                "该喝水了。",
+                repository=repository,
+                service=service,
+                async_repository=adapter,
+                bus=bus,
+            ))
+            outbound = await bus.consume_outbound()
+            self.assertEqual(outbound.channel, "weixin")
+            self.assertEqual(outbound.chat_id, recipient)
+            self.assertEqual(outbound.correlation_id, "reminder:41")
+            outbound.delivery_future.set_result(
+                DeliveryResult(True, code="ok", provider_message_id="wx-accepted")
+            )
+            result = await delivery
+            self.assertTrue(result.success)
+
+    async def test_context_missing_suspends_weixin_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = ReminderRepository(Path(directory) / "reminders.sqlite3")
+            recipient = encode_weixin_target("account", "user")
+            target = repository.bind_target(
+                "weixin", recipient, recipient, self.now
+            )
+            service = ReminderService(repository, now=lambda: self.now)
+            adapter = AsyncReminderRepository(repository, clock=lambda: self.now)
+            bus = MessageBus()
+            execution = SimpleNamespace(id=42, target_id=target.target_id)
+
+            delivery = asyncio.create_task(publish_reminder_delivery(
+                execution,
+                "提醒正文",
+                repository=repository,
+                service=service,
+                async_repository=adapter,
+                bus=bus,
+            ))
+            outbound = await bus.consume_outbound()
+            outbound.delivery_future.set_result(DeliveryResult(
+                False, code="context_missing", message="interaction required"
+            ))
+            result = await delivery
+            self.assertEqual(result.code, "context_missing")
+            self.assertIsNone(repository.get_active_target())
+            stored = repository.get_target_by_public_id(
+                target.target_id, active_only=False
+            )
+            self.assertFalse(stored.active)
 
     async def test_static_message_completes_without_agent_and_persists_receipt(self):
         task = self.create_task(TaskKind.MESSAGE, delivery_text="该喝水了。")

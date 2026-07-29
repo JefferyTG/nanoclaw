@@ -243,6 +243,99 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
         self.assertTrue(self.channel._started)
 
+    async def test_session_expired_suspends_reminders_without_leaking_callback_failure(self):
+        async def suspend():
+            raise RuntimeError("secret-token")
+
+        self.channel._suspend_callback = suspend
+        with patch.object(self.channel, "_schedule_reauth") as reauth:
+            with self.assertLogs("nanoclaw.weixin", level="WARNING") as captured:
+                await self.channel._handle_event("session_expired", {"code": -14})
+        self.assertTrue(reauth.called)
+        self.assertNotIn("secret-token", "\n".join(captured.output))
+
+    async def test_reminder_commands_wait_for_callback_then_reply_without_agent_handoff(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+
+        async def bind(recipient_id, owner_id):
+            calls.append((recipient_id, owner_id))
+            started.set()
+            await release.wait()
+            return "bound"
+
+        self.channel._bind_callback = bind
+        event = {
+            "account_id": "account", "user_id": "user", "delivery_id": "bind",
+            "text": " /bind-reminders ", "images": [],
+        }
+        handler = asyncio.create_task(self.channel._handle_inbound(event))
+        await asyncio.wait_for(started.wait(), 1)
+        self.assertFalse(self.process.stdin.lines)
+        self.assertTrue(self.bus.inbound_queue.empty())
+        release.set()
+        reply = await asyncio.wait_for(self.bus.consume_outbound(), 1)
+        target = encode_weixin_target("account", "user")
+        self.assertEqual(calls, [(target, target)])
+        self.assertEqual(reply.chat_id, target)
+        self.assertEqual(reply.content, "bound")
+        request = await self._respond(method="ack_inbound")
+        self.assertEqual(request["params"]["delivery_id"], "bind")
+        await handler
+
+    async def test_unbind_command_uses_sync_callback_and_text_with_image_is_not_intercepted(self):
+        calls = []
+        self.channel._unbind_callback = lambda recipient_id, owner_id: calls.append(
+            (recipient_id, owner_id)
+        ) or "unbound"
+        event = {
+            "account_id": "account", "user_id": "user", "delivery_id": "unbind",
+            "text": "/unbind-reminders", "images": [],
+        }
+        handler = asyncio.create_task(self.channel._handle_inbound(event))
+        reply = await asyncio.wait_for(self.bus.consume_outbound(), 1)
+        target = encode_weixin_target("account", "user")
+        self.assertEqual(calls, [(target, target)])
+        self.assertEqual(reply.content, "unbound")
+        await self._respond(method="ack_inbound")
+        await handler
+
+        # A text/image message is an ordinary image turn, never a bind command.
+        self.channel.image_merge_window_sec = 0
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            inbound_dir = state / "inbound"
+            inbound_dir.mkdir(parents=True)
+            image = inbound_dir / "in.png"
+            image.write_bytes(b"image")
+            self.channel.state_dir = state.resolve()
+            self.channel.image_store = _Store()
+            image_event = {
+                "account_id": "account", "user_id": "user", "delivery_id": "image",
+                "text": "/unbind-reminders",
+                "images": [{"file_path": str(image), "mime_type": "image/png"}],
+            }
+            inbound = await self._deliver_inbound(image_event, consume=True)
+        self.assertEqual(calls, [(target, target)])
+        self.assertEqual(inbound.content, "/unbind-reminders")
+        self.assertEqual(len(inbound.images), 1)
+
+    async def test_failed_reminder_callback_is_not_acked_or_leaked(self):
+        def bind(*_args):
+            raise RuntimeError("secret-token")
+
+        self.channel._bind_callback = bind
+        with self.assertLogs("nanoclaw.weixin", level="WARNING") as captured:
+            await self.channel._handle_inbound({
+                "account_id": "account", "user_id": "user", "delivery_id": "failed-bind",
+                "text": "/bind-reminders", "images": [],
+            })
+        self.assertFalse(self.process.stdin.lines)
+        self.assertTrue(self.bus.inbound_queue.empty())
+        self.assertTrue(self.bus.outbound_queue.empty())
+        self.assertNotIn("secret-token", "\n".join(captured.output))
+
     async def test_stop_cancels_pending_session_reauthentication(self):
         self.channel.restart_backoff_sec = 0
         await self.channel._handle_event("session_expired", {"code": -14})

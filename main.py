@@ -175,7 +175,61 @@ def build_reminder_service(config):
     return repository, ReminderService(repository)
 
 
-def build_weixin_channel(config, bus, image_store):
+async def publish_reminder_delivery(
+    execution,
+    output: str,
+    *,
+    repository,
+    service: ReminderService,
+    async_repository: AsyncReminderRepository,
+    bus: MessageBus,
+) -> DeliveryResult:
+    """Resolve one persisted target and await its channel acknowledgement."""
+
+    target = await asyncio.to_thread(
+        repository.get_target_by_public_id,
+        execution.target_id,
+        active_only=True,
+    )
+    if target is None:
+        result = DeliveryResult(
+            success=False,
+            retryable=False,
+            code="target_unbound",
+            message="提醒目标已暂停；同一渠道和用户重新绑定后可继续发送。",
+        )
+        async_repository.remember_delivery_result(execution.id, result)
+        return result
+
+    delivery_future = asyncio.get_running_loop().create_future()
+    await bus.publish_outbound(
+        OutboundMessage(
+            channel=target.channel,
+            chat_id=target.recipient_id,
+            content=output,
+            delivery_future=delivery_future,
+            correlation_id=f"reminder:{execution.id}",
+        )
+    )
+    result = await delivery_future
+    if (
+        target.channel == "weixin"
+        and result.code in {"context_missing", "session_expired"}
+    ):
+        await service.suspend_target_id(target.target_id)
+    async_repository.remember_delivery_result(execution.id, result)
+    return result
+
+
+def build_weixin_channel(
+    config,
+    bus,
+    image_store,
+    *,
+    bind_callback=None,
+    unbind_callback=None,
+    suspend_callback=None,
+):
     """Build the optional Weixin process adapter from startup-only settings."""
 
     settings = config.weixin if isinstance(config.weixin, dict) else {}
@@ -211,6 +265,9 @@ def build_weixin_channel(config, bus, image_store):
         state_dir=state_dir,
         allowed_user_ids=allowed,
         image_store=image_store,
+        bind_callback=bind_callback,
+        unbind_callback=unbind_callback,
+        suspend_callback=suspend_callback,
         image_merge_window_sec=float(
             settings.get("image_merge_window_sec", 10)
         ),
@@ -562,28 +619,14 @@ async def amain() -> None:
                 )
 
         async def deliver_reminder(execution, output: str) -> DeliveryResult:
-            target = await asyncio.to_thread(reminder_repository.get_active_target)
-            if target is None or target.target_id != execution.target_id:
-                result = DeliveryResult(
-                    success=False,
-                    retryable=True,
-                    code="target_unbound",
-                    message="飞书提醒目标已解绑；同一用户重新绑定后可继续发送。",
-                )
-                async_repository.remember_delivery_result(execution.id, result)
-                return result
-            delivery_future = asyncio.get_running_loop().create_future()
-            await bus.publish_outbound(
-                OutboundMessage(
-                    channel="feishu",
-                    chat_id=target.chat_id,
-                    content=output,
-                    delivery_future=delivery_future,
-                )
+            return await publish_reminder_delivery(
+                execution,
+                output,
+                repository=reminder_repository,
+                service=reminder_service,
+                async_repository=async_repository,
+                bus=bus,
             )
-            result = await delivery_future
-            async_repository.remember_delivery_result(execution.id, result)
-            return result
 
         reminder_scheduler = ReminderScheduler(
             async_repository,
@@ -682,7 +725,20 @@ async def amain() -> None:
     # 微信渠道：启用后由 Python 维护一个薄 Node Bridge 子进程。Bridge 独占
     # 登录凭据、cursor 和 context token；普通消息只携带稳定账号/用户 target。
     try:
-        weixin_channel = build_weixin_channel(cfg, bus, shared["image_store"])
+        weixin_channel = build_weixin_channel(
+            cfg,
+            bus,
+            shared["image_store"],
+            bind_callback=(
+                reminder_service.bind_weixin if reminder_service is not None else None
+            ),
+            unbind_callback=(
+                reminder_service.unbind_weixin if reminder_service is not None else None
+            ),
+            suspend_callback=(
+                reminder_service.suspend_weixin if reminder_service is not None else None
+            ),
+        )
     except (TypeError, ValueError) as exc:
         print(f"[!] 微信渠道未启用：配置值无效（{exc}）")
         weixin_channel = None

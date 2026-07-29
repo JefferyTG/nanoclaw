@@ -52,8 +52,8 @@ class ReminderTarget:
     id: int
     target_id: str
     channel: str
-    chat_id: str
-    open_id: str
+    recipient_id: str
+    owner_id: str
     active: bool
     created_at_utc: datetime
     updated_at_utc: datetime
@@ -101,8 +101,9 @@ class ReminderWorkItem:
     execution: ReminderExecution
     task_kind: TaskKind
     target_id: str
-    chat_id: str
-    open_id: str
+    channel: str
+    recipient_id: str
+    owner_id: str
     subject: str
     delivery_text: str | None
     agent_prompt: str | None

@@ -26,10 +26,11 @@ class RepositoryTests(unittest.TestCase):
     def test_wal_and_restarts_preserve_rows(self):
         with sqlite3.connect(self.path) as conn:
             self.assertEqual(conn.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
         self.assertEqual(ReminderRepository(self.path).get_task(self.task.id), self.task)
 
     def test_target_binding_rejects_other_open_id(self):
-        self.assertEqual(self.repo.get_active_target().open_id, "owner")
+        self.assertEqual(self.repo.get_active_target().owner_id, "owner")
         with self.assertRaises(PermissionError):
             self.repo.bind_feishu_target("new", "other", NOW)
         self.assertFalse(self.repo.cancel_task(self.task.id, target_id="other", now_utc=NOW))
@@ -44,6 +45,106 @@ class RepositoryTests(unittest.TestCase):
             self.repo.create_task(target_id=replacement.target_id, kind=TaskKind.MESSAGE, subject="bad", agent_prompt="not allowed", dtstart_local=NOW, timezone="UTC", rrule="RRULE:FREQ=DAILY", next_run_at_utc=NOW, now_utc=NOW)
         with self.assertRaises(ValueError):
             self.repo.create_task(target_id=replacement.target_id, kind=TaskKind.MESSAGE, subject="bad rule", delivery_text="x", dtstart_local=NOW, timezone="UTC", rrule="FREQ=DAILY", next_run_at_utc=NOW, now_utc=NOW)
+
+    def test_generic_target_binding_is_global_and_exact_lookup_respects_active(self):
+        self.assertEqual(self.target.recipient_id, "chat")
+        self.assertEqual(self.target.owner_id, "owner")
+        self.assertEqual(self.repo.get_target_by_public_id(self.target.target_id), self.target)
+        self.assertTrue(self.repo.unbind_target("feishu", "owner", NOW))
+        self.assertIsNone(self.repo.get_target_by_public_id(self.target.target_id))
+        self.assertFalse(self.repo.get_target_by_public_id(self.target.target_id, active_only=False).active)
+        rebound = self.repo.bind_target("feishu", "chat-2", "owner", NOW)
+        self.assertEqual(rebound.target_id, self.target.target_id)
+        self.assertEqual(rebound.recipient_id, "chat-2")
+        with self.assertRaises(PermissionError):
+            self.repo.bind_target("weixin", "wx-user", "wx-user", NOW)
+        with self.assertRaises(ValueError):
+            self.repo.bind_target("unknown", "recipient", "owner", NOW)
+
+    def test_suspend_and_unbind_release_claim_without_send_failure(self):
+        claim = self.repo.claim_due(now_utc=NOW, lease_owner="worker", lease_for=timedelta(minutes=1))[0]
+        self.assertTrue(self.repo.suspend_target(self.target.target_id, NOW))
+        self.assertTrue(
+            self.repo.defer_delivery(
+                claim.execution.id, lease_owner="worker", now_utc=NOW, reason="context_missing"
+            )
+        )
+        execution = self.repo.get_execution(claim.execution.id)
+        self.assertEqual(execution.status, ExecutionStatus.PENDING)
+        self.assertEqual(execution.send_attempts, 0)
+        self.assertEqual(self.repo.get_task(self.task.id).status.value, "active")
+        self.assertEqual(self.repo.claim_due(now_utc=NOW, lease_owner="other", lease_for=timedelta(minutes=1)), [])
+        self.repo.bind_target("feishu", "chat", "owner", NOW)
+        self.assertEqual(
+            self.repo.claim_due(now_utc=NOW, lease_owner="other", lease_for=timedelta(minutes=1))[0].execution.id,
+            claim.execution.id,
+        )
+
+    def test_legacy_feishu_database_migrates_without_losing_ids(self):
+        legacy_path = Path(self.tempdir.name) / "legacy.sqlite3"
+        with sqlite3.connect(legacy_path) as conn:
+            conn.executescript("""
+                CREATE TABLE targets (
+                    id INTEGER PRIMARY KEY, target_id TEXT NOT NULL UNIQUE,
+                    channel TEXT NOT NULL, chat_id TEXT NOT NULL, open_id TEXT NOT NULL,
+                    active INTEGER NOT NULL, created_at_utc TEXT NOT NULL, updated_at_utc TEXT NOT NULL
+                );
+                CREATE TABLE tasks (
+                    id INTEGER PRIMARY KEY, target_id INTEGER NOT NULL REFERENCES targets(id),
+                    kind TEXT NOT NULL, status TEXT NOT NULL, subject TEXT NOT NULL,
+                    delivery_text TEXT, agent_prompt TEXT, dtstart_local TEXT NOT NULL,
+                    timezone TEXT NOT NULL, rrule TEXT NOT NULL, next_run_at_utc TEXT,
+                    created_at_utc TEXT NOT NULL, updated_at_utc TEXT NOT NULL
+                );
+                CREATE TABLE executions (
+                    id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES tasks(id),
+                    scheduled_for_utc TEXT NOT NULL, status TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0, agent_attempts INTEGER NOT NULL DEFAULT 0,
+                    send_attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at_utc TEXT,
+                    lease_owner TEXT, lease_expires_at_utc TEXT, agent_output TEXT,
+                    delivery_success INTEGER, delivery_retryable INTEGER, delivery_code TEXT,
+                    delivery_message TEXT, provider_message_id TEXT,
+                    created_at_utc TEXT NOT NULL, updated_at_utc TEXT NOT NULL
+                );
+                INSERT INTO targets VALUES (7, 'target-uuid', 'feishu', 'chat-old', 'open-old', 1, '2026-01-01T12:00:00.000000+00:00', '2026-01-01T12:00:00.000000+00:00');
+                INSERT INTO tasks VALUES (11, 7, 'message', 'active', 'legacy', 'body', NULL, '2026-01-01T12:00:00', 'UTC', 'RRULE:FREQ=DAILY;COUNT=1', '2026-01-01T12:00:00.000000+00:00', '2026-01-01T12:00:00.000000+00:00', '2026-01-01T12:00:00.000000+00:00');
+                INSERT INTO executions VALUES (13, 11, '2026-01-01T12:00:00.000000+00:00', 'pending', 0, 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, '2026-01-01T12:00:00.000000+00:00', '2026-01-01T12:00:00.000000+00:00');
+            """)
+        migrated = ReminderRepository(legacy_path)
+        target = migrated.get_target_by_public_id("target-uuid")
+        self.assertEqual((target.id, target.recipient_id, target.owner_id), (7, "chat-old", "open-old"))
+        self.assertEqual(migrated.get_task(11).id, 11)
+        self.assertEqual(migrated.get_execution(13).id, 13)
+        with sqlite3.connect(legacy_path) as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM targets WHERE active=1").fetchone()[0], 1)
+        migrated.unbind_target("feishu", "open-old", NOW)
+        rebound = migrated.bind_target("feishu", "chat-new", "open-old", NOW)
+        self.assertEqual(rebound.target_id, "target-uuid")
+        with sqlite3.connect(legacy_path) as conn:
+            row = conn.execute(
+                "SELECT recipient_id,owner_id,chat_id,open_id FROM targets WHERE id=7"
+            ).fetchone()
+        self.assertEqual(row, ("chat-new", "open-old", "chat-new", "open-old"))
+
+    def test_empty_legacy_database_accepts_its_first_binding_after_migration(self):
+        legacy_path = Path(self.tempdir.name) / "empty-legacy.sqlite3"
+        with sqlite3.connect(legacy_path) as conn:
+            conn.execute("""
+                CREATE TABLE targets (
+                    id INTEGER PRIMARY KEY, target_id TEXT NOT NULL UNIQUE,
+                    channel TEXT NOT NULL, chat_id TEXT NOT NULL, open_id TEXT NOT NULL,
+                    active INTEGER NOT NULL, created_at_utc TEXT NOT NULL, updated_at_utc TEXT NOT NULL
+                )
+            """)
+        migrated = ReminderRepository(legacy_path)
+        target = migrated.bind_target("weixin", "wx-target", "wx-target", NOW)
+        self.assertEqual((target.channel, target.recipient_id), ("weixin", "wx-target"))
+        with sqlite3.connect(legacy_path) as conn:
+            row = conn.execute(
+                "SELECT recipient_id,owner_id,chat_id,open_id FROM targets"
+            ).fetchone()
+        self.assertEqual(row, ("wx-target",) * 4)
 
     def test_concurrent_claim_has_one_winner_and_lease_recovers(self):
         def claim(owner):
