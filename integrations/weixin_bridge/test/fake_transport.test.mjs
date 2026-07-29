@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 
+import {decryptEcb} from '../lib/cdn.mjs';
 import {StateStore} from '../lib/state.mjs';
 import {
   accountState,
@@ -152,11 +153,14 @@ test('stop cancels an in-flight provider request and returns promptly', async t 
 
 test('image upload uses CDN /c2c path, caption ordering, and controlled files', async t => {
   const sent = [];
+  let encryptedUpload;
+  let uploadRequest;
   const cdn = await fakeServer(async (request, response) => {
     assert.match(request.url, /^\/c2c\/upload\?/);
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
-    assert.ok(Buffer.concat(chunks).length > 0);
+    encryptedUpload = Buffer.concat(chunks);
+    assert.ok(encryptedUpload.length > 0);
     response.writeHead(200, {'x-encrypted-param': 'download-parameter'});
     response.end();
   });
@@ -164,6 +168,7 @@ test('image upload uses CDN /c2c path, caption ordering, and controlled files', 
   const api = await fakeServer(async (request, response) => {
     const body = await jsonBody(request);
     if (request.url === '/ilink/bot/getuploadurl') {
+      uploadRequest = body;
       jsonResponse(response, {ret: 0, upload_param: 'upload-parameter'});
       return;
     }
@@ -179,7 +184,8 @@ test('image upload uses CDN /c2c path, caption ordering, and controlled files', 
   const mediaRoot = path.join(directory, 'outbound');
   fs.mkdirSync(mediaRoot, {mode: 0o700});
   const filePath = path.join(mediaRoot, 'image.png');
-  fs.writeFileSync(filePath, Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1]));
+  const plaintext = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1]);
+  fs.writeFileSync(filePath, plaintext);
   const state = accountState(api.baseUrl, {cdn_base_url: `${cdn.baseUrl}/c2c`});
   state.context_tokens['account-1'] = {user: {token: 'context', updated_at_ms: 1}};
   writePrivateState(directory, state);
@@ -194,7 +200,13 @@ test('image upload uses CDN /c2c path, caption ordering, and controlled files', 
   assert.equal(response.ok, true);
   assert.equal(sent.length, 2);
   assert.equal(sent[0].item_list[0].text_item.text, 'caption');
-  assert.ok(sent[1].item_list[0].image_item.media.encrypt_query_param);
+  const imageItem = sent[1].item_list[0].image_item;
+  assert.equal(imageItem.media.encrypt_query_param, 'download-parameter');
+  const decodedKey = Buffer.from(imageItem.media.aes_key, 'base64').toString('ascii');
+  assert.match(decodedKey, /^[0-9a-f]{32}$/);
+  assert.equal(uploadRequest.aeskey, decodedKey);
+  assert.equal(imageItem.mid_size, encryptedUpload.length);
+  assert.deepEqual(decryptEcb(encryptedUpload, Buffer.from(decodedKey, 'hex')), plaintext);
   assert.deepEqual(sent.map(message => message.client_id), [
     stableClientId('image-correlation', 0),
     stableClientId('image-correlation', 1),

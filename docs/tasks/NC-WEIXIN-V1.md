@@ -285,3 +285,16 @@ git status --short --branch
   安全/可靠性复审未发现 blocker。
 - 未验证项：本跟进未调用真实微信、真实视觉模型或任何付费/外部副作用链路；
   合并后需由用户继续手工收图验收。
+
+## 2026-07-29 微信端出站图片解密修复
+
+- 问题：图片已上传且微信生成了消息气泡，但点开提示“图片已过期或已被清理”。
+- 根因：Bridge 把原始 16 字节 AES 密钥直接做 Base64 写入 `media.aes_key`；
+  腾讯当前实现要求先将密钥转成 32 位十六进制字符串，再对该 ASCII 字符串做 Base64。
+- 修复：`getuploadurl.aeskey` 与 `sendmessage.media.aes_key` 由同一个十六进制密钥派生，
+  保持 CDN 密文、上传元数据和图片消息三者一致。
+- 回归覆盖：fake CDN 捕获真实上传密文，从图片消息还原协议密钥并完成 AES 解密，
+  同时校验 `mid_size` 和上传请求密钥，避免 fake 接口只验证字段存在而与错误实现共同自洽。
+- 验证：`npm test` 35 passed，`npm run build` 通过，Python 全量 164 tests OK；
+  `import main` 和 `git diff --check` 通过。
+- 未验证项：未调用真实微信或 CDN；自动化通过后仍需用户在手机端重新发送一张新图片验收。

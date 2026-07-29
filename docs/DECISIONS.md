@@ -49,6 +49,7 @@
 | 微信入站采用 ack 后批次提交 cursor | 有效 | context 先落盘，Python 投递成功后 ack，整批完成才提交去重与 cursor；崩溃允许重复、不允许静默丢失 |
 | 微信 allowlist 默认 deny-all | 有效 | 单账号私聊仍是外部不可信入口；空列表不放行，`*` 必须由用户显式选择 |
 | 微信图片等待窗口与会话键对齐 Gateway | 有效 | 默认等待 10 秒合并同一用户的后续图文，接收图片先原子落盘再 ack，MessageBus 消费确认后才删除；ImageStore 使用完整 `weixin:<target>`，保证 `ask_image` 可按 image_id 解析 |
+| 微信出站图片 AES 密钥采用腾讯线格式 | 有效 | `getuploadurl.aeskey` 使用 32 位十六进制；消息 `media.aes_key` 是该 ASCII 十六进制字符串的 Base64，不是原始 16 字节密钥的 Base64，否则微信端无法解密并显示“图片已过期或已被清理” |
 | 微信发送回执同时检查 HTTP 和 JSON | 有效 | 要求 HTTP 成功和有效 JSON；腾讯成功响应可省略 `ret/errcode`，任一存在且非零或非数值都失败，correlation/client ID 在重试间稳定 |
 | 微信 `-14` 切换凭据代次 | 有效 | 清除 account/cursor/context/去重后重新扫码；旧 context 不跨认证代次复用，避免稳定的主动发送失败 |
 

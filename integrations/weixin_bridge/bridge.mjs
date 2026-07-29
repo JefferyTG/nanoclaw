@@ -273,6 +273,7 @@ async function outboundItems(kind, params, signal) {
   requireParams(params, ['file_path']);
   const plaintext = controlledImage(params.file_path);
   const key = crypto.randomBytes(16);
+  const keyHex = key.toString('hex');
   const filekey = crypto.randomBytes(16).toString('hex');
   const ciphertextSize = aesEcbPaddedSize(plaintext.length);
   const upload = await transport('/ilink/bot/getuploadurl', {
@@ -283,7 +284,7 @@ async function outboundItems(kind, params, signal) {
     rawfilemd5: crypto.createHash('md5').update(plaintext).digest('hex'),
     filesize: ciphertextSize,
     no_need_thumb: true,
-    aeskey: key.toString('hex'),
+    aeskey: keyHex,
   }, signal);
   requireFields(upload, ['upload_param']);
 
@@ -312,7 +313,9 @@ async function outboundItems(kind, params, signal) {
     image_item: {
       media: {
         encrypt_query_param: downloadParameter,
-        aes_key: key.toString('base64'),
+        // iLink's image wire format base64-encodes the 32-byte ASCII hex key,
+        // rather than the 16 raw AES bytes. Match Tencent's reference client.
+        aes_key: Buffer.from(keyHex, 'ascii').toString('base64'),
         encrypt_type: 1,
       },
       mid_size: ciphertextSize,
