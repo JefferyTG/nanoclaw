@@ -353,7 +353,7 @@ class ReminderService:
         except PermissionError:
             return (
                 "⚠️ 当前实例的提醒目标已由其他渠道或用户持有；"
-                "V1 只支持首次绑定的渠道与用户重新绑定。"
+                "请由当前所有者先发送 /unbind-reminders 释放后再绑定。"
             )
         except (OSError, ValueError):
             return "⚠️ 绑定提醒失败，请检查本实例的提醒数据库配置。"
@@ -383,7 +383,10 @@ class ReminderService:
         if not changed:
             return "当前没有由你绑定的提醒目标。"
         self._wake()
-        return "✅ 已解绑主动提醒；已有任务会保留，并在同一用户重新绑定后恢复调度。"
+        return (
+            "✅ 已解绑主动提醒；已有任务会保留。"
+            "之后可在任意支持的飞书或微信私聊中发送 /bind-reminders 继续接收。"
+        )
 
     async def bind_feishu(self, chat_id: str, open_id: str) -> str:
         return await self.bind_target("feishu", chat_id, open_id)
@@ -397,12 +400,17 @@ class ReminderService:
     async def unbind_weixin(self, recipient_id: str, owner_id: str) -> str:
         return await self.unbind_target("weixin", recipient_id, owner_id)
 
-    async def suspend_target_id(self, target_id: str) -> bool:
+    async def suspend_target_id(
+        self, target_id: str, *, expected_binding_revision: int
+    ) -> bool:
         """Pause a provider target while retaining its tasks and ownership."""
 
         try:
             changed = await self._repo(
-                "suspend_target", target_id=target_id, now_utc=self._now_utc()
+                "suspend_target",
+                target_id=target_id,
+                now_utc=self._now_utc(),
+                expected_binding_revision=expected_binding_revision,
             )
         except (OSError, ValueError):
             return False
@@ -418,7 +426,10 @@ class ReminderService:
         except OSError:
             return
         if target is not None and target.channel == "weixin":
-            await self.suspend_target_id(target.target_id)
+            await self.suspend_target_id(
+                target.target_id,
+                expected_binding_revision=target.binding_revision,
+            )
 
     async def create_reminder(self, **kwargs) -> str:
         try:

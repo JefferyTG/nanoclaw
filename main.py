@@ -216,7 +216,10 @@ async def publish_reminder_delivery(
         target.channel == "weixin"
         and result.code in {"context_missing", "session_expired"}
     ):
-        await service.suspend_target_id(target.target_id)
+        await service.suspend_target_id(
+            target.target_id,
+            expected_binding_revision=target.binding_revision,
+        )
     async_repository.remember_delivery_result(execution.id, result)
     return result
 

@@ -52,13 +52,15 @@ class ReminderRepository:
         with self._connection() as conn:
             conn.execute("PRAGMA journal_mode = WAL")
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-            if version > 1:
+            if version > 2:
                 raise RuntimeError(f"unsupported reminders database version: {version}")
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS targets (
                     id INTEGER PRIMARY KEY, target_id TEXT NOT NULL UNIQUE,
                     channel TEXT NOT NULL, recipient_id TEXT NOT NULL, owner_id TEXT NOT NULL,
                     active INTEGER NOT NULL CHECK(active IN (0, 1)),
+                    rebind_released INTEGER NOT NULL DEFAULT 0 CHECK(rebind_released IN (0, 1)),
+                    binding_revision INTEGER NOT NULL DEFAULT 0 CHECK(binding_revision >= 0),
                     created_at_utc TEXT NOT NULL, updated_at_utc TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS tasks (
@@ -99,6 +101,20 @@ class ReminderRepository:
                 columns.update({"recipient_id", "owner_id"})
             if not {"recipient_id", "owner_id"}.issubset(columns):
                 raise RuntimeError("targets table has no supported identity columns")
+            if "rebind_released" not in columns:
+                # v0/v1 inactive targets cannot be assumed to have been
+                # explicitly released.  Keep their historical lock intact.
+                conn.execute(
+                    "ALTER TABLE targets ADD COLUMN rebind_released "
+                    "INTEGER NOT NULL DEFAULT 0 CHECK(rebind_released IN (0, 1))"
+                )
+                columns.add("rebind_released")
+            if "binding_revision" not in columns:
+                conn.execute(
+                    "ALTER TABLE targets ADD COLUMN binding_revision "
+                    "INTEGER NOT NULL DEFAULT 0 CHECK(binding_revision >= 0)"
+                )
+                columns.add("binding_revision")
             # A migrated v0 table retains its NOT NULL chat_id/open_id columns
             # so foreign keys and integer IDs never need a destructive rebuild.
             # Remember that physical compatibility shape for future writes.
@@ -112,7 +128,7 @@ class ReminderRepository:
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS one_active_target ON targets(active) WHERE active=1"
             )
-            conn.execute("PRAGMA user_version = 1")
+            conn.execute("PRAGMA user_version = 2")
 
     def get_active_target(self) -> ReminderTarget | None:
         with self._connection() as conn:
@@ -139,28 +155,58 @@ class ReminderRepository:
             raise ValueError("channel, recipient_id, and owner_id are required")
         now = _time(now_utc)
         with self._connection() as conn:
-            owner = conn.execute("SELECT * FROM targets ORDER BY id LIMIT 1").fetchone()
-            if owner and (owner["channel"] != channel or owner["owner_id"] != owner_id):
-                raise PermissionError("default target belongs to another channel or owner")
-            existing = conn.execute("SELECT * FROM targets WHERE channel=? AND owner_id=? ORDER BY id LIMIT 1", (channel, owner_id)).fetchone()
-            if existing:
+            # Serialize the ownership check with the following update.  A
+            # deferred transaction would let two claimants both observe the
+            # released row before either one writes it.
+            conn.execute("BEGIN IMMEDIATE")
+            target = conn.execute("SELECT * FROM targets ORDER BY id LIMIT 1").fetchone()
+            if target:
+                same_owner = (
+                    target["channel"] == channel and target["owner_id"] == owner_id
+                )
+                if not same_owner and (
+                    target["active"] or not target["rebind_released"]
+                ):
+                    raise PermissionError("default target belongs to another channel or owner")
                 if self._legacy_identity_columns:
                     conn.execute(
-                        "UPDATE targets SET recipient_id=?,owner_id=?,chat_id=?,open_id=?,active=1,updated_at_utc=? WHERE id=?",
-                        (recipient_id, owner_id, recipient_id, owner_id, now, existing["id"]),
+                        "UPDATE targets SET channel=?,recipient_id=?,owner_id=?,chat_id=?,open_id=?,"
+                        "active=1,rebind_released=0,binding_revision=binding_revision+1,"
+                        "updated_at_utc=? WHERE id=?",
+                        (
+                            channel,
+                            recipient_id,
+                            owner_id,
+                            recipient_id,
+                            owner_id,
+                            now,
+                            target["id"],
+                        ),
                     )
                 else:
-                    conn.execute("UPDATE targets SET recipient_id=?, active=1, updated_at_utc=? WHERE id=?", (recipient_id, now, existing["id"]))
-                row = conn.execute("SELECT * FROM targets WHERE id = ?", (existing["id"],)).fetchone()
+                    conn.execute(
+                        "UPDATE targets SET channel=?,recipient_id=?,owner_id=?,active=1,"
+                        "rebind_released=0,binding_revision=binding_revision+1,"
+                        "updated_at_utc=? WHERE id=?",
+                        (channel, recipient_id, owner_id, now, target["id"]),
+                    )
+                row = conn.execute("SELECT * FROM targets WHERE id = ?", (target["id"],)).fetchone()
             else:
                 target_id = str(uuid.uuid4())
                 if self._legacy_identity_columns:
                     cur = conn.execute(
-                        "INSERT INTO targets(target_id,channel,recipient_id,owner_id,chat_id,open_id,active,created_at_utc,updated_at_utc) VALUES (?,?,?,?,?,?,1,?,?)",
+                        "INSERT INTO targets(target_id,channel,recipient_id,owner_id,chat_id,open_id,"
+                        "active,rebind_released,binding_revision,created_at_utc,updated_at_utc) "
+                        "VALUES (?,?,?,?,?,?,1,0,1,?,?)",
                         (target_id, channel, recipient_id, owner_id, recipient_id, owner_id, now, now),
                     )
                 else:
-                    cur = conn.execute("INSERT INTO targets(target_id,channel,recipient_id,owner_id,active,created_at_utc,updated_at_utc) VALUES (?, ?, ?, ?, 1, ?, ?)", (target_id, channel, recipient_id, owner_id, now, now))
+                    cur = conn.execute(
+                        "INSERT INTO targets(target_id,channel,recipient_id,owner_id,active,"
+                        "rebind_released,binding_revision,created_at_utc,updated_at_utc) "
+                        "VALUES (?, ?, ?, ?, 1, 0, 1, ?, ?)",
+                        (target_id, channel, recipient_id, owner_id, now, now),
+                    )
                 row = conn.execute("SELECT * FROM targets WHERE id = ?", (cur.lastrowid,)).fetchone()
         return self._target(row)
 
@@ -169,7 +215,11 @@ class ReminderRepository:
             owner = conn.execute("SELECT channel,owner_id FROM targets ORDER BY id LIMIT 1").fetchone()
             if owner and (owner["channel"] != channel or owner["owner_id"] != owner_id):
                 raise PermissionError("default target belongs to another channel or owner")
-            result = conn.execute("UPDATE targets SET active=0, updated_at_utc=? WHERE channel=? AND owner_id=? AND active=1", (_time(now_utc), channel, owner_id))
+            result = conn.execute(
+                "UPDATE targets SET active=0, rebind_released=1, updated_at_utc=? "
+                "WHERE channel=? AND owner_id=? AND rebind_released=0",
+                (_time(now_utc), channel, owner_id),
+            )
         return result.rowcount == 1
 
     # Compatibility wrappers keep the existing Feishu channel/API stable while
@@ -180,9 +230,19 @@ class ReminderRepository:
     def unbind_feishu_target(self, open_id: str, now_utc: datetime) -> bool:
         return self.unbind_target("feishu", open_id, now_utc)
 
-    def suspend_target(self, target_id: str, now_utc: datetime) -> bool:
+    def suspend_target(
+        self,
+        target_id: str,
+        now_utc: datetime,
+        *,
+        expected_binding_revision: int,
+    ) -> bool:
         with self._connection() as conn:
-            result = conn.execute("UPDATE targets SET active=0, updated_at_utc=? WHERE target_id=? AND active=1", (_time(now_utc), target_id))
+            result = conn.execute(
+                "UPDATE targets SET active=0, rebind_released=0, updated_at_utc=? "
+                "WHERE target_id=? AND binding_revision=? AND active=1",
+                (_time(now_utc), target_id, expected_binding_revision),
+            )
         return result.rowcount == 1
 
     def create_task(self, *, target_id: str, kind: TaskKind, subject: str, dtstart_local: datetime, timezone: str, rrule: str, next_run_at_utc: datetime | None, now_utc: datetime, delivery_text: str | None = None, agent_prompt: str | None = None) -> ReminderTask:
@@ -397,7 +457,7 @@ class ReminderRepository:
 
     @staticmethod
     def _target(row: sqlite3.Row) -> ReminderTarget:
-        return ReminderTarget(row['id'], row['target_id'], row['channel'], row['recipient_id'], row['owner_id'], bool(row['active']), _date(row['created_at_utc']), _date(row['updated_at_utc']))
+        return ReminderTarget(row['id'], row['target_id'], row['channel'], row['recipient_id'], row['owner_id'], bool(row['active']), bool(row['rebind_released']), row['binding_revision'], _date(row['created_at_utc']), _date(row['updated_at_utc']))
     @staticmethod
     def _task(row: sqlite3.Row) -> ReminderTask:
         return ReminderTask(row['id'], row['target_id'], TaskKind(row['kind']), TaskStatus(row['status']), row['subject'], row['delivery_text'], row['agent_prompt'], datetime.fromisoformat(row['dtstart_local']), row['timezone'], row['rrule'], _date(row['next_run_at_utc']), _date(row['created_at_utc']), _date(row['updated_at_utc']))

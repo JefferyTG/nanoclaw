@@ -38,7 +38,7 @@
 | 子 Agent Web 事件必须命名空间化 | 有效 | 子层级的 token/done 不能污染父回复或触发 TTS；父会话只持久化有界回放摘要和图片 ID |
 | 缺失人设采用 Gateway 级首次引导 | 有效 | 三种渠道共用同一入口；引导不调用模型、不进入会话历史，用户描述原子写入后每轮自动重读 |
 | Linux 控制脚本使用独立进程组 | 有效 | start/stop/restart/status 无需固定安装路径；SIGTERM 先触发应用清理，超时才强制结束整个进程组 |
-| 提醒目标必须显式绑定且单实例二选一 | 有效 | 工具不接受 channel/chat/user ID；首次私聊绑定的 `(channel, owner_id)` 永久锁定实例，飞书/微信 V1 二选一，解绑只暂停不释放所有权 |
+| 提醒目标必须显式绑定且单实例二选一 | 有效 | 工具不接受 channel/chat/user ID；飞书/微信同一时刻只允许一个目标。原 owner 主动解绑后可换渠道或用户，历史任务原位迁移；绑定事务串行化，旧回执按 binding revision 隔离；登录/context 异常只暂停且不释放所有权 |
 | 提醒周期统一使用 DTSTART + timezone + RRULE | 有效 | 避免 once/daily 特例；next occurrence 从原计划计算并覆盖 DST、COUNT、UNTIL |
 | 提醒调度以独立 SQLite 为事实源 | 有效 | 单 Scheduler 动态等待，WAL + 原子 claim/lease 支持重启恢复；不混入可重建的 memory/index.db |
 | 动态任务先固化 Agent 输出再发送 | 有效 | scheduled 独立会话不污染日常聊天；发送重试复用相同文本，第一版明确为 at-least-once |

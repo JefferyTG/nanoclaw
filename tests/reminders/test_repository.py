@@ -2,6 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 import sqlite3
 import tempfile
+from threading import Barrier
 import unittest
 from pathlib import Path
 
@@ -26,7 +27,7 @@ class RepositoryTests(unittest.TestCase):
     def test_wal_and_restarts_preserve_rows(self):
         with sqlite3.connect(self.path) as conn:
             self.assertEqual(conn.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
         self.assertEqual(ReminderRepository(self.path).get_task(self.task.id), self.task)
 
     def test_target_binding_rejects_other_open_id(self):
@@ -46,24 +47,35 @@ class RepositoryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.repo.create_task(target_id=replacement.target_id, kind=TaskKind.MESSAGE, subject="bad rule", delivery_text="x", dtstart_local=NOW, timezone="UTC", rrule="FREQ=DAILY", next_run_at_utc=NOW, now_utc=NOW)
 
-    def test_generic_target_binding_is_global_and_exact_lookup_respects_active(self):
+    def test_explicit_unbind_releases_the_same_target_for_cross_channel_rebind(self):
         self.assertEqual(self.target.recipient_id, "chat")
         self.assertEqual(self.target.owner_id, "owner")
         self.assertEqual(self.repo.get_target_by_public_id(self.target.target_id), self.target)
         self.assertTrue(self.repo.unbind_target("feishu", "owner", NOW))
         self.assertIsNone(self.repo.get_target_by_public_id(self.target.target_id))
-        self.assertFalse(self.repo.get_target_by_public_id(self.target.target_id, active_only=False).active)
-        rebound = self.repo.bind_target("feishu", "chat-2", "owner", NOW)
+        released = self.repo.get_target_by_public_id(self.target.target_id, active_only=False)
+        self.assertFalse(released.active)
+        self.assertTrue(released.rebind_released)
+        rebound = self.repo.bind_target("weixin", "wx-user", "wx-user", NOW)
         self.assertEqual(rebound.target_id, self.target.target_id)
-        self.assertEqual(rebound.recipient_id, "chat-2")
+        self.assertEqual((rebound.channel, rebound.recipient_id, rebound.owner_id), ("weixin", "wx-user", "wx-user"))
+        self.assertFalse(rebound.rebind_released)
         with self.assertRaises(PermissionError):
-            self.repo.bind_target("weixin", "wx-user", "wx-user", NOW)
+            self.repo.bind_target("feishu", "chat-2", "owner", NOW)
+        self.assertTrue(self.repo.unbind_target("weixin", "wx-user", NOW))
+        reverse = self.repo.bind_target("feishu", "chat-2", "owner-2", NOW)
+        self.assertEqual(reverse.target_id, self.target.target_id)
+        self.assertEqual((reverse.channel, reverse.recipient_id), ("feishu", "chat-2"))
         with self.assertRaises(ValueError):
             self.repo.bind_target("unknown", "recipient", "owner", NOW)
 
     def test_suspend_and_unbind_release_claim_without_send_failure(self):
         claim = self.repo.claim_due(now_utc=NOW, lease_owner="worker", lease_for=timedelta(minutes=1))[0]
-        self.assertTrue(self.repo.suspend_target(self.target.target_id, NOW))
+        self.assertTrue(self.repo.suspend_target(
+            self.target.target_id,
+            NOW,
+            expected_binding_revision=self.target.binding_revision,
+        ))
         self.assertTrue(
             self.repo.defer_delivery(
                 claim.execution.id, lease_owner="worker", now_utc=NOW, reason="context_missing"
@@ -79,6 +91,47 @@ class RepositoryTests(unittest.TestCase):
             self.repo.claim_due(now_utc=NOW, lease_owner="other", lease_for=timedelta(minutes=1))[0].execution.id,
             claim.execution.id,
         )
+
+    def test_suspend_does_not_release_the_target_for_cross_owner_rebind(self):
+        self.assertTrue(self.repo.suspend_target(
+            self.target.target_id,
+            NOW,
+            expected_binding_revision=self.target.binding_revision,
+        ))
+        suspended = self.repo.get_target_by_public_id(self.target.target_id, active_only=False)
+        self.assertFalse(suspended.rebind_released)
+        with self.assertRaises(PermissionError):
+            self.repo.bind_target("weixin", "wx-user", "wx-user", NOW)
+        self.assertTrue(self.repo.unbind_target("feishu", "owner", NOW))
+        rebound = self.repo.bind_target("weixin", "wx-user", "wx-user", NOW)
+        self.assertEqual(rebound.target_id, self.target.target_id)
+        self.assertFalse(rebound.rebind_released)
+
+    def test_concurrent_claimants_cannot_overwrite_a_released_binding(self):
+        current = self.target
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            for round_number in range(30):
+                self.assertTrue(
+                    self.repo.unbind_target(current.channel, current.owner_id, NOW)
+                )
+                barrier = Barrier(3)
+
+                def bind(owner_id):
+                    barrier.wait()
+                    try:
+                        self.repo.bind_target("weixin", owner_id, owner_id, NOW)
+                    except PermissionError:
+                        return False
+                    return True
+
+                futures = [
+                    pool.submit(bind, f"wx-{round_number}-a"),
+                    pool.submit(bind, f"wx-{round_number}-b"),
+                ]
+                barrier.wait()
+                self.assertEqual(sum(future.result() for future in futures), 1)
+                current = self.repo.get_active_target()
+                self.assertIsNotNone(current)
 
     def test_legacy_feishu_database_migrates_without_losing_ids(self):
         legacy_path = Path(self.tempdir.name) / "legacy.sqlite3"
@@ -113,10 +166,11 @@ class RepositoryTests(unittest.TestCase):
         migrated = ReminderRepository(legacy_path)
         target = migrated.get_target_by_public_id("target-uuid")
         self.assertEqual((target.id, target.recipient_id, target.owner_id), (7, "chat-old", "open-old"))
+        self.assertFalse(target.rebind_released)
         self.assertEqual(migrated.get_task(11).id, 11)
         self.assertEqual(migrated.get_execution(13).id, 13)
         with sqlite3.connect(legacy_path) as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM targets WHERE active=1").fetchone()[0], 1)
         migrated.unbind_target("feishu", "open-old", NOW)
         rebound = migrated.bind_target("feishu", "chat-new", "open-old", NOW)
@@ -126,6 +180,51 @@ class RepositoryTests(unittest.TestCase):
                 "SELECT recipient_id,owner_id,chat_id,open_id FROM targets WHERE id=7"
             ).fetchone()
         self.assertEqual(row, ("chat-new", "open-old", "chat-new", "open-old"))
+
+    def test_v1_migration_keeps_inactive_target_locked_until_explicit_release(self):
+        legacy_path = Path(self.tempdir.name) / "v1.sqlite3"
+        with sqlite3.connect(legacy_path) as conn:
+            conn.executescript("""
+                CREATE TABLE targets (
+                    id INTEGER PRIMARY KEY, target_id TEXT NOT NULL UNIQUE,
+                    channel TEXT NOT NULL, recipient_id TEXT NOT NULL, owner_id TEXT NOT NULL,
+                    active INTEGER NOT NULL, created_at_utc TEXT NOT NULL, updated_at_utc TEXT NOT NULL
+                );
+                CREATE TABLE tasks (
+                    id INTEGER PRIMARY KEY, target_id INTEGER NOT NULL REFERENCES targets(id),
+                    kind TEXT NOT NULL, status TEXT NOT NULL, subject TEXT NOT NULL,
+                    delivery_text TEXT, agent_prompt TEXT, dtstart_local TEXT NOT NULL,
+                    timezone TEXT NOT NULL, rrule TEXT NOT NULL, next_run_at_utc TEXT,
+                    created_at_utc TEXT NOT NULL, updated_at_utc TEXT NOT NULL
+                );
+                CREATE TABLE executions (
+                    id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES tasks(id),
+                    scheduled_for_utc TEXT NOT NULL, status TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0, agent_attempts INTEGER NOT NULL DEFAULT 0,
+                    send_attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at_utc TEXT,
+                    lease_owner TEXT, lease_expires_at_utc TEXT, agent_output TEXT,
+                    delivery_success INTEGER, delivery_retryable INTEGER, delivery_code TEXT,
+                    delivery_message TEXT, provider_message_id TEXT,
+                    created_at_utc TEXT NOT NULL, updated_at_utc TEXT NOT NULL
+                );
+                INSERT INTO targets VALUES (7, 'target-uuid', 'feishu', 'chat-old', 'open-old', 0, '2026-01-01T12:00:00.000000+00:00', '2026-01-01T12:00:00.000000+00:00');
+                INSERT INTO tasks VALUES (11, 7, 'message', 'active', 'legacy', 'body', NULL, '2026-01-01T12:00:00', 'UTC', 'RRULE:FREQ=DAILY;COUNT=1', '2026-01-01T12:00:00.000000+00:00', '2026-01-01T12:00:00.000000+00:00', '2026-01-01T12:00:00.000000+00:00');
+                INSERT INTO executions VALUES (13, 11, '2026-01-01T12:00:00.000000+00:00', 'pending', 0, 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, '2026-01-01T12:00:00.000000+00:00', '2026-01-01T12:00:00.000000+00:00');
+                PRAGMA user_version = 1;
+            """)
+        migrated = ReminderRepository(legacy_path)
+        target = migrated.get_target_by_public_id("target-uuid", active_only=False)
+        self.assertFalse(target.rebind_released)
+        self.assertEqual((migrated.get_task(11).id, migrated.get_execution(13).id), (11, 13))
+        with self.assertRaises(PermissionError):
+            migrated.bind_target("weixin", "wx-target", "wx-target", NOW)
+        rebound = migrated.bind_target("feishu", "chat-new", "open-old", NOW)
+        self.assertEqual((rebound.id, rebound.target_id), (7, "target-uuid"))
+        self.assertTrue(migrated.unbind_target("feishu", "open-old", NOW))
+        transferred = migrated.bind_target("weixin", "wx-target", "wx-target", NOW)
+        self.assertEqual((transferred.id, transferred.target_id), (7, "target-uuid"))
+        self.assertEqual(migrated.get_task(11).target_id, 7)
+        self.assertEqual(migrated.get_execution(13).task_id, 11)
 
     def test_empty_legacy_database_accepts_its_first_binding_after_migration(self):
         legacy_path = Path(self.tempdir.name) / "empty-legacy.sqlite3"
@@ -174,8 +273,7 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(self.repo.list_execution_ids(self.task.id), [item.execution.id])
         self.assertTrue(self.repo.unbind_feishu_target("owner", NOW))
         self.assertIsNone(self.repo.next_wake_at())
-        with self.assertRaises(PermissionError):
-            self.repo.bind_feishu_target("other-chat", "other", NOW)
+        self.assertFalse(self.repo.unbind_feishu_target("owner", NOW))
         with self.assertRaises(PermissionError):
             self.repo.unbind_feishu_target("other", NOW)
 

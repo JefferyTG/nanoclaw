@@ -55,6 +55,8 @@ class ReminderTarget:
     recipient_id: str
     owner_id: str
     active: bool
+    rebind_released: bool
+    binding_revision: int
     created_at_utc: datetime
     updated_at_utc: datetime
 

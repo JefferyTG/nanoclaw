@@ -121,8 +121,9 @@ class ContextBuilder:
             "人设写成克制、准确、自包含的成稿，不要包含内部说明。agent 任务只保存"
             "明确、可独立执行的 agent_prompt，到点才运行 Agent。\n"
             "提醒只能投递到用户通过飞书或微信私聊 /bind-reminders 显式绑定的唯一"
-            "目标；首次绑定的渠道和用户会锁定当前实例。不得编造、索取或向工具传入"
-            "channel、chat_id、user_id。未绑定时原样转达工具给出的绑定指引。"
+            "目标；原绑定用户可先发送 /unbind-reminders，再去另一渠道重新绑定，已有"
+            "任务会跟随新目标。不得编造、索取或向工具传入 channel、chat_id、user_id。"
+            "未绑定时原样转达工具给出的绑定指引。"
         )
 
     def build_system_prompt(self) -> str:

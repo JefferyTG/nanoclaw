@@ -237,9 +237,12 @@ workspace/
 工具。工具不接受 channel、chat/user ID；ReminderService 只从数据库中当前有效的
 `target_id` 解析发送目标。目标只能由 FeishuChannel 或 WeixinChannel 在私聊中识别
 确定性命令 `/bind-reminders`、`/unbind-reminders` 后写入。首次绑定的
-`(channel, owner_id)` 永久锁定实例，飞书与微信在 V1 中二选一；解绑只暂停，不释放
-所有权。微信 recipient/owner 都使用稳定可逆的 account/user target，context token
-继续仅由 Bridge 持有。
+`(channel, owner_id)` 在未显式释放时锁定实例，飞书与微信同一时刻二选一。当前 owner
+主动解绑会持久标记为可换绑；下一次绑定原位更新同一个 target，因此历史任务与 execution
+整体跟随新渠道。`session_expired`、`context_missing` 等系统暂停不设置可换绑状态，防止
+掉线期间其它 allowlist 用户接管。每次绑定递增 `binding_revision`；迟到的旧渠道失败
+回执只有在代次仍匹配时才能暂停目标，不能误伤已经换绑的新渠道。微信 recipient/owner
+使用稳定可逆的 account/user target，context token 继续仅由 Bridge 持有。
 
 任务保存本地 `DTSTART`、IANA timezone、规范 RFC 5545 RRULE 和
 `next_run_at_utc`。ReminderScheduler 不做秒级轮询，也不为每个任务保留协程：它读取
@@ -272,9 +275,10 @@ sequenceDiagram
 动态任务使用 `scheduled:<task_id>:<execution_id>` 独立临时会话；生成后立即保存输出
 并清理 SessionManager/ImageStore。发送失败只重发该输出，不重复调用 Agent。回执表示
 目标渠道 API 已接受，不表示用户已读。微信使用 `reminder:<execution_id>` 作为稳定
-correlation ID。目标解绑、微信会话过期或 context 缺失会释放 claim 并暂停，而不是
-消耗三次发送机会；同一 owner 重绑后恢复。第一版采用 at-least-once：若进程在渠道
-接受后、SQLite 成功提交前崩溃，重启后仍存在极小概率重复发送。
+correlation ID。主动解绑、微信会话过期或 context 缺失都会释放 claim 而不消耗三次
+发送机会；主动解绑允许下次显式换绑，系统暂停则只允许原 owner 恢复。第一版采用
+at-least-once：若进程在渠道接受后、SQLite 成功提交前崩溃，重启后仍存在极小概率
+重复发送。
 
 ## 6. 配置生效边界
 

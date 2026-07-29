@@ -206,17 +206,64 @@ class ReminderRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cleaned, [task_id])
         self.assertIn("cancelled", await service.list_reminders(include_inactive=True))
 
-    async def test_first_binding_locks_channel_and_owner(self):
-        self.repository.unbind_target("feishu", "owner", self.now)
+    async def test_active_or_system_suspended_target_rejects_another_owner(self):
         service = ReminderService(self.repository, now=lambda: self.now)
+        weixin_target = encode_weixin_target("account", "user")
 
         refused = await service.bind_weixin(
-            encode_weixin_target("account", "user"),
-            encode_weixin_target("account", "user"),
+            weixin_target,
+            weixin_target,
         )
-        self.assertIn("首次绑定", refused)
+        self.assertIn("/unbind-reminders", refused)
+
+        await service.suspend_target_id(
+            self.target.target_id,
+            expected_binding_revision=self.target.binding_revision,
+        )
+        still_refused = await service.bind_weixin(weixin_target, weixin_target)
+        self.assertIn("/unbind-reminders", still_refused)
+
         rebound = await service.bind_feishu("new-chat", "owner")
         self.assertIn("飞书私聊", rebound)
+
+    async def test_owner_unbind_allows_weixin_rebind_and_keeps_tasks(self):
+        task = self.create_task(TaskKind.MESSAGE, delivery_text="迁移后仍需发送。")
+        service = ReminderService(self.repository, now=lambda: self.now)
+        weixin_target = encode_weixin_target("account", "user")
+
+        unbound = await service.unbind_feishu("chat", "owner")
+        self.assertIn("任意支持的飞书或微信私聊", unbound)
+        rebound = await service.bind_weixin(weixin_target, weixin_target)
+        self.assertIn("微信私聊", rebound)
+
+        target = self.repository.get_active_target()
+        self.assertEqual(target.target_id, self.target.target_id)
+        self.assertEqual((target.channel, target.recipient_id), ("weixin", weixin_target))
+        self.assertIn("test", await service.list_reminders())
+        self.assertEqual(self.repository.get_task(task.id).target_id, self.target.id)
+
+    async def test_suspended_owner_can_explicitly_release_before_transfer(self):
+        service = ReminderService(self.repository, now=lambda: self.now)
+        weixin_target = encode_weixin_target("account", "user")
+        await service.suspend_target_id(
+            self.target.target_id,
+            expected_binding_revision=self.target.binding_revision,
+        )
+
+        released = await service.unbind_feishu("chat", "owner")
+        rebound = await service.bind_weixin(weixin_target, weixin_target)
+
+        self.assertIn("任意支持的飞书或微信私聊", released)
+        self.assertIn("微信私聊", rebound)
+        self.assertEqual(self.repository.get_active_target().target_id, self.target.target_id)
+
+    async def test_non_owner_cannot_release_target(self):
+        service = ReminderService(self.repository, now=lambda: self.now)
+
+        refused = await service.unbind_feishu("other-chat", "other-owner")
+
+        self.assertIn("只有当前绑定的飞书用户", refused)
+        self.assertEqual(self.repository.get_active_target().target_id, self.target.target_id)
 
     async def test_weixin_delivery_routes_by_persisted_target_and_stable_id(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -247,6 +294,31 @@ class ReminderRuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
             result = await delivery
             self.assertTrue(result.success)
+
+    async def test_rebound_target_delivers_existing_task_to_weixin(self):
+        task = self.create_task(TaskKind.MESSAGE, delivery_text="迁移后的提醒。")
+        service = ReminderService(self.repository, now=lambda: self.now)
+        recipient = encode_weixin_target("account", "user")
+        self.assertIn("已解绑", await service.unbind_feishu("chat", "owner"))
+        self.assertIn("已绑定", await service.bind_weixin(recipient, recipient))
+
+        adapter = AsyncReminderRepository(self.repository, clock=lambda: self.now)
+        bus = MessageBus()
+        execution = SimpleNamespace(id=43, target_id=self.target.target_id)
+        delivery = asyncio.create_task(publish_reminder_delivery(
+            execution,
+            "迁移后的提醒。",
+            repository=self.repository,
+            service=service,
+            async_repository=adapter,
+            bus=bus,
+        ))
+        outbound = await bus.consume_outbound()
+        self.assertEqual(outbound.channel, "weixin")
+        self.assertEqual(outbound.chat_id, recipient)
+        outbound.delivery_future.set_result(DeliveryResult(True, code="ok"))
+        self.assertTrue((await delivery).success)
+        self.assertEqual(self.repository.get_task(task.id).target_id, self.target.id)
 
     async def test_context_missing_suspends_weixin_target(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -279,6 +351,43 @@ class ReminderRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 target.target_id, active_only=False
             )
             self.assertFalse(stored.active)
+            other_recipient = encode_weixin_target("account", "other-user")
+            refused = await service.bind_weixin(other_recipient, other_recipient)
+            self.assertIn("/unbind-reminders", refused)
+            self.assertIn("已绑定", await service.bind_weixin(recipient, recipient))
+
+    async def test_stale_weixin_failure_cannot_suspend_rebound_feishu_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = ReminderRepository(Path(directory) / "reminders.sqlite3")
+            recipient = encode_weixin_target("account", "user")
+            target = repository.bind_target("weixin", recipient, recipient, self.now)
+            service = ReminderService(repository, now=lambda: self.now)
+            adapter = AsyncReminderRepository(repository, clock=lambda: self.now)
+            bus = MessageBus()
+            execution = SimpleNamespace(id=44, target_id=target.target_id)
+
+            delivery = asyncio.create_task(publish_reminder_delivery(
+                execution,
+                "旧微信投递",
+                repository=repository,
+                service=service,
+                async_repository=adapter,
+                bus=bus,
+            ))
+            outbound = await bus.consume_outbound()
+            self.assertEqual(outbound.channel, "weixin")
+
+            self.assertIn("已解绑", await service.unbind_weixin(recipient, recipient))
+            self.assertIn("已绑定", await service.bind_feishu("new-chat", "new-owner"))
+            outbound.delivery_future.set_result(DeliveryResult(
+                False, code="context_missing", message="stale Weixin context"
+            ))
+            self.assertEqual((await delivery).code, "context_missing")
+
+            rebound = repository.get_active_target()
+            self.assertEqual(rebound.target_id, target.target_id)
+            self.assertEqual((rebound.channel, rebound.owner_id), ("feishu", "new-owner"))
+            self.assertGreater(rebound.binding_revision, target.binding_revision)
 
     async def test_static_message_completes_without_agent_and_persists_receipt(self):
         task = self.create_task(TaskKind.MESSAGE, delivery_text="该喝水了。")
