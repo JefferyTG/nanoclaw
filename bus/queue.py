@@ -60,6 +60,10 @@ class OutboundMessage:
     # Optional acknowledgement for callers that need the channel's API result.
     # Ordinary conversation messages leave it as None and remain fire-and-forget.
     delivery_future: "asyncio.Future[DeliveryResult] | None" = None
+    # Stable caller-supplied identifier for providers that support idempotent
+    # retries.  Channels may derive deterministic per-chunk IDs from this value;
+    # when absent they may generate a fresh identifier for this one send.
+    correlation_id: Optional[str] = None
 
 
 @dataclass

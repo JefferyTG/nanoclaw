@@ -10,7 +10,7 @@ NanoClaw 把「大模型推理」与「消息渠道」解耦：模型在本地�
 
 ## 特性
 
-- **多渠道接入**：飞书（WebSocket 长连接，支持收图与发送生成图片）、网页（aiohttp + WebSocket，含会话侧边栏、历史接回、断线自动重连）。
+- **多渠道接入**：微信私聊（扫码登录、文本/图片、断线恢复）、飞书（WebSocket 长连接，支持收图与发送生成图片）、网页（aiohttp + WebSocket，含会话侧边栏、历史接回、断线自动重连）。
 - **网页语音输入**：浏览器录音经可替换 ASR Provider 转成文字后，继续复用原有文本消息、会话与 Agent 流程。
 - **网页自动朗读**：可选开启 `edge-tts`，按自然语义片段合成并顺序朗读 Agent 的新回复，默认关闭且不回放历史。
 - **ReAct 工具循环**：模型自主决定调用工具（文件读写、目录列举、执行命令、子 Agent 委派等），带单轮迭代上限与墙钟超时熔断，防卡死。
@@ -29,9 +29,12 @@ NanoClaw 把「大模型推理」与「消息渠道」解耦：模型在本地�
 flowchart LR
     subgraph 渠道 Channels
         FS[飞书 WS]
+        WX[微信 iLink]
         WEB[网页 WS]
         CLI[命令行]
     end
+
+    WXBR[Node Bridge\nJSONL + 持久状态]
 
     BUS((消息总线 Bus))
     GW[网关 Gateway]
@@ -47,6 +50,9 @@ flowchart LR
     REM[ReminderScheduler\nSQLite + RRULE]
 
     FS --> BUS
+    WX <--> WXBR
+    WXBR --> BUS
+    BUS --> WXBR
     WEB --> BUS
     CLI --> BUS
     BUS <--> GW
@@ -81,6 +87,8 @@ nanoclaw/
 │   └── tools/              # 内置工具 + MCP 接入层（mcp.py）
 ├── bus/                    # 消息总线
 ├── channels/               # 渠道：feishu.py / web.py / cli.py
+├── integrations/
+│   └── weixin_bridge/      # 固定 iLink client + 薄 Node JSONL Bridge
 ├── providers/              # 模型 Provider（OpenAI 兼容，支持流式）
 ├── reminders/              # RRULE、SQLite 状态机、调度器和应用服务
 ├── voice/                  # 音频规范化与可替换 ASR Provider
@@ -99,6 +107,7 @@ nanoclaw/
 ### 1. 前置
 
 - Python 3.13+（推荐用 [uv](https://github.com/astral-sh/uv) 管理环境）
+- 微信渠道需要 Node.js 20+
 - 一个 OpenAI 兼容的模型 API Key
 - 使用网页语音输入时需额外安装 `ffmpeg`/`ffprobe`，并配置支持 `/audio/transcriptions` 的 ASR 服务
 
@@ -106,6 +115,15 @@ nanoclaw/
 
 ```bash
 uv sync          # 按 pyproject.toml + uv.lock 安装到 .venv
+```
+
+只在启用微信渠道时准备 Bridge：
+
+```bash
+cd integrations/weixin_bridge
+npm ci
+npm run build
+cd ../..
 ```
 
 ### 3. 配置
@@ -132,7 +150,7 @@ export ASR_API_KEY="sk-..."       # 仅网页语音识别需要
 uv run python main.py
 ```
 
-默认只启用命令行渠道。要开网页渠道，把 `config.json` 里的 `web_port` 设为非零（如 `8080`），浏览器打开 `http://<本机IP>:8080/`。
+默认只启用命令行渠道。要开网页渠道，把 `config.json` 里的 `web_port` 设为非零（如 `8080`）；微信渠道需完成上面的 Bridge 构建并配置 `weixin.enabled=true`。
 
 ---
 
@@ -158,10 +176,22 @@ uv run python main.py
 | `asr_model` | 网页语音识别 Provider、模型、地址、超时、大小与 FFmpeg 配置 | 默认关闭 |
 | `tts_model` | 网页自动朗读的 Provider、音色、语速、超时与资源上限 | Edge TTS 后端就绪，页面默认关闭 |
 | `reminders` | 主动提醒开关、独立 SQLite 路径、回执/lease/低频校时与重试上限；均在重启后生效 | 启用，`workspace/reminders.db` |
+| `weixin` | 微信 Bridge 命令、被忽略的状态目录、私聊 allowlist、IPC/登录/图片上限；均在重启后生效 | 关闭，allowlist 为空（deny-all） |
 
 ---
 
 ## 渠道
+
+### 微信
+
+1. 安装并构建 `integrations/weixin_bridge/`，确认本机 `node --version` 为 20 或更高；
+2. 在 `config.json` 的 `weixin.allowed_user_ids` 中填写允许的微信 iLink `user_id`。空列表会拒绝所有用户；只有显式 `"*"` 才允许任意私聊用户；
+3. 设置 `weixin.enabled=true` 后重启 NanoClaw。首次启动会在本机终端显示扫码内容；手机确认后，Bridge 把凭据保存到被 Git 忽略的 `workspace/weixin/`；
+4. 后续启动会恢复凭据、长轮询 cursor、`account_id + user_id` 对应的 context token 和去重状态，无需把 token 写入 `config.json`。
+
+V1 只处理单账号私聊文本和 PNG/JPEG/GIF/WEBP/BMP 图片。群聊、语音、视频、文件和多账号暂不支持。入站与出站都经过 allowlist；可靠回执表示 iLink HTTP 和 JSON `ret/errcode` 已接受，不表示用户已读。一个用户至少入站交互一次后，Bridge 才有该用户的 context token；此后可用稳定的 `account_id + user_id` 主动发送，重启不丢失这项能力。
+
+Bridge stdout 只承载 JSONL 协议，敏感凭据、cursor 和 context token 始终留在权限为 `0700/0600` 的状态目录。若收到 `-14` 会话失效，Bridge 会停止轮询、清除当前凭据代次的 context/去重状态并要求重新扫码；重新登录后，对端需再次交互才能恢复主动发送。当前真实微信扫码/收发属于有外部副作用的手工验收，不在自动测试中执行。
 
 ### 飞书
 
@@ -268,10 +298,12 @@ uv sync --frozen
 ```bash
 uv run python -m compileall -q agent bus channels providers session  # 基础语法检查
 uv run python -c "import main"                                      # 导入链冒烟
+uv run python -m unittest discover -s tests                          # Python 离线回归
+cd integrations/weixin_bridge && npm test && npm run build           # 微信 Bridge 离线回归
 uv run python main.py                                                # 本地调试
 ```
 
-仓库当前尚未建立正式测试套件；新增功能和 Bug 修复应按开发流程补充可重复的回归测试。
+仓库已有基于 `unittest` 的离线回归集；新增功能和 Bug 修复应继续按开发流程保留可重复测试。微信 Bridge 另用 Node 内置 test runner 和 fake iLink HTTP/CDN，不需要真实微信凭据。
 
 新增内置工具：在 `agent/tools/` 下继承 `Tool` 基类并实现 `name` / `description` / `parameters` / `execute` / `to_function_definition`。
 
@@ -280,3 +312,5 @@ uv run python main.py                                                # 本地调
 ## License
 
 本项目仅供个人学习与使用。具体许可条款见仓库 LICENSE 文件（如有）。
+
+微信 Bridge 的第三方来源、固定提交与许可证核验见 `integrations/weixin_bridge/NOTICE.md`；运行时精确锁定 `wechat-ilink-client@0.1.0` 并直接复用其协议常量与 CDN/AES 原语，腾讯对照源码的 MIT 文本保存在同目录。社区项目当前仅在 `package.json` 声明 MIT、上游缺少独立 LICENSE，正式分发前仍应完成维护者/法律复核。

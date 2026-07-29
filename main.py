@@ -68,6 +68,7 @@ from bus.queue import MessageBus, OutboundMessage
 from gateway import Gateway
 from channels.cli import CLIChannel
 from channels.feishu import FeishuChannel
+from channels.weixin import WeixinChannel
 from channels.web import WebChannel
 from reminders.models import DeliveryResult
 from reminders.repository import ReminderRepository
@@ -172,6 +173,89 @@ def build_reminder_service(config):
         database_path = os.path.join(config.workspace, database_path)
     repository = ReminderRepository(database_path)
     return repository, ReminderService(repository)
+
+
+def build_weixin_channel(config, bus, image_store):
+    """Build the optional Weixin process adapter from startup-only settings."""
+
+    settings = config.weixin if isinstance(config.weixin, dict) else {}
+    if not settings.get("enabled", False):
+        return None
+
+    command = settings.get("bridge_command")
+    if (
+        not isinstance(command, (list, tuple))
+        or not command
+        or not all(isinstance(part, str) and part.strip() for part in command)
+    ):
+        raise ValueError("weixin.bridge_command must be a non-empty argv list")
+
+    allowed = settings.get("allowed_user_ids", [])
+    if not isinstance(allowed, (list, tuple)) or not all(
+        isinstance(user_id, str) and user_id for user_id in allowed
+    ):
+        raise ValueError("weixin.allowed_user_ids must be a list of user IDs")
+
+    state_dir = os.fspath(settings.get("state_dir") or "workspace/weixin")
+    if not os.path.isabs(state_dir):
+        state_dir = os.path.join(config.workspace, state_dir)
+    state_dir = os.path.realpath(state_dir)
+    runtime_root = os.path.realpath(os.path.join(config.workspace, "workspace"))
+    if os.path.commonpath((runtime_root, state_dir)) != runtime_root:
+        raise ValueError("weixin.state_dir must stay under <workspace>/workspace")
+
+    return WeixinChannel(
+        "weixin",
+        bus,
+        bridge_command=command,
+        state_dir=state_dir,
+        allowed_user_ids=allowed,
+        image_store=image_store,
+        request_timeout_sec=float(settings.get("request_timeout_sec", 30)),
+        login_timeout_sec=float(settings.get("login_timeout_sec", 480)),
+        inbound_ack_timeout_sec=float(
+            settings.get("inbound_ack_timeout_sec", 30)
+        ),
+        stop_timeout_sec=float(settings.get("stop_timeout_sec", 10)),
+        max_ipc_line_bytes=int(settings.get("max_ipc_line_bytes", 1024 * 1024)),
+        max_inbound_image_bytes=int(
+            settings.get("max_inbound_image_bytes", 20 * 1024 * 1024)
+        ),
+        max_outbound_image_bytes=int(
+            settings.get("max_outbound_image_bytes", 20 * 1024 * 1024)
+        ),
+        auto_login=True,
+    )
+
+
+async def watch_channel_start_failures(tasks, channels, *, ignore_indices=()):
+    """Surface background-style channel startup failures without treating a
+    successful, short ``start()`` as application shutdown.
+
+    CLI is excluded because its normal completion is already the explicit
+    application-exit signal.  Web/Feishu/Weixin ``start()`` may return after
+    installing their background listener; those successful returns are ignored.
+    """
+
+    monitored = {
+        task: channels[index].name
+        for index, task in enumerate(tasks)
+        if index not in set(ignore_indices)
+    }
+    while monitored:
+        done, _ = await asyncio.wait(
+            monitored, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in done:
+            channel_name = monitored.pop(task)
+            if task.cancelled():
+                continue
+            error = task.exception()
+            if error is not None:
+                raise RuntimeError(
+                    f"channel '{channel_name}' failed to start: {error}"
+                ) from error
+    await asyncio.Future()
 
 
 def build_shared() -> dict:
@@ -592,6 +676,21 @@ async def amain() -> None:
     else:
         print("（飞书渠道：未配置 App ID/Secret，未启用）")
 
+    # 微信渠道：启用后由 Python 维护一个薄 Node Bridge 子进程。Bridge 独占
+    # 登录凭据、cursor 和 context token；普通消息只携带稳定账号/用户 target。
+    try:
+        weixin_channel = build_weixin_channel(cfg, bus, shared["image_store"])
+    except (TypeError, ValueError) as exc:
+        print(f"[!] 微信渠道未启用：配置值无效（{exc}）")
+        weixin_channel = None
+    if weixin_channel is not None:
+        channels.append(weixin_channel)
+        if not weixin_channel.allowed_user_ids:
+            print("[!] 微信渠道 allowlist 为空：将拒绝所有入站与出站用户")
+        print("（微信渠道：已启用·Node Bridge·仅私聊）")
+    else:
+        print("（微信渠道：未启用）")
+
     # 网页渠道：配置了端口且 >0 时启用（同局域网内网页访问）
     if cfg.web_port and cfg.web_port > 0:
         web_channel = WebChannel(
@@ -608,7 +707,7 @@ async def amain() -> None:
         print("（网页渠道：未配置 web_port 或未启用）")
 
     if not channels:
-        print("错误：没有任何启用渠道（CLI 需终端，网页需 web_port>0，飞书需凭证），退出。")
+        print("错误：没有任何启用渠道（CLI 需终端，网页/飞书/微信需显式配置），退出。")
         return
 
     gateway = Gateway(
@@ -622,6 +721,13 @@ async def amain() -> None:
     # CLI 的 start() 是长循环（/exit 时返回）；飞书/网页的 start() 仅拉起
     # 后台守护线程并立即返回。CLI 退出即视为整体退出；无 CLI 时永久运行。
     start_tasks = [asyncio.create_task(ch.start()) for ch in channels]
+    start_failure_task = asyncio.create_task(
+        watch_channel_start_failures(
+            start_tasks,
+            channels,
+            ignore_indices=(() if cli_task_index is None else (cli_task_index,)),
+        )
+    )
     inbound_task = asyncio.create_task(gateway._process_inbound())
     outbound_task = asyncio.create_task(gateway._dispatch_outbound())
     stream_task = asyncio.create_task(gateway._dispatch_stream())
@@ -641,7 +747,7 @@ async def amain() -> None:
             pass
 
     shutdown_waiter = asyncio.create_task(shutdown_event.wait())
-    watched = {inbound_task, shutdown_waiter}
+    watched = {inbound_task, shutdown_waiter, start_failure_task}
     if reminder_scheduler_task is not None:
         watched.add(reminder_scheduler_task)
     if cli_task_index is not None:
@@ -650,10 +756,16 @@ async def amain() -> None:
 
     if shutdown_event.is_set():
         print("\n收到停止信号，正在释放资源……")
+    elif start_failure_task.done() and not start_failure_task.cancelled():
+        try:
+            start_failure_task.result()
+        except Exception as exc:  # noqa: BLE001 - already normalized above
+            print(f"[!] 渠道启动失败，正在停止实例：{exc}")
     for i, task in enumerate(start_tasks):
         if cli_task_index is None or i != cli_task_index or not task.done():
             task.cancel()
     shutdown_waiter.cancel()
+    start_failure_task.cancel()
 
     if reminder_scheduler is not None:
         await reminder_scheduler.stop()
@@ -667,6 +779,7 @@ async def amain() -> None:
         outbound_task,
         stream_task,
         shutdown_waiter,
+        start_failure_task,
         *([reminder_scheduler_task] if reminder_scheduler_task is not None else []),
         return_exceptions=True,
     )

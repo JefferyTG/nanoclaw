@@ -20,6 +20,22 @@ from typing import Optional
 # 硅基流动（SiliconFlow）OpenAI 兼容端点
 _SILICONFLOW_URL = "https://api.siliconflow.cn/v1"
 
+# Weixin credentials are deliberately absent: bot_token, cursor and context
+# tokens belong exclusively to the ignored Bridge state directory.
+_WEIXIN_FIELDS = (
+    "enabled",
+    "bridge_command",
+    "state_dir",
+    "allowed_user_ids",
+    "request_timeout_sec",
+    "login_timeout_sec",
+    "inbound_ack_timeout_sec",
+    "stop_timeout_sec",
+    "max_ipc_line_bytes",
+    "max_inbound_image_bytes",
+    "max_outbound_image_bytes",
+)
+
 # 参与序列化/反序列化的字段清单（用于从 JSON 安全填充，避免读到无关键）
 _CONFIG_FIELDS = (
     "api_key",
@@ -49,6 +65,8 @@ _CONFIG_FIELDS = (
     "tts_model",
     # 主动提醒：独立 SQLite、lease、回执等待和动态唤醒参数；均为启动期配置。
     "reminders",
+    # 微信 iLink：Node Bridge、持久状态目录、显式访问控制和 IPC 生命周期参数。
+    "weixin",
 )
 
 
@@ -164,6 +182,26 @@ class NanoClawConfig:
             "once_grace_seconds": 3600,
         }
     )
+    # 微信渠道默认关闭。敏感凭据、cursor 和 context token 仅由 Node Bridge
+    # 写入 state_dir，不进入本配置；allowed_user_ids 为空时明确拒绝所有用户。
+    weixin: dict = field(
+        default_factory=lambda: {
+            "enabled": False,
+            "bridge_command": [
+                "node",
+                "integrations/weixin_bridge/bridge.mjs",
+            ],
+            "state_dir": "workspace/weixin",
+            "allowed_user_ids": [],
+            "request_timeout_sec": 30,
+            "login_timeout_sec": 480,
+            "inbound_ack_timeout_sec": 30,
+            "stop_timeout_sec": 10,
+            "max_ipc_line_bytes": 1024 * 1024,
+            "max_inbound_image_bytes": 20 * 1024 * 1024,
+            "max_outbound_image_bytes": 20 * 1024 * 1024,
+        }
+    )
 
 
 def load_config(config_path: str = "config.json") -> NanoClawConfig:
@@ -188,9 +226,14 @@ def load_config(config_path: str = "config.json") -> NanoClawConfig:
             if key in data and data[key] is not None:
                 # ASR/TTS 配置允许只覆盖少数字段；其余继续使用当前代码默认值，
                 # 方便未来新增可选参数而不要求用户立刻重写旧 config.json。
-                if key in ("asr_model", "tts_model", "reminders") and isinstance(data[key], dict):
+                if key in ("asr_model", "tts_model", "reminders", "weixin") and isinstance(data[key], dict):
                     merged = dict(getattr(cfg, key))
-                    merged.update(data[key])
+                    if key == "weixin":
+                        merged.update(
+                            {name: data[key][name] for name in _WEIXIN_FIELDS if name in data[key]}
+                        )
+                    else:
+                        merged.update(data[key])
                     setattr(cfg, key, merged)
                 else:
                     setattr(cfg, key, data[key])
@@ -243,5 +286,11 @@ def save_config(cfg: NanoClawConfig, config_path: str = "config.json") -> None:
     if os.environ.get("ASR_API_KEY") and isinstance(data.get("asr_model"), dict):
         data["asr_model"] = dict(data["asr_model"])
         data["asr_model"]["api_key"] = ""
+    if isinstance(data.get("weixin"), dict):
+        data["weixin"] = {
+            name: data["weixin"][name]
+            for name in _WEIXIN_FIELDS
+            if name in data["weixin"]
+        }
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)

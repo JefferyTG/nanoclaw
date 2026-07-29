@@ -73,5 +73,21 @@
     "lease_seconds": 900,
     "max_sleep_seconds": 3600,
     "once_grace_seconds": 3600
+  },
+  "weixin": {
+    "enabled": false,
+    "bridge_command": [
+      "node",
+      "integrations/weixin_bridge/bridge.mjs"
+    ],
+    "state_dir": "workspace/weixin",
+    "allowed_user_ids": [],
+    "request_timeout_sec": 30,
+    "login_timeout_sec": 480,
+    "inbound_ack_timeout_sec": 30,
+    "stop_timeout_sec": 10,
+    "max_ipc_line_bytes": 1048576,
+    "max_inbound_image_bytes": 20971520,
+    "max_outbound_image_bytes": 20971520
   }
 }

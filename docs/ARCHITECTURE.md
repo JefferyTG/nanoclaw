@@ -14,6 +14,7 @@ NanoClaw 是一个本地优先、单进程、多渠道的个人 AI Agent 网关�
 | 模型 | `openai.AsyncOpenAI` | 调用 OpenAI-compatible Chat Completions，支持流式和工具调用 |
 | Web | `aiohttp`、原生 HTML/CSS/JS | HTTP 配置/会话/图片 API、WebSocket 聊天与单页 UI |
 | 飞书 | `lark-oapi` | WebSocket 长连接收文本/图片、IM API 发文本/图片 |
+| 微信 | Python `asyncio` + Node.js 20+ JSONL Bridge | iLink 扫码、长轮询、CDN AES 与私有持久状态 |
 | 工具扩展 | 自定义 Tool API、MCP stdio | 内置工具注册和外部 MCP Server 接入 |
 | 网络工具 | `httpx`、`ddgs`、`html2text` | 网页抓取、搜索、生图服务请求 |
 | 语音输入 | MediaRecorder、FFmpeg/ffprobe、`httpx` | Web 录音、格式规范化、云端 ASR |
@@ -30,8 +31,11 @@ flowchart LR
     subgraph Channels["渠道适配层"]
         CLI["CLIChannel"]
         FS["FeishuChannel"]
+        WX["WeixinChannel"]
         WEB["WebChannel"]
     end
+
+    WXBR["Node Weixin Bridge\nJSONL / iLink / CDN AES"]
 
     WEB --> ASR["AudioTranscriptionService\nASRProvider"]
     ASR --> WEB
@@ -49,6 +53,7 @@ flowchart LR
     REM["ReminderScheduler\nSQLite / RRULE / lease"]
 
     Channels <--> BUS
+    WX <--> WXBR
     BUS <--> GW
     GW <--> LOOP
     LOOP --> CTX
@@ -92,6 +97,8 @@ nanoclaw/
 │   └── tools/              # Tool 抽象、Registry、内置工具、MCP 包装
 ├── bus/queue.py            # DTO 和三个 asyncio.Queue
 ├── channels/               # CLI、飞书、Web 渠道适配器
+├── integrations/
+│   └── weixin_bridge/      # 固定上游源码、Node Bridge、NOTICE 与 Node 测试
 ├── providers/              # 模型抽象和 OpenAI-compatible 实现
 ├── reminders/              # DTO、RFC 5545、SQLite 仓储、调度器和应用服务
 ├── voice/                  # 音频校验/规范化、ASR/TTS 抽象与 Provider
@@ -118,7 +125,8 @@ nanoclaw/
 2. `build_shared()` 加载配置，创建基础 Provider、SkillsLoader、ToolRegistry、ContextBuilder、SessionManager、ImageStore、MemorySearcher、DailyMemory、MemoryConsolidation，以及启用时的 ReminderRepository/ReminderService。
 3. 启动时重建记忆/会话 SQLite 索引。
 4. MCPClientManager 按配置拉起 stdio Server，并把远端工具包装进同一个 ToolRegistry。
-5. 根据终端、飞书凭证和 `web_port` 启用 Channel。
+5. 根据终端、飞书凭证、`weixin.enabled` 和 `web_port` 启用 Channel。微信启用时
+   额外启动一个 Node Bridge；Python 只传状态/受控图片目录，不接触登录秘密。
 6. 启动渠道任务、Gateway 的入站/出站/流事件消费循环，以及单一 ReminderScheduler；关闭时先停止调度器，再停止出站分发和渠道。
 
 若配置的人设文件不存在或为空，Gateway 会在创建会话 Agent 前调用实例级 `IdentityBootstrapper`。首条消息只触发询问，同一会话下一条文本生成工作区内的人设文件；引导消息不调用模型、不进入会话历史。人设创建后 ContextBuilder 每轮重读文件，因此无需重启。多渠道并发由 Bootstrapper 的实例级锁协调，任一渠道完成后其它渠道直接进入正常流程。
@@ -154,6 +162,12 @@ sequenceDiagram
 ```
 
 Gateway 每条入站消息创建任务；同一会话竞争同一把锁而串行，不同会话使用不同锁并发。Agent 实例和锁按 session_key 缓存。
+
+微信私聊使用稳定、可逆的 `account_id + user_id` target 同时作为 sender/chat ID，
+会话不依赖临时 context token，也不会引入分隔符碰撞。Python Channel 把 Bridge
+入站图片保存进共享 ImageStore，再按普通 `InboundMessage` 投递；出站继续消费
+Gateway 的 `OutboundMessage.content/images` 和可选 `delivery_future`。allowlist
+为空时 deny-all，只有精确 user ID 或显式 `*` 才放行。
 
 Web 是唯一启用细粒度流事件的渠道：`thinking`、`token`、`tool_call`、`tool_result`、`image`、`subagent_event`、`done` 经 stream queue 回到 WebSocket。子 Agent 的内部事件统一包装在 `subagent_event` 中，避免其 `token/done` 混入父回复或触发 TTS。最终 OutboundMessage 标记 `streamed=True`，防止前端重复显示。
 
@@ -197,7 +211,11 @@ workspace/
 │   ├── followups.jsonl
 │   ├── daily/YYYY-MM-DD.md
 │   └── index.db
-└── reminders.db            # 独立、不可重建的提醒事实库（WAL）
+├── reminders.db            # 独立、不可重建的提醒事实库（WAL）
+└── weixin/
+    ├── state.json          # Bridge 独占凭据/cursor/context/去重（0600）
+    ├── inbound/            # 等待搬入 ImageStore 的已解密临时图片
+    └── outbound/           # Python 为 Bridge 暂存的受控出站图片
 ```
 
 - JSONL 保存 user、assistant 和 tool 消息；system prompt 每轮重建，不落盘。
@@ -205,6 +223,11 @@ workspace/
 - 子 Agent 图片沿用父会话 key；父 `assistant(tool_calls)` 记录保存有界的 `subagent_runs` 回放摘要和 `generated_images`。这些 UI 元数据在恢复模型上下文前会被剥离。
 - USER 偏长期个人信息，MEMORY 偏项目/工作事实，HISTORY 保存压缩轨迹，daily 保存 best-effort 事件摘要。
 - MemorySearcher 启动时重建全部索引；每次搜索只刷新记忆文件部分，会话索引在当前进程内不会实时更新。
+- Weixin 状态目录为 `0700`，状态文件原子替换。context token 按 account/user
+  持久化；一批入站先保存 context、发事件并等待 Python ack，整批完成后才提交
+  去重 ID 和 cursor。崩溃语义为 at-least-once：允许重复，不允许先推进 cursor
+  导致静默丢消息。`-14` 表示凭据代次失效，会同时清除当前 account、cursor、
+  context 和去重状态；重新扫码后必须由对端再次交互，不能复用旧代次 token。
 
 ### 5.5 主动提醒与定时 Agent
 
@@ -256,6 +279,8 @@ SQLite 成功提交前崩溃，重启后存在极小概率重复发送。
 - `base_model_multimodal` 决定是否注册 `ask_image`，因此修改后必须重启。
 - `asr_model` 和 `tts_model` 都是启动期服务配置；页面的 TTS 喇叭开关只是当前标签页内存状态，刷新后默认关闭。
 - `reminders` 的数据库路径、超时、lease、校时与尝试上限都是启动期配置；Web 保存后需重启。
+- `weixin` 的 Bridge 命令、state dir、allowlist、IPC/登录/图片上限均为启动期配置；
+  状态秘密不属于 `config.json`，加载/保存都会过滤 Bridge 独占字段。
 
 ## 7. 扩展点
 
@@ -281,3 +306,6 @@ SQLite 成功提交前崩溃，重启后存在极小概率重复发送。
 4. 工具循环在第 10 次重复时停止累计，导致计划中的第 20 次硬熔断不可达。
 5. 会话 key 使用 `:`/`_` 互换，映射有损且可能碰撞；飞书 ID 常含下划线。
 6. 队列、任务和会话缓存没有背压/回收策略；Channel 的 stop 也未真正关闭后台服务。
+7. 微信社区基础仓库只在 `package.json` 声明 MIT、缺少独立 LICENSE；当前 vendor
+   固定了来源和 NOTICE，但正式分发前仍需维护者/法律复核。真实腾讯端点兼容性
+   也只能在明确授权扫码后手工验收，自动化使用 fake iLink HTTP/CDN/process。

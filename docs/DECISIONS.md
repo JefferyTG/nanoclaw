@@ -43,6 +43,13 @@
 | 提醒调度以独立 SQLite 为事实源 | 有效 | 单 Scheduler 动态等待，WAL + 原子 claim/lease 支持重启恢复；不混入可重建的 memory/index.db |
 | 动态任务先固化 Agent 输出再发送 | 有效 | scheduled 独立会话不污染日常聊天；发送重试复用相同文本，第一版明确为 at-least-once |
 | 提醒回执沿用 Bus/Gateway/Feishu 链路 | 有效 | OutboundMessage 仅为可靠发送附可选 future，普通聊天继续 fire-and-forget |
+| 微信采用固定 Node Bridge 而非重写协议或运行 OpenClaw | 有效 | vendor `wechat-ilink-client` 固定提交，Python 只做 Channel/JSONL/生命周期，Agent 逻辑继续复用 NanoClaw |
+| 微信稳定身份是 account_id + user_id | 有效 | 会话和未来主动提醒不依赖临时 context token；target 使用可逆编码避免分隔符碰撞 |
+| 微信秘密和同步状态由 Bridge 独占 | 有效 | token/cursor/context/去重只写入被忽略的 0700/0600 状态目录，不进入 config、Bus 或普通日志 |
+| 微信入站采用 ack 后批次提交 cursor | 有效 | context 先落盘，Python 投递成功后 ack，整批完成才提交去重与 cursor；崩溃允许重复、不允许静默丢失 |
+| 微信 allowlist 默认 deny-all | 有效 | 单账号私聊仍是外部不可信入口；空列表不放行，`*` 必须由用户显式选择 |
+| 微信发送回执同时检查 HTTP 和 JSON | 有效 | HTTP 2xx 不代表 iLink 接受；`ret/errcode` 非零都失败，correlation/client ID 在重试间稳定 |
+| 微信 `-14` 切换凭据代次 | 有效 | 清除 account/cursor/context/去重后重新扫码；旧 context 不跨认证代次复用，避免稳定的主动发送失败 |
 
 这些约定来自 `.workbuddy/memory/MEMORY.md` 和 2026-07-22 至 2026-07-26 的开发日志；原日志被 Git 忽略，因此本表是跨会话的正式摘录。
 
@@ -56,6 +63,7 @@
 | 07-25 | Web 重连、MCP、Prompt Cache 排序、常驻运行探索 | 后台 WS 不等于消息持久队列；睡眠期间可能丢消息 |
 | 07-26 | 记忆、图片/视觉、生图、工具耗时 | 配置/消息/持久化是跨层协议；临时测试不应再删除 |
 | 07-29 | 主动提醒、RRULE 调度、飞书绑定与可靠回执 | 持久状态机与副作用分离；Agent 输出必须先落库再发送 |
+| 07-29 | 微信私聊 V1、Node Bridge、扫码/图片/状态恢复 | 跨进程协议先定契约；cursor 必须在消费确认后推进；fake 服务不能与错误实现共同自洽 |
 
 ## 4. 已替代或已核销的旧记录
 
@@ -110,11 +118,15 @@
 | NC-DOC-001 | README 与实现有少量漂移 | README 称 MCP 多 Server 并行连接，当前实现为顺序 await；配置热更新描述也需更精确 |
 | NC-SEC-002 | WebFetch 可访问内网地址 | 只限制 http/https 且跟随重定向；不可信输入下应评估 SSRF 防护 |
 | NC-CLEAN-001 | `agent/skills/` 历史副本 | 当前运行入口使用根 `skills/`；确认无外部依赖后可移除重复副本 |
+| NC-LICENSE-001 | 微信社区基础缺少独立 LICENSE | 上游 `package.json` 声明 MIT，但仓库没有 LICENSE 文件；当前已固定来源/NOTICE，正式分发前仍需维护者或法律复核 |
+| NC-WEIXIN-001 | 微信真实端点未验收 | 自动化使用 fake iLink HTTP/CDN/clock/process；真实扫码、长轮询、图片和主动发送需用户授权后受控手工验收 |
+| NC-WEIXIN-002 | 微信主动发送需要历史 context token | 对端至少入站交互一次后才可发送；Bridge 按 account/user 持久化，V1 不绕过服务端这项协议约束 |
 
 ## 6. 运行和产品边界
 
 - Web 当前只能用于严格可信网络；在 NC-BUG-001 修复前，优先绑定 `127.0.0.1`。
 - 多实例必须使用不同 workspace、Web 端口和飞书 App；同一个飞书 App 不应被多个进程竞争长连接。
+- 微信 V1 每个实例只支持一个扫码账号；多实例必须使用不同 workspace/weixin 状态目录，且不应让多个进程竞争同一账号 cursor。
 - 进程内长期多 Agent/Mailbox/寻址层尚未实现，也不是当前优先产品方向。
 - 本地图片工具只应接受 workspace 内路径；外部目录需显式改变 workspace 或另行授权。
 - `base_model_multimodal`、MCP、skills、workspace 等启动期结构变化后需要重启。
