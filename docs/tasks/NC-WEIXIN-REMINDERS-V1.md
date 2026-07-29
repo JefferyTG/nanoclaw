@@ -114,8 +114,10 @@ cd integrations/weixin_bridge && npm test && npm run build
 - 未验证项：真实微信端点与真实模型
 - 风险与遗留问题：第一版不支持跨渠道切换或双投递；渠道 API 接受仍不等于用户已读，
   at-least-once 崩溃窗口仍可能造成极低概率重复发送。
-- commit：待本记录更新后按用户授权提交并同步本地主干
-- 当前 `git status --short --branch`：detached HEAD，17 个跟踪文件有改动并新增本任务卡
+- commit：实现提交 `bd02252`，已按用户授权 cherry-pick 为本地主干 `d731920`；最终验收
+  记录由后续纯文档提交补齐
+- 当前 `git status --short --branch`：实现提交后任务 worktree 无代码改动；本地主干仅有
+  用户原有未跟踪图片和 `output/`，均未读取或改动
 - 建议下一步：由用户在本地主干重启实例，完成真实微信绑定与到点发送手工验收
 
 ## 负责人验收
