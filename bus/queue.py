@@ -10,9 +10,12 @@ CLI 等）把收到的用户消息封装成 :class:`InboundMessage` 投递进
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import asyncio
+
+if TYPE_CHECKING:
+    from reminders.models import DeliveryResult
 
 
 @dataclass
@@ -54,6 +57,9 @@ class OutboundMessage:
     # Agent 本轮生成、准备随回复发送的图片引用。渠道自行决定如何呈现：
     # 飞书会上传后发送 image 消息；Web 已由流事件展示；CLI 可忽略。
     images: Optional[List[ImageRef]] = None
+    # Optional acknowledgement for callers that need the channel's API result.
+    # Ordinary conversation messages leave it as None and remain fire-and-forget.
+    delivery_future: "asyncio.Future[DeliveryResult] | None" = None
 
 
 @dataclass

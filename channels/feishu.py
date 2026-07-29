@@ -27,6 +27,7 @@ import os
 import re
 import threading
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
@@ -39,6 +40,9 @@ from lark_oapi.api.im.v1 import (
 
 from channels.base import Channel
 from bus.queue import InboundMessage, OutboundMessage
+
+if TYPE_CHECKING:
+    from reminders.models import DeliveryResult
 
 logger = logging.getLogger("nanoclaw.feishu")
 
@@ -80,8 +84,17 @@ class _PendingImageBatch:
 class FeishuChannel(Channel):
     """飞书长连接渠道（name 固定为 ``"feishu"``）。"""
 
-    def __init__(self, name: str, bus, app_id: str, app_secret: str,
-                 image_store=None, image_merge_window_sec: float = 10.0) -> None:
+    def __init__(
+        self,
+        name: str,
+        bus,
+        app_id: str,
+        app_secret: str,
+        image_store=None,
+        image_merge_window_sec: float = 10.0,
+        bind_callback=None,
+        unbind_callback=None,
+    ) -> None:
         super().__init__(name=name, bus=bus)
         self.app_id = app_id
         self.app_secret = app_secret
@@ -107,6 +120,10 @@ class FeishuChannel(Channel):
         # _sessions: chat_id -> {"seq": 已建会话数, "current": 当前活动序号}
         self._sessions: dict = {}
         self._clear_callback = None    # 清空历史回调（/clear 命令调用，同 CLI）
+        # ReminderService owns persistence and authorization; this channel only
+        # recognizes deterministic p2p commands and forwards identity fields.
+        self._bind_callback = bind_callback
+        self._unbind_callback = unbind_callback
 
     async def start(self) -> None:
         """捕获主事件循环，建好长连接客户端并在后台线程启动监听。"""
@@ -199,12 +216,21 @@ class FeishuChannel(Channel):
             # 命令也是图片批次边界，但不能成为图片说明。放到主事件循环处理，
             # 与图片等待状态串行；命令本身仍在 SDK 线程立即执行，确保紧随其后的
             # 新消息能读取到 /new、/switch 更新后的会话序号。
-            if text.split()[0] in ("/new", "/sessions", "/switch", "/clear"):
+            if text.split()[0] in (
+                "/new",
+                "/sessions",
+                "/switch",
+                "/clear",
+                "/bind-reminders",
+                "/unbind-reminders",
+            ):
                 asyncio.run_coroutine_threadsafe(
                     self._handle_pending_for_command(chat_id, text, sequence),
                     self._loop,
                 )
-                self._try_handle_command(chat_id, text)
+                self._try_handle_command(
+                    chat_id, text, chat_type=chat_type, sender_open_id=sender_open_id
+                )
                 return
 
             # 正常文本也进入主事件循环：若同一用户有待处理图片则合并，否则立即投递。
@@ -506,7 +532,13 @@ class FeishuChannel(Channel):
             self._sessions[chat_id] = st
         return st
 
-    def _try_handle_command(self, chat_id: str, text: str) -> bool:
+    def _try_handle_command(
+        self,
+        chat_id: str,
+        text: str,
+        chat_type: str = "p2p",
+        sender_open_id: str | None = None,
+    ) -> bool:
         """解析飞书内置命令。命中返回 True（已回复，调用方跳过 Agent）。
 
         命令与 CLI 完全对称：/new 开新会话、/sessions 列表、/switch <n> 切换、
@@ -516,8 +548,32 @@ class FeishuChannel(Channel):
         if not parts:
             return False
         cmd = parts[0]
-        if cmd not in ("/new", "/sessions", "/switch", "/clear"):
+        if cmd not in (
+            "/new",
+            "/sessions",
+            "/switch",
+            "/clear",
+            "/bind-reminders",
+            "/unbind-reminders",
+        ):
             return False
+
+        if cmd in ("/bind-reminders", "/unbind-reminders"):
+            if chat_type != "p2p":
+                self._reply(chat_id, "请在与机器人的私聊中使用提醒绑定命令。")
+                return True
+            callback = (
+                self._bind_callback
+                if cmd == "/bind-reminders"
+                else self._unbind_callback
+            )
+            if callback is None:
+                self._reply(chat_id, "⚠️ 当前实例未启用主动提醒服务。")
+                return True
+            self._schedule_binding_callback(
+                chat_id, sender_open_id or "", callback, cmd
+            )
+            return True
 
         st = self._session_state(chat_id)
         if cmd == "/new":
@@ -551,6 +607,31 @@ class FeishuChannel(Channel):
             self._reply(chat_id, f"🧹 当前会话 #{st['current']} 历史已清空")
         return True
 
+    def _schedule_binding_callback(
+        self, chat_id: str, open_id: str, callback, command: str
+    ) -> None:
+        """Run a synchronous or asynchronous binding callback on the main loop."""
+
+        async def run_callback() -> None:
+            try:
+                outcome = callback(chat_id, open_id)
+                if hasattr(outcome, "__await__"):
+                    outcome = await outcome
+                default = (
+                    "✅ 已绑定主动提醒。"
+                    if command == "/bind-reminders"
+                    else "✅ 已解绑主动提醒。"
+                )
+                self._reply(
+                    chat_id,
+                    outcome if isinstance(outcome, str) and outcome else default,
+                )
+            except Exception as exc:  # noqa: BLE001 - keep details out of user reply
+                logger.exception("提醒绑定命令失败：%s", exc)
+                self._reply(chat_id, "⚠️ 提醒设置失败，请稍后重试。")
+
+        asyncio.run_coroutine_threadsafe(run_callback(), self._loop)
+
     def _reply(self, chat_id: str, text: str) -> None:
         """命令确认等轻量回复：直接经 bus 回飞书，绕过 Agent。"""
         asyncio.run_coroutine_threadsafe(
@@ -563,26 +644,39 @@ class FeishuChannel(Channel):
             self._loop,
         )
 
-    async def send(self, message: OutboundMessage) -> None:
-        """把回复按 chat_id 发回飞书，长消息自动分片。"""
+    async def send(self, message: OutboundMessage) -> "DeliveryResult":
+        """Send one logical reply and report whether Feishu accepted it."""
         chat_id = message.chat_id
         text = message.content or ""
         if not chat_id:
             logger.warning("飞书回复缺少 chat_id，已丢弃")
-            return
+            return self._delivery_result(
+                success=False, code="missing_chat_id", message="missing chat_id"
+            )
 
         # Gateway 现在会附带结构化 ImageRef；优先使用它，避免用户在
         # Agent 执行期间切换会话时按“当前会话”找错图片。image_id 文本解析
         # 仅作为与旧 Gateway 的兼容回退。
         image_refs = self._outbound_image_refs(message)
+        image_failure = None
+        last_result = None
+        strict_delivery = message.delivery_future is not None
         for index, ref in enumerate(image_refs):
-            await self._send_image(chat_id, ref)
+            result = await self._send_image(chat_id, ref)
+            if not result.success:
+                # Reliable reminders are all-or-stop.  Ordinary chat keeps the
+                # historical text fallback when an attached image fails.
+                if strict_delivery or not text:
+                    return result
+                image_failure = result
+                break
+            last_result = result
             if index < len(image_refs) - 1:
                 await asyncio.sleep(_CHUNK_SLEEP)
 
         # 纯图片回复不额外发送空文本；普通文本仍保持原来的分片行为。
         if not text and image_refs:
-            return
+            return last_result
 
         # 按字符切分；无图片且内容为空时仍发一条占位，保持原有行为。
         chunks = [text[i:i + _MAX_CHUNK] for i in range(0, len(text), _MAX_CHUNK)] or [""]
@@ -600,19 +694,13 @@ class FeishuChannel(Channel):
                 )
                 .build()
             )
-            try:
-                # 网络调用放到线程里，避免阻塞主事件循环
-                resp = await asyncio.to_thread(
-                    self._client.im.v1.message.create, request
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("飞书发送消息失败：%s", exc)
-                return
-            if not resp.success():
-                logger.error("飞书发送失败：code=%s msg=%s", resp.code, resp.msg)
-                return
+            result = await self._send_request(self._client.im.v1.message.create, request)
+            if not result.success:
+                return result
+            last_result = result
             if i < len(chunks) - 1:
                 await asyncio.sleep(_CHUNK_SLEEP)
+        return image_failure or last_result
 
     def _outbound_image_refs(self, message: OutboundMessage) -> list:
         if message.images:
@@ -629,14 +717,10 @@ class FeishuChannel(Channel):
                 refs.append(ref)
         return refs
 
-    async def _send_image(self, chat_id: str, ref) -> None:
-        try:
-            image_key = await asyncio.to_thread(self._upload_image_sync, ref)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("飞书上传图片失败：%s", exc)
-            return
-        if not image_key:
-            return
+    async def _send_image(self, chat_id: str, ref) -> "DeliveryResult":
+        image_key, upload_failure = await self._upload_image(ref)
+        if upload_failure is not None:
+            return upload_failure
         payload = json.dumps({"image_key": image_key}, ensure_ascii=False)
         request = (
             CreateMessageRequest.builder()
@@ -650,16 +734,99 @@ class FeishuChannel(Channel):
             )
             .build()
         )
+        return await self._send_request(self._client.im.v1.message.create, request)
+
+    async def _upload_image(self, ref):
+        """Upload once; ReminderScheduler owns logical retries."""
         try:
-            resp = await asyncio.to_thread(self._client.im.v1.message.create, request)
+            response = await asyncio.to_thread(self._upload_image_sync, ref)
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:  # noqa: BLE001
-            logger.exception("飞书发送图片消息失败：%s", exc)
-            return
-        if not resp.success():
-            logger.error("飞书发送图片失败：code=%s msg=%s", resp.code, resp.msg)
+            return None, self._delivery_result(
+                success=False, retryable=True, message=str(exc)
+            )
+        if response is None:
+            return None, self._delivery_result(
+                success=False, message="image upload failed"
+            )
+        code = getattr(response, "code", None)
+        if response.success():
+            image_key = getattr(getattr(response, "data", None), "image_key", None)
+            if image_key:
+                return image_key, None
+            return None, self._delivery_result(
+                success=False,
+                code=code,
+                message="image upload returned no image key",
+            )
+        return None, self._delivery_result(
+            success=False,
+            retryable=self._retryable_code(code),
+            code=code,
+            message=f"Feishu image upload error {code}: "
+            f"{getattr(response, 'msg', '')}",
+        )
+
+    async def _send_request(self, request_fn, request) -> "DeliveryResult":
+        """Make one SDK request and classify the result for the scheduler."""
+        try:
+            response = await asyncio.to_thread(request_fn, request)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - SDK transport failure
+            logger.exception("飞书发送请求失败：%s", exc)
+            return self._delivery_result(
+                success=False, retryable=True, message=str(exc)
+            )
+
+        code = getattr(response, "code", None)
+        if response.success():
+            return self._delivery_result(
+                success=True,
+                code=code,
+                message=getattr(response, "msg", None) or "accepted",
+                provider_message_id=self._provider_message_id(response),
+            )
+        message = f"Feishu API error {code}: {getattr(response, 'msg', '')}"
+        logger.error("飞书发送失败：%s", message)
+        return self._delivery_result(
+            success=False,
+            retryable=self._retryable_code(code),
+            code=code,
+            message=message,
+        )
+
+    @staticmethod
+    def _retryable_code(code) -> bool:
+        return code == 429 or (isinstance(code, int) and 500 <= code < 600)
+
+    @staticmethod
+    def _provider_message_id(response) -> str | None:
+        data = getattr(response, "data", None)
+        return getattr(data, "message_id", None) if data is not None else None
+
+    @staticmethod
+    def _delivery_result(
+        *,
+        success: bool,
+        retryable: bool = False,
+        code: int | str | None = None,
+        provider_message_id: str | None = None,
+        message: str | None = None,
+    ) -> "DeliveryResult":
+        from reminders.models import DeliveryResult
+
+        return DeliveryResult(
+            success=success,
+            retryable=retryable,
+            code=code,
+            provider_message_id=provider_message_id,
+            message=message,
+        )
 
     def _upload_image_sync(self, ref):
-        """上传 ImageStore 图片并返回飞书 image_key；由 ``to_thread`` 调用。"""
+        """上传 ImageStore 图片并返回 SDK response；由 ``to_thread`` 调用。"""
         if not os.path.isfile(ref.path):
             logger.warning("待发送图片已不存在：%s", ref.path)
             return None
@@ -685,8 +852,7 @@ class FeishuChannel(Channel):
             resp = self._client.im.v1.image.create(request)
         if not resp.success() or not getattr(resp, "data", None):
             logger.error("飞书图片上传失败：code=%s msg=%s", resp.code, resp.msg)
-            return None
-        return getattr(resp.data, "image_key", None)
+        return resp
 
     async def stop(self) -> None:
         """取消图片等待任务并清理尚未投递的图片。"""

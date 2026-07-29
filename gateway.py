@@ -13,12 +13,35 @@ Gateway 是「渠道无关」的运行时核心。它不关心消息具体来自
 """
 
 import asyncio
-from typing import Callable, Dict, List
+from typing import TYPE_CHECKING, Callable, Dict, List
 
 from bus.queue import MessageBus, InboundMessage, OutboundMessage, StreamEvent
 from channels.base import Channel
 from agent.identity import IdentityBootstrapper
 from agent.loop import AgentLoop
+
+if TYPE_CHECKING:
+    from reminders.models import DeliveryResult
+
+
+def _delivery_result(
+    *,
+    success: bool,
+    retryable: bool = False,
+    code: int | str | None = None,
+    provider_message_id: str | None = None,
+    message: str | None = None,
+) -> "DeliveryResult":
+    """Create the shared DTO lazily so normal startup stays loosely coupled."""
+    from reminders.models import DeliveryResult
+
+    return DeliveryResult(
+        success=success,
+        retryable=retryable,
+        code=code,
+        provider_message_id=provider_message_id,
+        message=message,
+    )
 
 
 class Gateway:
@@ -181,8 +204,48 @@ class Gateway:
             if channel is None:
                 # 找不到对应渠道就告警并丢弃，不阻塞分发循环
                 print(f"⚠️ 出站消息找不到渠道 '{msg.channel}'，已丢弃")
+                if msg.delivery_future is not None:
+                    self._complete_delivery(
+                        msg,
+                        _delivery_result(
+                            success=False,
+                            code="channel_not_found",
+                            message=f"channel not found: {msg.channel}",
+                        ),
+                    )
                 continue
-            await channel.send(msg)
+            try:
+                result = await channel.send(msg)
+            except asyncio.CancelledError:
+                if msg.delivery_future is not None:
+                    self._complete_delivery(
+                        msg, _delivery_result(success=False, message="dispatch cancelled")
+                    )
+                raise
+            except Exception as exc:  # noqa: BLE001 - one failure must not kill routing
+                print(f"⚠️ 出站消息发送失败（{msg.channel}）：{exc}")
+                if msg.delivery_future is not None:
+                    self._complete_delivery(
+                        msg, _delivery_result(success=False, message=str(exc))
+                    )
+                continue
+            if msg.delivery_future is not None:
+                self._complete_delivery(
+                    msg,
+                    result
+                    or _delivery_result(
+                        success=False, message="channel returned no delivery result"
+                    ),
+                )
+
+    @staticmethod
+    def _complete_delivery(
+        msg: OutboundMessage, result: "DeliveryResult"
+    ) -> None:
+        """Resolve an optional acknowledgement at most once on every path."""
+        future = msg.delivery_future
+        if future is not None and not future.done():
+            future.set_result(result)
 
     async def shutdown(self) -> None:
         """取消在途消息，停止所有渠道并清空 Agent 缓存。"""

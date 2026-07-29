@@ -11,5 +11,6 @@ dependencies = [
     "lark-oapi>=1.7.1",
     "mcp>=1.28.1",
     "openai>=2.46.0",
+    "python-dateutil>=2.9.0.post0",
     "pyyaml>=6.0.3",
 ]

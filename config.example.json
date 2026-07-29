@@ -63,5 +63,15 @@
     "max_text_chars": 4000,
     "max_audio_bytes": 16777216,
     "max_concurrency": 2
+  },
+  "reminders": {
+    "enabled": true,
+    "database_path": "workspace/reminders.db",
+    "delivery_timeout_sec": 30,
+    "max_delivery_attempts": 3,
+    "max_agent_attempts": 3,
+    "lease_seconds": 900,
+    "max_sleep_seconds": 3600,
+    "once_grace_seconds": 3600
   }
 }

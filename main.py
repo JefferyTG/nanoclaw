@@ -18,6 +18,7 @@ import asyncio
 import os
 import signal
 import sys
+from datetime import timedelta
 
 from config import load_config
 from providers.openai_compat import OpenAICompatProvider
@@ -33,6 +34,11 @@ from agent.tools.web_search import WebSearchTool
 from agent.tools.web_fetch import WebFetchTool
 from agent.tools.skills_tools import ListSkillsTool, LoadSkillTool, ReadSkillResourceTool
 from agent.tools.spawn import SpawnSubagentTool
+from agent.tools.reminders import (
+    CancelReminderTool,
+    CreateReminderTool,
+    ListRemindersTool,
+)
 from agent.tools.agent_profiles import (
     CreateAgentPrivateTool,
     CreateAgentSkillTool,
@@ -58,11 +64,15 @@ from agent.tools.vision import AskImageTool
 from agent.tools.imagegen import GenerateImageTool
 from agent.imagestore import ImageStore
 
-from bus.queue import MessageBus
+from bus.queue import MessageBus, OutboundMessage
 from gateway import Gateway
 from channels.cli import CLIChannel
 from channels.feishu import FeishuChannel
 from channels.web import WebChannel
+from reminders.models import DeliveryResult
+from reminders.repository import ReminderRepository
+from reminders.scheduler import ReminderScheduler, SystemClock
+from reminders.service import AsyncReminderRepository, ReminderService
 
 
 # 配置文件路径（网页渠道配置页也写回同一文件）
@@ -151,6 +161,19 @@ def build_tts_service(config):
     return service
 
 
+def build_reminder_service(config):
+    """Create the dedicated reminder store and application service when enabled."""
+
+    settings = config.reminders if isinstance(config.reminders, dict) else {}
+    if not settings.get("enabled", True):
+        return None, None
+    database_path = os.fspath(settings.get("database_path") or "workspace/reminders.db")
+    if not os.path.isabs(database_path):
+        database_path = os.path.join(config.workspace, database_path)
+    repository = ReminderRepository(database_path)
+    return repository, ReminderService(repository)
+
+
 def build_shared() -> dict:
     """创建跨会话共享的组件，返回供 agent_factory 复用的配置字典。
 
@@ -190,6 +213,11 @@ def build_shared() -> dict:
     tools.register(ExecTool(config.workspace))
     tools.register(WebSearchTool())
     tools.register(WebFetchTool())
+    reminder_repository, reminder_service = build_reminder_service(config)
+    if reminder_service is not None:
+        tools.register(CreateReminderTool(reminder_service))
+        tools.register(ListRemindersTool(reminder_service))
+        tools.register(CancelReminderTool(reminder_service))
     # 技能工具：让模型能主动枚举与读取技能正文
     tools.register(ListSkillsTool(skills_loader))
     tools.register(LoadSkillTool(skills_loader))
@@ -326,6 +354,8 @@ def build_shared() -> dict:
         "scene_tool_assets": scene_tool_assets,
         "tool_factories": tool_factories,
         "agents_summary": agents_summary,
+        "reminder_repository": reminder_repository,
+        "reminder_service": reminder_service,
     }
 
 
@@ -404,6 +434,92 @@ async def amain() -> None:
     agents_registry: dict = {}
     factory = make_agent_factory(shared, agents_registry)
 
+    reminder_scheduler = None
+    reminder_scheduler_task = None
+    reminder_service = shared.get("reminder_service")
+    reminder_repository = shared.get("reminder_repository")
+
+    if reminder_service is not None and reminder_repository is not None:
+        reminder_settings = shared["config"].reminders
+        reminder_clock = SystemClock()
+        async_repository = AsyncReminderRepository(
+            reminder_repository,
+            clock=reminder_clock.now,
+            once_grace=timedelta(
+                seconds=float(reminder_settings.get("once_grace_seconds", 3600))
+            ),
+        )
+
+        async def clear_scheduled_session(session_key: str) -> None:
+            agents_registry.pop(session_key, None)
+            await asyncio.to_thread(shared["session_manager"].clear, session_key)
+            await asyncio.to_thread(shared["image_store"].clear, session_key)
+
+        async def scheduled_agent_runner(prompt: str, session_key: str) -> str:
+            # A scheduled execution is deliberately isolated from daily chat and
+            # from a previous crashed attempt. SQLite retains its durable output.
+            await clear_scheduled_session(session_key)
+            agent = factory(session_key)
+            try:
+                return await agent.run(prompt)
+            finally:
+                await clear_scheduled_session(session_key)
+
+        async def cleanup_scheduled_task(task_id: int) -> None:
+            execution_ids = await asyncio.to_thread(
+                reminder_repository.list_execution_ids, task_id
+            )
+            for execution_id in execution_ids:
+                await clear_scheduled_session(
+                    f"scheduled:{task_id}:{execution_id}"
+                )
+
+        async def deliver_reminder(execution, output: str) -> DeliveryResult:
+            target = await asyncio.to_thread(reminder_repository.get_active_target)
+            if target is None or target.target_id != execution.target_id:
+                result = DeliveryResult(
+                    success=False,
+                    retryable=True,
+                    code="target_unbound",
+                    message="飞书提醒目标已解绑；同一用户重新绑定后可继续发送。",
+                )
+                async_repository.remember_delivery_result(execution.id, result)
+                return result
+            delivery_future = asyncio.get_running_loop().create_future()
+            await bus.publish_outbound(
+                OutboundMessage(
+                    channel="feishu",
+                    chat_id=target.chat_id,
+                    content=output,
+                    delivery_future=delivery_future,
+                )
+            )
+            result = await delivery_future
+            async_repository.remember_delivery_result(execution.id, result)
+            return result
+
+        reminder_scheduler = ReminderScheduler(
+            async_repository,
+            scheduled_agent_runner,
+            deliver_reminder,
+            clock=reminder_clock,
+            lease_duration=timedelta(
+                seconds=float(reminder_settings.get("lease_seconds", 900))
+            ),
+            max_sleep=timedelta(
+                seconds=float(reminder_settings.get("max_sleep_seconds", 3600))
+            ),
+            delivery_timeout=float(
+                reminder_settings.get("delivery_timeout_sec", 30)
+            ),
+            max_delivery_attempts=int(
+                reminder_settings.get("max_delivery_attempts", 3)
+            ),
+            max_agent_attempts=int(reminder_settings.get("max_agent_attempts", 3)),
+        )
+        reminder_service.attach_scheduler(reminder_scheduler)
+        reminder_service.attach_cleanup(cleanup_scheduled_task)
+
     def clear_callback(session_key: str) -> None:
         """/clear 命令回调：按完整 session_key 清空对应会话历史。
 
@@ -463,6 +579,12 @@ async def amain() -> None:
             cfg.feishu_app_secret,
             image_store=shared["image_store"],
             image_merge_window_sec=cfg.feishu_image_merge_window_sec,
+            bind_callback=(
+                reminder_service.bind_feishu if reminder_service is not None else None
+            ),
+            unbind_callback=(
+                reminder_service.unbind_feishu if reminder_service is not None else None
+            ),
         )
         feishu_channel._clear_callback = clear_callback  # 复用同一清空回调
         channels.append(feishu_channel)
@@ -503,6 +625,8 @@ async def amain() -> None:
     inbound_task = asyncio.create_task(gateway._process_inbound())
     outbound_task = asyncio.create_task(gateway._dispatch_outbound())
     stream_task = asyncio.create_task(gateway._dispatch_stream())
+    if reminder_scheduler is not None:
+        reminder_scheduler_task = reminder_scheduler.start()
 
     # Linux 管理脚本使用 SIGTERM 停止进程；显式转成 asyncio 事件后，渠道、
     # Agent 与 MCP 都会走下方的统一清理流程，而不是被操作系统直接截断。
@@ -518,6 +642,8 @@ async def amain() -> None:
 
     shutdown_waiter = asyncio.create_task(shutdown_event.wait())
     watched = {inbound_task, shutdown_waiter}
+    if reminder_scheduler_task is not None:
+        watched.add(reminder_scheduler_task)
     if cli_task_index is not None:
         watched.add(start_tasks[cli_task_index])
     await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
@@ -529,6 +655,9 @@ async def amain() -> None:
             task.cancel()
     shutdown_waiter.cancel()
 
+    if reminder_scheduler is not None:
+        await reminder_scheduler.stop()
+
     inbound_task.cancel()     # 结束网关入站/出站循环
     outbound_task.cancel()
     stream_task.cancel()
@@ -538,6 +667,7 @@ async def amain() -> None:
         outbound_task,
         stream_task,
         shutdown_waiter,
+        *([reminder_scheduler_task] if reminder_scheduler_task is not None else []),
         return_exceptions=True,
     )
     for sig in installed_signals:

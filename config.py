@@ -47,6 +47,8 @@ _CONFIG_FIELDS = (
     "asr_model",
     # 文字转语音：首版使用 edge-tts；服务端能力与网页自动朗读开关相互独立。
     "tts_model",
+    # 主动提醒：独立 SQLite、lease、回执等待和动态唤醒参数；均为启动期配置。
+    "reminders",
 )
 
 
@@ -148,6 +150,20 @@ class NanoClawConfig:
             "max_concurrency": 2,
         }
     )
+    # 提醒数据库位于 workspace 下的独立持久库，不与可重建的 memory/index.db 混用。
+    # 第一版发送到显式绑定的飞书私聊；所有参数修改后需重启实例。
+    reminders: dict = field(
+        default_factory=lambda: {
+            "enabled": True,
+            "database_path": "workspace/reminders.db",
+            "delivery_timeout_sec": 30,
+            "max_delivery_attempts": 3,
+            "max_agent_attempts": 3,
+            "lease_seconds": 900,
+            "max_sleep_seconds": 3600,
+            "once_grace_seconds": 3600,
+        }
+    )
 
 
 def load_config(config_path: str = "config.json") -> NanoClawConfig:
@@ -172,7 +188,7 @@ def load_config(config_path: str = "config.json") -> NanoClawConfig:
             if key in data and data[key] is not None:
                 # ASR/TTS 配置允许只覆盖少数字段；其余继续使用当前代码默认值，
                 # 方便未来新增可选参数而不要求用户立刻重写旧 config.json。
-                if key in ("asr_model", "tts_model") and isinstance(data[key], dict):
+                if key in ("asr_model", "tts_model", "reminders") and isinstance(data[key], dict):
                     merged = dict(getattr(cfg, key))
                     merged.update(data[key])
                     setattr(cfg, key, merged)

@@ -10,9 +10,15 @@
 渠道保持纯粹的消息搬运角色。
 """
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING
 
 from bus.queue import MessageBus, OutboundMessage
+
+if TYPE_CHECKING:
+    from reminders.models import DeliveryResult
 
 
 class Channel(ABC):
@@ -36,8 +42,8 @@ class Channel(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def send(self, message: OutboundMessage) -> None:
-        """把一条出站回复下发回该渠道。"""
+    async def send(self, message: OutboundMessage) -> DeliveryResult | None:
+        """把一条出站回复下发回渠道，并可返回结构化 API 接受结果。"""
         raise NotImplementedError
 
     async def stop(self) -> None:

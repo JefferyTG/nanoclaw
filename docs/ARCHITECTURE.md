@@ -46,6 +46,7 @@ flowchart LR
     TOOLS["ToolRegistry"]
     STATE["Session / Memory / Image state"]
     MCP["MCP Servers"]
+    REM["ReminderScheduler\nSQLite / RRULE / lease"]
 
     Channels <--> BUS
     BUS <--> GW
@@ -55,6 +56,8 @@ flowchart LR
     LOOP <--> TOOLS
     LOOP <--> STATE
     TOOLS <--> MCP
+    TOOLS --> REM
+    REM --> BUS
 ```
 
 依赖方向的核心约束：
@@ -64,6 +67,7 @@ flowchart LR
 - Gateway 依赖 Bus、Channel 抽象和 AgentLoop，负责按 `session_key` 调度。
 - AgentLoop 依赖 Provider 抽象、ToolRegistry、ContextBuilder、SessionManager 和 MemoryConsolidation。
 - 具体工具才依赖 `httpx`、`ddgs`、MCP 等外部能力。
+- ReminderScheduler 只依赖异步仓储协议、Agent runner 和 Bus delivery 回调；SQLite 是任务事实源。
 
 ## 4. 目录和模块职责
 
@@ -89,6 +93,7 @@ nanoclaw/
 ├── bus/queue.py            # DTO 和三个 asyncio.Queue
 ├── channels/               # CLI、飞书、Web 渠道适配器
 ├── providers/              # 模型抽象和 OpenAI-compatible 实现
+├── reminders/              # DTO、RFC 5545、SQLite 仓储、调度器和应用服务
 ├── voice/                  # 音频校验/规范化、ASR/TTS 抽象与 Provider
 ├── bin/nanoclawctl         # Linux 后台进程启动、停止、重启与状态查询
 ├── session/manager.py      # 一会话一 JSONL、恢复和自愈
@@ -110,11 +115,11 @@ nanoclaw/
 ### 5.1 启动与装配
 
 1. `main.main()` 进入 `asyncio.run(amain())`。
-2. `build_shared()` 加载配置，创建基础 Provider、SkillsLoader、ToolRegistry、ContextBuilder、SessionManager、ImageStore、MemorySearcher、DailyMemory 和 MemoryConsolidation。
+2. `build_shared()` 加载配置，创建基础 Provider、SkillsLoader、ToolRegistry、ContextBuilder、SessionManager、ImageStore、MemorySearcher、DailyMemory、MemoryConsolidation，以及启用时的 ReminderRepository/ReminderService。
 3. 启动时重建记忆/会话 SQLite 索引。
 4. MCPClientManager 按配置拉起 stdio Server，并把远端工具包装进同一个 ToolRegistry。
 5. 根据终端、飞书凭证和 `web_port` 启用 Channel。
-6. 启动渠道任务及 Gateway 的入站、出站、流事件三个消费循环。
+6. 启动渠道任务、Gateway 的入站/出站/流事件消费循环，以及单一 ReminderScheduler；关闭时先停止调度器，再停止出站分发和渠道。
 
 若配置的人设文件不存在或为空，Gateway 会在创建会话 Agent 前调用实例级 `IdentityBootstrapper`。首条消息只触发询问，同一会话下一条文本生成工作区内的人设文件；引导消息不调用模型、不进入会话历史。人设创建后 ContextBuilder 每轮重读文件，因此无需重启。多渠道并发由 Bootstrapper 的实例级锁协调，任一渠道完成后其它渠道直接进入正常流程。
 
@@ -185,13 +190,14 @@ workspace/
 ├── sessions/
 │   ├── <safe_session_key>.jsonl
 │   └── <safe_session_key>_images/
-└── memory/
-    ├── USER.md
-    ├── MEMORY.md
-    ├── HISTORY.md
-    ├── followups.jsonl
-    ├── daily/YYYY-MM-DD.md
-    └── index.db
+├── memory/
+│   ├── USER.md
+│   ├── MEMORY.md
+│   ├── HISTORY.md
+│   ├── followups.jsonl
+│   ├── daily/YYYY-MM-DD.md
+│   └── index.db
+└── reminders.db            # 独立、不可重建的提醒事实库（WAL）
 ```
 
 - JSONL 保存 user、assistant 和 tool 消息；system prompt 每轮重建，不落盘。
@@ -199,6 +205,46 @@ workspace/
 - 子 Agent 图片沿用父会话 key；父 `assistant(tool_calls)` 记录保存有界的 `subagent_runs` 回放摘要和 `generated_images`。这些 UI 元数据在恢复模型上下文前会被剥离。
 - USER 偏长期个人信息，MEMORY 偏项目/工作事实，HISTORY 保存压缩轨迹，daily 保存 best-effort 事件摘要。
 - MemorySearcher 启动时重建全部索引；每次搜索只刷新记忆文件部分，会话索引在当前进程内不会实时更新。
+
+### 5.5 主动提醒与定时 Agent
+
+`create_reminder`、`list_reminders`、`cancel_reminder` 是所有普通 Agent 会话共享的
+工具。工具不接受 `chat_id`；ReminderService 只从数据库中当前有效的 `target_id`
+解析发送目标。目标只能由 FeishuChannel 在 p2p 中识别确定性命令
+`/bind-reminders`、`/unbind-reminders` 后写入，并以 `open_id` 保持实例所有权。
+
+任务保存本地 `DTSTART`、IANA timezone、规范 RFC 5545 RRULE 和
+`next_run_at_utc`。ReminderScheduler 不做秒级轮询，也不为每个任务保留协程：它读取
+SQLite 中最早唤醒时间，通过一个 `asyncio.Event` 和动态 timeout 等待。新建、取消、
+重绑或重试会唤醒它；启动和低频安全校时会恢复过期 lease。一次性任务只在默认一小时
+窗口内补发，周期任务只保留最近一次错过的 occurrence，下一次始终从计划时间推导。
+
+```mermaid
+sequenceDiagram
+    participant S as ReminderScheduler
+    participant R as SQLite Repository
+    participant A as AgentLoop (scheduled session)
+    participant B as MessageBus/Gateway
+    participant F as FeishuChannel/API
+    S->>R: atomic claim + lease
+    alt message
+        S->>R: persist delivery_text as output
+    else agent
+        S->>A: run agent_prompt in scheduled:task:execution
+        A-->>S: generated text
+        S->>R: persist exact output before delivery
+    end
+    S->>B: OutboundMessage + delivery_future
+    B->>F: send once
+    F-->>B: DeliveryResult
+    B-->>S: resolve acknowledgement
+    S->>R: success / retry_wait / failed + next occurrence
+```
+
+动态任务使用 `scheduled:<task_id>:<execution_id>` 独立临时会话；生成后立即保存输出
+并清理 SessionManager/ImageStore。发送失败只重发该输出，不重复调用 Agent。回执表示
+飞书 API 已接受，不表示用户已读。第一版采用 at-least-once：若进程在飞书接受后、
+SQLite 成功提交前崩溃，重启后存在极小概率重复发送。
 
 ## 6. 配置生效边界
 
@@ -209,6 +255,7 @@ workspace/
 - Web host/port、MCP 连接、技能摘要、工具注册、workspace 绑定、共享记忆 Provider 等启动期对象需要重启才能一致生效。
 - `base_model_multimodal` 决定是否注册 `ask_image`，因此修改后必须重启。
 - `asr_model` 和 `tts_model` 都是启动期服务配置；页面的 TTS 喇叭开关只是当前标签页内存状态，刷新后默认关闭。
+- `reminders` 的数据库路径、超时、lease、校时与尝试上限都是启动期配置；Web 保存后需重启。
 
 ## 7. 扩展点
 

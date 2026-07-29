@@ -19,6 +19,7 @@ NanoClaw 把「大模型推理」与「消息渠道」解耦：模型在本地�
 - **会话持久化**：对话落盘为 JSONL，重启后可侧边栏查看、接上、删除。
 - **人设可定制**：通过 `identity.md`（不随仓库发布）定义语气与角色；首次缺失时会在聊天渠道中引导用户创建。
 - **长上下文优化**：System Prompt 把易变内容（当前时间）置于末尾，固定前缀稳定命中 Prompt Cache。
+- **主动提醒**：CLI、Web 或飞书都能让 Agent 创建、查询、取消任务；到点只向显式绑定的飞书私聊发送，支持静态提醒和实时 Agent 任务。
 
 ---
 
@@ -43,6 +44,7 @@ flowchart LR
 
     TOOLS[内置工具 Tools]
     MCP[MCPClientManager\n外部 MCP Server]
+    REM[ReminderScheduler\nSQLite + RRULE]
 
     FS --> BUS
     WEB --> BUS
@@ -53,6 +55,8 @@ flowchart LR
     LOOP <--> PROV
     LOOP --> TOOLS
     LOOP --> MCP
+    TOOLS --> REM
+    REM --> BUS
 ```
 
 - **消息总线**：渠道与网关的运行时解耦层，避免相互直接依赖。
@@ -78,6 +82,7 @@ nanoclaw/
 ├── bus/                    # 消息总线
 ├── channels/               # 渠道：feishu.py / web.py / cli.py
 ├── providers/              # 模型 Provider（OpenAI 兼容，支持流式）
+├── reminders/              # RRULE、SQLite 状态机、调度器和应用服务
 ├── voice/                  # 音频规范化与可替换 ASR Provider
 ├── session/                # 会话管理（JSONL 持久化）
 ├── skills/                 # 本地技能（SKILL.md）
@@ -152,6 +157,7 @@ uv run python main.py
 | `image_gen_model` | 生图服务配置；`timeout_sec` 是单次 HTTP 请求上限，`total_timeout_sec` 是包含重试、退避与下载的整次任务预算 | 单次 `120` 秒 / 总计 `600` 秒 |
 | `asr_model` | 网页语音识别 Provider、模型、地址、超时、大小与 FFmpeg 配置 | 默认关闭 |
 | `tts_model` | 网页自动朗读的 Provider、音色、语速、超时与资源上限 | Edge TTS 后端就绪，页面默认关闭 |
+| `reminders` | 主动提醒开关、独立 SQLite 路径、回执/lease/低频校时与重试上限；均在重启后生效 | 启用，`workspace/reminders.db` |
 
 ---
 
@@ -165,6 +171,13 @@ uv run python main.py
 4. 运行后应用会建立 WebSocket 长连接，自动重连。
 
 飞书私聊支持直接发送 PNG、JPEG、GIF、WEBP 或 BMP 图片，图片会复用网页端已有的视觉理解流程；Agent 或子 Agent 通过 `generate_image` 产生的图片会作为飞书图片消息发送。收到图片后默认等待 10 秒：同一用户随后发送的文字会与图片合并，连续发送图片会重置等待时间；超时后才使用默认图片分析提示。可通过 `feishu_image_merge_window_sec` 调整或关闭等待，修改后需重启实例。入站图片当前限制 20 MB，出站图片遵循飞书上传接口的 10 MB 限制。群聊仍遵守“仅被 @ 时响应”的规则，因此第一版建议在私聊中使用纯图片消息。
+
+主动提醒首次使用时，在与机器人的飞书私聊中发送 `/bind-reminders`。绑定成功后，
+可以从飞书、Web 或 CLI 用自然语言让 Agent 创建、查询或取消任务；任务始终发送到
+该已绑定私聊。`message` 任务到点直接发送创建时写好的正文，`agent` 任务到点才运行
+独立 Agent 会话获取实时内容。发送 `/unbind-reminders` 会暂停目标调度但保留任务，
+同一飞书用户重新绑定后恢复。绑定命令不接受群聊，一个实例也不能改绑给另一用户。
+“每隔一天”等存在不同理解时，Agent 会先确认，并在创建成功后列出未来最多三次时间。
 
 ### 网页
 

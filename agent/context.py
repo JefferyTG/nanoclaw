@@ -105,6 +105,25 @@ class ContextBuilder:
             "Follow Up 跟进：用户表达「以后研究X」「下次试试Y」等未来意向时，记入 workspace/memory/followups.jsonl（每行一个JSON：{topic,content,created,max_remind:2,reminded_count:0,status:\"open\"}）。用 read_file 读、write_file 写回完整内容（文件不存在则新建，JSONL 每行一个对象，写回要写全部行）。当你察觉用户当前话题与某个 open 状态 followup 的 topic 相关时，自然提一句，提醒后 reminded_count+1 写回；达 max_remind 或用户表示已处理/不感兴趣则 status 改 closed；超过30天未触发主动清理；用户要求不再提立即 closed。不要每轮都读 followups，只在话题可能相关时读。"
         )
 
+    @staticmethod
+    def _reminder_instructions() -> str:
+        """定时任务的可靠创建规则；工具未注册时模型会自然忽略不可用能力。"""
+        return (
+            "\n\n## 主动提醒与定时任务\n"
+            "当用户要求稍后提醒、周期提醒或到点执行 Agent 任务时，必须使用 "
+            "create_reminder 工具持久化，不能只口头答应。查询与取消分别使用 "
+            "list_reminders、cancel_reminder；若这些工具未出现在本轮可用工具中，"
+            "应明确说明当前实例未启用提醒能力。\n"
+            "创建前确认本地开始时间与 IANA 时区。‘每隔一天/每隔两天’等可能指不同"
+            "间隔的说法必须先向用户确认；不得自行猜测。工具成功后把返回的未来最多"
+            "三次执行时间清楚展示给用户。\n"
+            "message 任务的 delivery_text 是到点直接发送的最终正文：创建时就按当前"
+            "人设写成克制、准确、自包含的成稿，不要包含内部说明。agent 任务只保存"
+            "明确、可独立执行的 agent_prompt，到点才运行 Agent。\n"
+            "提醒只能投递到用户通过飞书私聊 /bind-reminders 显式绑定的目标；不得"
+            "编造、索取或向工具传入 chat_id。未绑定时原样转达工具给出的绑定指引。"
+        )
+
     def build_system_prompt(self) -> str:
         """拼接完整 System Prompt。
 
@@ -131,6 +150,7 @@ class ContextBuilder:
         if memory:
             sections.append("【长期记忆】\n" + memory)
         sections.append(self._memory_instructions())  # 记忆更新指引
+        sections.append(self._reminder_instructions())
         prompt = "\n\n".join(sections)
 
         # 若注入了技能摘要，追加「可用技能」段
