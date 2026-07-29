@@ -41,6 +41,11 @@ class InboundMessage:
     content: str                  # 消息正文
     raw: Optional[dict] = None    # 原始消息（各渠道 SDK 的原始结构），调试用
     images: Optional[List[ImageRef]] = None  # 随消息附带的图片引用（无则为 None）
+    # Optional handoff acknowledgement for a durable channel inbox.  The bus
+    # resolves it only after a consumer has removed this message from the
+    # in-memory queue, so the producer can retain its recovery record until
+    # the volatile handoff is complete.
+    acceptance_future: "asyncio.Future[None] | None" = None
 
 
 @dataclass
@@ -114,7 +119,13 @@ class MessageBus:
 
     async def consume_inbound(self) -> InboundMessage:
         """从 inbound_queue 取出一条入站消息，队列为空时自动等待。"""
-        return await self.inbound_queue.get()
+        message = await self.inbound_queue.get()
+        if (
+            message.acceptance_future is not None
+            and not message.acceptance_future.done()
+        ):
+            message.acceptance_future.set_result(None)
+        return message
 
     async def publish_outbound(self, msg: OutboundMessage) -> None:
         """投递一条出站消息到 outbound_queue（生产者侧）。"""

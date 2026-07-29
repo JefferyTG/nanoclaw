@@ -82,6 +82,7 @@
     ],
     "state_dir": "workspace/weixin",
     "allowed_user_ids": [],
+    "image_merge_window_sec": 10,
     "request_timeout_sec": 30,
     "login_timeout_sec": 480,
     "inbound_ack_timeout_sec": 30,

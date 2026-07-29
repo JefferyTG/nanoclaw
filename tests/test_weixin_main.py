@@ -23,6 +23,7 @@ class WeixinCompositionTests(unittest.TestCase):
                 "enabled": True,
                 "bridge_command": ["node", "bridge.mjs"],
                 "allowed_user_ids": ["user-1"],
+                "image_merge_window_sec": 3.5,
                 "request_timeout_sec": 12,
             }
             channel = build_weixin_channel(cfg, MessageBus(), object())
@@ -30,6 +31,7 @@ class WeixinCompositionTests(unittest.TestCase):
         self.assertEqual(channel.bridge_command, ("node", "bridge.mjs"))
         self.assertEqual(channel.allowed_user_ids, frozenset({"user-1"}))
         self.assertEqual(channel.command_timeout_sec, 12)
+        self.assertEqual(channel.image_merge_window_sec, 3.5)
         self.assertTrue(channel.auto_login)
         self.assertEqual(
             channel.state_dir,

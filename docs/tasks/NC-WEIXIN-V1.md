@@ -8,7 +8,7 @@
   - Bridge 实现：独占 `integrations/weixin_bridge/**`
   - Python Channel 实现：独占 `channels/weixin.py`、`tests/test_weixin_channel.py`
   - 安全/可靠性审查：实现结束后只读审查
-- 基线 commit / 分支：`f6e7a87` / detached HEAD
+- 基线 commit / 分支：`eed850f` / detached HEAD
 - 依赖任务：无
 
 ### 目标
@@ -265,3 +265,23 @@ git status --short --branch
 - 验收结论：离线验收通过；真实微信验收按明确非目标保留为授权后手工步骤。
 - 证据与备注：独立安全/可靠性复审提出的 QR headers、`binded_redirect`、
   `-14` context 代次及实际 vendor 使用四项 P1 均已修复并复审关闭；未发现 blocker。
+
+## 2026-07-29 实机反馈跟进
+
+- 问题：微信入站图片已生成无扩展名 `image_id`，但 `ask_image` 报图片未找到。
+- 根因：WeixinChannel 使用 `<target>` 保存图片，Gateway/AgentLoop 却使用
+  `weixin:<target>` 解析；无扩展名 ID 是 ImageStore 的正常公开标识，不是故障。
+- 修复：入站图片改用 Gateway 完整会话键；新增默认 10 秒的同用户图文
+  合并窗口，后续图片重置计时，`0` 表示关闭等待。
+- 可靠性：等待批次先以 `0700/0600` 权限原子落盘再确认 Bridge；
+  MessageBus 消费者实际取走消息后才删除恢复记录。停止会先取消未完成的
+  交接和定时器，保留已落盘批次；恢复失败时 fail-closed，不启动新轮询。
+- 安全：ImageStore 新建图片目录/文件显式收紧为 `0700/0600`。
+- 自动验证覆盖：会话键到 `ask_image` 真实解析、图/文合并、连续图片重置、
+  用户隔离、停止保留、重启恢复、重投去重、落盘失败不误 ack、Bus 交接崩溃
+  窗口、恢复重试和私有权限。
+- 验证：`npm test` 35 passed，`npm run build` 通过，Python 全量 164 tests OK；
+  `py_compile`、`import main`、配置 JSON 校验和 `git diff --check` 均通过。最终只读
+  安全/可靠性复审未发现 blocker。
+- 未验证项：本跟进未调用真实微信、真实视觉模型或任何付费/外部副作用链路；
+  合并后需由用户继续手工收图验收。

@@ -165,8 +165,10 @@ Gateway 每条入站消息创建任务；同一会话竞争同一把锁而串行
 
 微信私聊使用稳定、可逆的 `account_id + user_id` target 同时作为 sender/chat ID，
 会话不依赖临时 context token，也不会引入分隔符碰撞。Python Channel 把 Bridge
-入站图片保存进共享 ImageStore，再按普通 `InboundMessage` 投递；出站继续消费
-Gateway 的 `OutboundMessage.content/images` 和可选 `delivery_future`。allowlist
+入站图片按 Gateway 的完整 `weixin:<target>` 会话键保存进共享 ImageStore；纯图片先按
+配置窗口等待同一用户的后续文字或图片，合并后再作为一个 `InboundMessage` 投递；
+持久批次只在 MessageBus 消费者确认取走该消息后删除，避免内存队列交接窗口静默丢图。
+出站继续消费 Gateway 的 `OutboundMessage.content/images` 和可选 `delivery_future`。allowlist
 为空时 deny-all，只有精确 user ID 或显式 `*` 才放行。
 
 Web 是唯一启用细粒度流事件的渠道：`thinking`、`token`、`tool_call`、`tool_result`、`image`、`subagent_event`、`done` 经 stream queue 回到 WebSocket。子 Agent 的内部事件统一包装在 `subagent_event` 中，避免其 `token/done` 混入父回复或触发 TTS。最终 OutboundMessage 标记 `streamed=True`，防止前端重复显示。

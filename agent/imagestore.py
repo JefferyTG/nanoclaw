@@ -55,11 +55,13 @@ class ImageStore:
         from bus.queue import ImageRef
 
         images_dir = self._images_dir(session_key)
-        os.makedirs(images_dir, exist_ok=True)
+        os.makedirs(images_dir, mode=0o700, exist_ok=True)
+        os.chmod(images_dir, 0o700)
         image_id = uuid.uuid4().hex
         ext = (ext or "png").lstrip(".")
         path = os.path.join(images_dir, f"{image_id}.{ext}")
-        with open(path, "wb") as f:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f:
             f.write(data)
         return ImageRef(id=image_id, path=path, mime=mime or "image/png")
 

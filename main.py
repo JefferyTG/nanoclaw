@@ -211,6 +211,9 @@ def build_weixin_channel(config, bus, image_store):
         state_dir=state_dir,
         allowed_user_ids=allowed,
         image_store=image_store,
+        image_merge_window_sec=float(
+            settings.get("image_merge_window_sec", 10)
+        ),
         request_timeout_sec=float(settings.get("request_timeout_sec", 30)),
         login_timeout_sec=float(settings.get("login_timeout_sec", 480)),
         inbound_ack_timeout_sec=float(

@@ -16,7 +16,9 @@ import os
 import re
 import stat
 import tempfile
+import time
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -28,6 +30,7 @@ logger = logging.getLogger("nanoclaw.weixin")
 _PROTOCOL_VERSION = 1
 _MAX_LINE_BYTES = 1024 * 1024
 _MAX_IMAGE_BYTES = 20 * 1024 * 1024
+_MAX_PENDING_STATE_BYTES = 8 * 1024 * 1024
 _CHANNEL_ERROR_CODES = frozenset({
     "api_rejected",
     "cancelled",
@@ -56,6 +59,20 @@ _SECRET_RE = re.compile(
 )
 
 
+@dataclass
+class _PendingImageBatch:
+    """Saved images awaiting an optional text description from one peer."""
+
+    account_id: str
+    user_id: str
+    target: str
+    session_key: str
+    images: list = field(default_factory=list)
+    delivery_ids: set[str] = field(default_factory=set)
+    deadline_ms: int = 0
+    timer: asyncio.Task | None = None
+
+
 class WeixinBridgeError(RuntimeError):
     """A structured bridge failure safe to present to the local scheduler."""
 
@@ -63,6 +80,10 @@ class WeixinBridgeError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.retryable = retryable
+
+
+class _UnsupportedInbound(ValueError):
+    """A syntactically valid delivery V1 intentionally declines to consume."""
 
 
 def encode_weixin_target(account_id: str, user_id: str) -> str:
@@ -113,6 +134,7 @@ class WeixinChannel(Channel):
         max_inbound_image_bytes: int = _MAX_IMAGE_BYTES,
         max_outbound_image_bytes: int = _MAX_IMAGE_BYTES,
         restart_backoff_sec: float = 1.0,
+        image_merge_window_sec: float = 10.0,
         auto_login: bool = False,
     ) -> None:
         super().__init__(name=name, bus=bus)
@@ -130,6 +152,11 @@ class WeixinChannel(Channel):
         self.max_inbound_image_bytes = max(1, int(max_inbound_image_bytes))
         self.max_outbound_image_bytes = max(1, int(max_outbound_image_bytes))
         self.restart_backoff_sec = max(0.0, float(restart_backoff_sec))
+        try:
+            merge_window = float(image_merge_window_sec)
+        except (TypeError, ValueError):
+            merge_window = 10.0
+        self.image_merge_window_sec = max(0.0, min(60.0, merge_window))
         self.auto_login = auto_login
         self._process = None
         self._reader_task: asyncio.Task | None = None
@@ -142,6 +169,9 @@ class WeixinChannel(Channel):
         self._stopping = False
         self._started = False
         self._supervisor_task: asyncio.Task | None = None
+        self._pending_image_batches: dict[tuple[str, str], _PendingImageBatch] = {}
+        self._inbound_lock = asyncio.Lock()
+        self._pending_batches_restored = False
 
     def target(self, account_id: str, user_id: str) -> str:
         return encode_weixin_target(account_id, user_id)
@@ -158,6 +188,14 @@ class WeixinChannel(Channel):
         await self._request("hello", {}, timeout=self.command_timeout_sec)
         if self.auto_login:
             await self.login()
+        try:
+            await self._restore_pending_image_batches()
+        except Exception as exc:
+            raise WeixinBridgeError(
+                "state_restore_failed",
+                "unable to restore pending Weixin images",
+                retryable=True,
+            ) from exc
         await self.start_polling()
 
     async def login(self, force: bool = False) -> dict[str, Any]:
@@ -313,6 +351,12 @@ class WeixinChannel(Channel):
 
     async def stop(self) -> None:
         self._stopping = True
+        inbound_tasks = list(self._background)
+        for task in inbound_tasks:
+            task.cancel()
+        if inbound_tasks:
+            await asyncio.gather(*inbound_tasks, return_exceptions=True)
+        await self._cancel_pending_image_timers()
         if self._supervisor_task is not None:
             self._supervisor_task.cancel()
             await asyncio.gather(self._supervisor_task, return_exceptions=True)
@@ -454,6 +498,8 @@ class WeixinChannel(Channel):
 
     async def _handle_event(self, event: str | None, data: dict[str, Any]) -> None:
         if event == "inbound_message":
+            if self._stopping:
+                return
             await self._handle_inbound(data)
         elif event == "qr_code":
             # QR payload is intentionally shown only to the local operator; it
@@ -504,29 +550,351 @@ class WeixinChannel(Channel):
             except WeixinBridgeError:
                 logger.warning("failed to acknowledge denied Weixin inbound message")
             return
-        images = []
         try:
-            for descriptor in data.get("images") or []:
-                image = self._consume_inbound_image(descriptor, encode_weixin_target(account_id, user_id))
-                if image is not None:
-                    images.append(image)
-            text = data.get("text") if isinstance(data.get("text"), str) else ""
-            if not text and images:
-                text = "请分析这张图片。" if len(images) == 1 else "请分析这些图片。"
-            if not text:
-                logger.info("discarded empty or unsupported Weixin inbound message")
-                await self._ack_inbound(delivery_id)
-                return
-            target = encode_weixin_target(account_id, user_id)
-            await self.bus.publish_inbound(InboundMessage(self.name, target, target, text, raw={"message_id": data.get("message_id"), "delivery_id": delivery_id}, images=images or None))
-        except Exception as exc:
-            logger.warning("discarded Weixin inbound message: %s", exc)
-            # A syntactically valid delivery that V1 cannot consume (for
-            # example unsupported media) must not pin the bridge cursor.
+            async with self._inbound_lock:
+                accepted = await self._accept_inbound_locked(
+                    account_id, user_id, delivery_id, data
+                )
+        except _UnsupportedInbound as exc:
+            logger.warning("discarded unsupported Weixin inbound message: %s", exc)
             await self._ack_inbound(delivery_id)
             return
+        except Exception as exc:
+            # ImageStore, persistence and Bus failures are recoverable.  Do
+            # not acknowledge: Bridge redelivery is the at-least-once path.
+            logger.warning("failed to accept Weixin inbound message: %s", exc)
+            return
+        if accepted:
+            await self._ack_inbound(delivery_id)
 
-        await self._ack_inbound(delivery_id)
+    async def _accept_inbound_locked(
+        self, account_id: str, user_id: str, delivery_id: str, data: dict[str, Any]
+    ) -> bool:
+        """Persist/merge an inbound event while serializing timer races.
+
+        Returning true means the event was either published or durably accepted
+        into its in-memory image batch and may therefore be acknowledged.
+        """
+        target = encode_weixin_target(account_id, user_id)
+        session_key = f"{self.name}:{target}"
+        batch = self._pending_image_batches.get((account_id, user_id))
+        if batch is not None and delivery_id in batch.delivery_ids:
+            for descriptor in data.get("images") or []:
+                self._discard_duplicate_inbound_image(descriptor)
+            return True
+        images = []
+        for descriptor in data.get("images") or []:
+            try:
+                image = self._consume_inbound_image(descriptor, session_key)
+            except ValueError as exc:
+                raise _UnsupportedInbound(str(exc)) from exc
+            if image is not None:
+                images.append(image)
+        text = data.get("text") if isinstance(data.get("text"), str) else ""
+        text = text.strip()
+        if not text and not images:
+            logger.info("discarded empty or unsupported Weixin inbound message")
+            return True
+        key = (account_id, user_id)
+        batch = self._pending_image_batches.get(key)
+        if text:
+            if batch is not None:
+                await self._flush_image_batch_locked(key, text, data, images)
+            else:
+                try:
+                    await self._publish_inbound(target, text, images, data)
+                except Exception:
+                    self._delete_image_refs(images)
+                    raise
+            return True
+        if self.image_merge_window_sec == 0:
+            prompt = "请分析这张图片。" if len(images) == 1 else "请分析这些图片。"
+            try:
+                await self._publish_inbound(target, prompt, images, data)
+            except Exception:
+                self._delete_image_refs(images)
+                raise
+            return True
+        old_batch = batch
+        new_batch = _PendingImageBatch(
+            account_id, user_id, target, session_key,
+            list(old_batch.images) if old_batch is not None else [],
+            set(old_batch.delivery_ids) if old_batch is not None else set(),
+            int((time.time() + self.image_merge_window_sec) * 1000),
+        )
+        new_batch.images.extend(images)
+        new_batch.delivery_ids.add(delivery_id)
+        self._pending_image_batches[key] = new_batch
+        try:
+            self._persist_pending_image_batches_locked()
+        except Exception:
+            if old_batch is None:
+                self._pending_image_batches.pop(key, None)
+            else:
+                self._pending_image_batches[key] = old_batch
+            self._delete_image_refs(images)
+            raise
+        if old_batch is not None and old_batch.timer is not None:
+            old_batch.timer.cancel()
+        self._schedule_image_batch_timer_locked(key, new_batch)
+        return True
+
+    async def _flush_image_batch_after_window(
+        self, key: tuple[str, str], batch: _PendingImageBatch
+    ) -> None:
+        try:
+            await asyncio.sleep(max(0, batch.deadline_ms / 1000 - time.time()))
+            async with self._inbound_lock:
+                if self._pending_image_batches.get(key) is batch:
+                    await self._flush_image_batch_locked(key, None, {})
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("failed to publish queued Weixin images")
+
+    async def _flush_image_batch_locked(
+        self, key: tuple[str, str], text: str | None, raw: dict[str, Any], extra_images: list | None = None
+    ) -> None:
+        batch = self._pending_image_batches.get(key)
+        if batch is None:
+            return
+        extra_images = extra_images or []
+        content = text or (
+            "请分析这张图片。" if len(batch.images) == 1 else "请分析这些图片。"
+        )
+        try:
+            await self._publish_inbound(batch.target, content, batch.images + extra_images, raw)
+        except Exception:
+            self._delete_image_refs(extra_images)
+            raise
+        self._pending_image_batches.pop(key, None)
+        try:
+            self._persist_pending_image_batches_locked()
+        except Exception:
+            self._pending_image_batches[key] = batch
+            raise
+        if batch.timer is not None and batch.timer is not asyncio.current_task():
+            batch.timer.cancel()
+
+    async def _publish_inbound(self, target: str, text: str, images: list, raw: dict[str, Any]) -> None:
+        acceptance = asyncio.get_running_loop().create_future()
+        await self.bus.publish_inbound(InboundMessage(
+            self.name, target, target, text,
+            raw={"message_id": raw.get("message_id"), "delivery_id": raw.get("delivery_id")},
+            images=images or None,
+            acceptance_future=acceptance,
+        ))
+        await acceptance
+
+    async def _cancel_pending_image_timers(self) -> None:
+        # A timer can be holding _inbound_lock while it waits for MessageBus to
+        # accept a flush.  Cancel it before acquiring that lock so shutdown can
+        # never deadlock behind an unconsumed in-memory handoff.
+        timers = [
+            batch.timer
+            for batch in self._pending_image_batches.values()
+            if batch.timer is not None
+        ]
+        for timer in timers:
+            timer.cancel()
+        if timers:
+            await asyncio.gather(*timers, return_exceptions=True)
+        async with self._inbound_lock:
+            for batch in self._pending_image_batches.values():
+                if batch.timer in timers:
+                    batch.timer = None
+
+    def _schedule_image_batch_timer_locked(
+        self, key: tuple[str, str], batch: _PendingImageBatch
+    ) -> None:
+        batch.timer = asyncio.create_task(
+            self._flush_image_batch_after_window(key, batch),
+            name="weixin-image-merge",
+        )
+
+    def _pending_batches_path(self) -> Path:
+        if self.state_dir is None:
+            raise ValueError("weixin state_dir is required for image batching")
+        self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if self.state_dir.is_symlink() or not self.state_dir.is_dir():
+            raise ValueError("invalid Weixin state directory")
+        os.chmod(self.state_dir, 0o700)
+        return self.state_dir / "pending_image_batches.json"
+
+    def _persist_pending_image_batches_locked(self) -> None:
+        path = self._pending_batches_path()
+        if os.path.lexists(path) and path.is_symlink():
+            raise ValueError("invalid pending image state file")
+        if not self._pending_image_batches:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            else:
+                self._fsync_pending_directory()
+            return
+        payload = {
+            "version": 1,
+            "batches": [
+                {
+                    "account_id": batch.account_id,
+                    "user_id": batch.user_id,
+                    "target": batch.target,
+                    "session_key": batch.session_key,
+                    "delivery_ids": sorted(batch.delivery_ids),
+                    "deadline_ms": batch.deadline_ms,
+                    "images": [{"id": image.id, "mime": image.mime} for image in batch.images],
+                }
+                for batch in self._pending_image_batches.values()
+            ],
+        }
+        encoded = json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        if len(encoded) > _MAX_PENDING_STATE_BYTES:
+            raise ValueError("pending image state exceeds size limit")
+        fd, temporary = tempfile.mkstemp(prefix=".pending-images-", dir=self.state_dir)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as output:
+                output.write(encoded)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, path)
+            os.chmod(path, 0o600)
+            self._fsync_pending_directory()
+        except Exception:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise
+
+    def _fsync_pending_directory(self) -> None:
+        directory_fd = os.open(self.state_dir, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    async def _restore_pending_image_batches(self) -> None:
+        if self._pending_batches_restored:
+            return
+        if self.state_dir is None or self.image_store is None:
+            self._pending_batches_restored = True
+            return
+        async with self._inbound_lock:
+            path = self._pending_batches_path()
+            if not os.path.lexists(path):
+                self._pending_batches_restored = True
+                return
+            if path.is_symlink():
+                raise ValueError("invalid pending image state file")
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            info = os.fstat(fd)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_size <= 0
+                or info.st_size > _MAX_PENDING_STATE_BYTES
+            ):
+                os.close(fd)
+                raise ValueError("invalid pending image state file")
+            with os.fdopen(fd, encoding="utf-8") as source:
+                payload = json.load(source)
+            if (
+                not isinstance(payload, dict)
+                or payload.get("version") != 1
+                or not isinstance(payload.get("batches"), list)
+            ):
+                raise ValueError("invalid pending image state")
+            loaded: dict[tuple[str, str], _PendingImageBatch] = {}
+            expired: list[tuple[str, str]] = []
+            for item in payload["batches"]:
+                if not isinstance(item, dict):
+                    continue
+                account_id, user_id = item.get("account_id"), item.get("user_id")
+                target, session_key = item.get("target"), item.get("session_key")
+                if not all(isinstance(value, str) and value for value in (account_id, user_id, target, session_key)):
+                    continue
+                if not self._allowed(user_id):
+                    continue
+                if target != encode_weixin_target(account_id, user_id) or session_key != f"{self.name}:{target}":
+                    continue
+                image_items = item.get("images")
+                delivery_items = item.get("delivery_ids")
+                deadline = item.get("deadline_ms")
+                if (
+                    not isinstance(image_items, list)
+                    or not isinstance(delivery_items, list)
+                    or not delivery_items
+                    or not all(
+                        isinstance(value, str) and 0 < len(value) <= 256
+                        for value in delivery_items
+                    )
+                    or isinstance(deadline, bool)
+                    or not isinstance(deadline, (int, float))
+                    or deadline <= 0
+                ):
+                    continue
+                images = []
+                for image_data in image_items:
+                    if (
+                        not isinstance(image_data, dict)
+                        or not isinstance(image_data.get("id"), str)
+                        or not 0 < len(image_data["id"]) <= 128
+                    ):
+                        continue
+                    image = self.image_store.resolve(session_key, image_data["id"])
+                    if image is not None:
+                        images.append(image)
+                if not images:
+                    continue
+                key = (account_id, user_id)
+                if key in loaded:
+                    continue
+                batch = _PendingImageBatch(
+                    account_id, user_id, target, session_key, images,
+                    set(delivery_items), int(deadline),
+                )
+                loaded[key] = batch
+                if batch.deadline_ms <= int(time.time() * 1000):
+                    expired.append(key)
+            self._pending_image_batches.update(loaded)
+            self._persist_pending_image_batches_locked()
+            for key in expired:
+                await self._flush_image_batch_locked(key, None, {})
+            for key, batch in loaded.items():
+                if key in self._pending_image_batches and key not in expired:
+                    self._schedule_image_batch_timer_locked(key, batch)
+            self._pending_batches_restored = True
+
+    def _discard_duplicate_inbound_image(self, descriptor: Any) -> None:
+        """Remove a redelivered Bridge temp file without copying it again."""
+        if not isinstance(descriptor, dict) or self.state_dir is None:
+            return
+        path_text, mime = descriptor.get("file_path"), descriptor.get("mime_type")
+        if not isinstance(path_text, str) or mime not in _IMAGE_MIMES:
+            return
+        try:
+            path = Path(path_text)
+            if path.is_symlink():
+                return
+            state_root = self.state_dir.resolve(strict=True)
+            inbound_root = (self.state_dir / "inbound").resolve(strict=True)
+            inbound_root.relative_to(state_root)
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(inbound_root)
+            resolved.unlink()
+        except (OSError, ValueError):
+            return
+
+    @staticmethod
+    def _delete_image_refs(images: list) -> None:
+        for image in images:
+            try:
+                os.unlink(image.path)
+            except FileNotFoundError:
+                pass
 
     async def _ack_inbound(self, delivery_id: str) -> None:
         """Best-effort acknowledgement for an already validated delivery id."""
@@ -580,6 +948,9 @@ class WeixinChannel(Channel):
                 pass
 
     def _spawn(self, coroutine) -> None:
+        if self._stopping:
+            coroutine.close()
+            return
         task = asyncio.create_task(coroutine)
         self._background.add(task)
         task.add_done_callback(self._background.discard)

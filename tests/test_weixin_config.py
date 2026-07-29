@@ -17,6 +17,7 @@ class WeixinConfigTests(unittest.TestCase):
             ["node", "integrations/weixin_bridge/bridge.mjs"],
         )
         self.assertEqual(settings["state_dir"], "workspace/weixin")
+        self.assertEqual(settings["image_merge_window_sec"], 10.0)
 
     def test_partial_file_config_keeps_safe_defaults(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as file:
@@ -30,7 +31,16 @@ class WeixinConfigTests(unittest.TestCase):
         self.assertTrue(cfg.weixin["enabled"])
         self.assertEqual(cfg.weixin["allowed_user_ids"], ["wx-user"])
         self.assertEqual(cfg.weixin["state_dir"], "workspace/weixin")
+        self.assertEqual(cfg.weixin["image_merge_window_sec"], 10.0)
         self.assertEqual(cfg.weixin["request_timeout_sec"], 30)
+
+    def test_image_merge_window_can_be_overridden(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as file:
+            json.dump({"weixin": {"image_merge_window_sec": 3.5}}, file)
+            file.flush()
+            cfg = load_config(file.name)
+
+        self.assertEqual(cfg.weixin["image_merge_window_sec"], 3.5)
 
     def test_save_round_trip_does_not_add_credentials(self):
         cfg = NanoClawConfig()
