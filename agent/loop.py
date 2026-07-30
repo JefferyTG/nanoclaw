@@ -36,8 +36,11 @@ from typing import List, Optional
 from providers.base import LLMProvider
 from agent.tools.registry import ToolRegistry
 from agent.context import ContextBuilder
+from agent.cache_observability import PromptCacheObserver, stable_text_hash
+from agent.history import canonicalize_history
 from session.manager import SessionManager
 from agent.memory import MemoryConsolidation
+from providers.usage import PromptCacheUsage
 
 
 class AgentLoop:
@@ -61,6 +64,7 @@ class AgentLoop:
         base_model_multimodal: bool = False,
         generated_ids_sink: Optional[list] = None,
         subagent_runs_sink: Optional[list] = None,
+        cache_observer: Optional[PromptCacheObserver] = None,
     ):
         self.provider = provider
         self.tools = tools
@@ -82,6 +86,9 @@ class AgentLoop:
         # replay metadata to the parent assistant tool-call record.
         self.generated_ids_sink = generated_ids_sink
         self.subagent_runs_sink = subagent_runs_sink
+        self.cache_observer = cache_observer or PromptCacheObserver()
+        self._active_cache_turn = None
+        self.last_cache_metrics = None
         # The return value is deliberately user-facing text, so callers such as
         # SpawnSubagentTool need a separate structured lifecycle outcome rather
         # than guessing timeout/error state from localized message strings.
@@ -229,6 +236,16 @@ class AgentLoop:
         }
 
     async def run(self, user_message: str, images=None, stream_sink=None) -> str:
+        """Run one user turn and always finalize its privacy-safe cache metrics."""
+        self._active_cache_turn = None
+        try:
+            return await self._run(user_message, images=images, stream_sink=stream_sink)
+        finally:
+            if self._active_cache_turn is not None:
+                self.last_cache_metrics = self._active_cache_turn.finish()
+                self._active_cache_turn = None
+
+    async def _run(self, user_message: str, images=None, stream_sink=None) -> str:
         """处理一轮用户消息，返回模型最终文本回复。
 
         参数：
@@ -253,24 +270,40 @@ class AgentLoop:
         #      由模型按需调用 ask_image 工具。
         current_content = self._user_content(user_message, images, base_mm)
         history_clean = [self._history_item_to_api(m, base_mm) for m in self._session_history]
+        # Freeze one logical tool snapshot for every model call in this user turn.
+        # The top-level registry is frozen after MCP startup; ephemeral child
+        # registries still get a deterministic, name-sorted per-turn snapshot.
+        tool_definitions = self.tools.get_definitions()
         messages = self.context.build_messages(
             history=history_clean,
             current_message=current_content,
+        )
+        self._active_cache_turn = self.cache_observer.start_turn(
+            system_hash=stable_text_hash(str(messages[0].get("content") or "")),
+            tools_hash=self.tools.schema_hash,
+            history_messages=len(history_clean),
         )
         # 1.5 会话压缩：当估算 token 超预算时，把中间旧消息压成一条摘要。
         #     MemoryConsolidation 仅在 messages 超出 token_budget 才触发压缩，
         #     预算内原样返回；memory 为 None 表示未启用（保持向后兼容）。
         if self.memory is not None:
-            compressed = await self.memory.maybe_consolidate(messages)
-            if len(compressed) != len(messages):
-                new_history = compressed[1:-1]
+            compressed = await self.memory.maybe_consolidate(
+                messages, tools=tool_definitions, cache_turn=self._active_cache_turn
+            )
+            if self.memory.last_consolidation.get("consolidated", False):
+                new_history = canonicalize_history(compressed[1:-1])
                 self._session_history = new_history
                 self.session_manager.save_messages(self.session_key, new_history)
+                boundary = self.memory.last_consolidation
                 print(
                     f"\033[2;35m🗜️  会话历史已压缩：{len(messages)} 条 → "
-                    f"{len(compressed)} 条（节省 token 预算）\033[0m"
+                    f"{len(compressed)} 条；估算 {boundary.get('estimated_tokens')} / "
+                    f"预算 {boundary.get('token_budget')} token\033[0m"
                 )
             messages = compressed
+        # Exclude the system and current user message.  If consolidation ran,
+        # this is the actual history count sent to the main ReAct provider.
+        self._active_cache_turn.set_main_history_messages(max(0, len(messages) - 2))
         # 持久化当前用户消息（原文 + 图片元数据；图片字节由 ImageStore 落盘，
         # 此处仅记 id/mime，发送时再按 base_mm 分支还原成多模态 content 或占位符）
         user_record = {"role": "user", "content": user_message}
@@ -286,7 +319,7 @@ class AgentLoop:
 
         # 2. 主循环：模型调用工具直到给出最终回答，或触达上限/错误/熔断
         turn_start = time.monotonic()
-        for _ in range(self.max_iterations):
+        for tool_iteration in range(self.max_iterations):
             # 整轮超时保护：墙钟耗时超限即终止并回传提示，避免「工具卡死 /
             # 模型反复重试同一失败工具」导致回合永不结束、卡住整个会话。
             if time.monotonic() - turn_start > self.turn_timeout:
@@ -306,7 +339,7 @@ class AgentLoop:
                 # 离散路径的 chat() 已自带 wait_for，这里补齐对称性。
                 try:
                     response, final_content = await asyncio.wait_for(
-                        self._run_streamed(messages, stream_sink),
+                        self._run_streamed(messages, tool_definitions, stream_sink),
                         timeout=self.turn_timeout,
                     )
                 except asyncio.TimeoutError:
@@ -319,7 +352,7 @@ class AgentLoop:
                 try:
                     response = await asyncio.wait_for(
                         self.provider.chat(
-                            messages, self.tools.get_definitions(), self.model
+                            messages, tool_definitions, self.model
                         ),
                         timeout=self.turn_timeout,
                     )
@@ -331,6 +364,11 @@ class AgentLoop:
                     return msg
                 # 离散路径：把整轮响应作为一次性事件推给 sink（无 sink 则返回正文）
                 final_content = await self._emit_discrete(response, stream_sink)
+
+            self._active_cache_turn.record(
+                getattr(response, "cache_usage", PromptCacheUsage()),
+                tool_iteration=tool_iteration,
+            )
 
             # b. 模型侧异常：直接退出返回错误信息。流式与离散路径都要补 done，
             # 否则网页端收不到「收尾」事件会一直停在「思考中」。
@@ -409,7 +447,9 @@ class AgentLoop:
         self.last_run_status = "timed_out"
         return timeout_msg
 
-    async def _run_streamed(self, messages: list, stream_sink) -> tuple:
+    async def _run_streamed(
+        self, messages: list, tool_definitions: list[dict], stream_sink
+    ) -> tuple:
         """流式路径：逐字消费 Provider.chat_stream，把增量实时推给 sink。
 
         返回 ``(LLMResponse, final_content)``。仅转发 ``reasoning`` / ``token``
@@ -419,7 +459,7 @@ class AgentLoop:
         content_buf: list = []
         call_start = time.monotonic()
         async for ev in self.provider.chat_stream(
-            messages, self.tools.get_definitions(), self.model
+            messages, tool_definitions, self.model
         ):
             # 单次流式模型调用也受整轮超时约束，避免模型连接挂死拖垮整轮
             if time.monotonic() - call_start > self.turn_timeout:
@@ -679,11 +719,14 @@ class AgentLoop:
     def _save_to_history(self, messages_snapshot: List[dict]) -> None:
         """保存本轮新增对话到跨轮历史（去掉首条 system 提示）。"""
         # messages = [system] + 历史 + 本轮新增；去掉 system 后即干净的对话流
-        self._session_history = list(messages_snapshot[1:])
+        self._session_history = canonicalize_history(messages_snapshot[1:])
 
     def clear_history(self) -> None:
-        """清空工具调用窗口、跨轮对话历史与会话持久化文件，开始全新会话。"""
+        """清空历史并显式刷新慢变上下文，开始新的 cache boundary。"""
         self._tool_call_history.clear()
         self._session_history.clear()
+        refresh = getattr(self.context, "refresh_context", None)
+        if callable(refresh):
+            refresh()
         # 同步清空磁盘上的 JSONL，避免下次启动又把旧历史读回来
         self.session_manager.clear(self.session_key)

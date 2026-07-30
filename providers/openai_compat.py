@@ -39,6 +39,7 @@ from openai import (
 )
 
 from providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from providers.usage import parse_prompt_cache_usage, usage_to_dict
 
 logger = logging.getLogger("nanoclaw.llm")
 
@@ -47,6 +48,16 @@ _RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 _MAX_RETRIES = 3
 # 指数退避基础间隔（秒）：第 1/2 次失败后分别等待 1s / 2s / 4s
 _BACKOFF = (1.0, 2.0, 4.0)
+
+
+def _stream_usage_option_unsupported(exc: Exception) -> bool:
+    """Detect a compatible server/SDK that rejects include_usage explicitly."""
+    status = getattr(exc, "status_code", None)
+    text = (str(exc) + " " + json.dumps(
+        getattr(exc, "body", None), ensure_ascii=False, default=str
+    )).lower()
+    names_option = "stream_options" in text or "include_usage" in text
+    return names_option and (status in (400, 422, None))
 
 
 class OpenAICompatProvider(LLMProvider):
@@ -144,13 +155,7 @@ class OpenAICompatProvider(LLMProvider):
             )
 
         # 提取 usage（转成普通 dict，兼容不同 SDK 版本）
-        usage: Dict = {}
-        if completion.usage is not None:
-            try:
-                usage = completion.usage.model_dump()
-            except AttributeError:
-                # 老版本或非 pydantic 对象的兜底
-                usage = dict(getattr(completion.usage, "__dict__", {}))
+        usage = usage_to_dict(getattr(completion, "usage", None))
 
         return LLMResponse(
             content=message.content,
@@ -158,6 +163,7 @@ class OpenAICompatProvider(LLMProvider):
             finish_reason=choice.finish_reason or "stop",
             usage=usage,
             reasoning_content=message_reasoning,
+            cache_usage=parse_prompt_cache_usage(usage),
         )
 
     async def chat_stream(
@@ -185,6 +191,10 @@ class OpenAICompatProvider(LLMProvider):
             "model": model or self.model,
             "messages": messages,
             "stream": True,
+            # OpenAI-compatible services commonly omit usage from SSE unless
+            # explicitly requested.  Providers that do not implement it leave
+            # cache_usage unavailable rather than fabricating a cache miss.
+            "stream_options": {"include_usage": True},
         }
         if tools:
             request_kwargs["tools"] = tools
@@ -193,6 +203,7 @@ class OpenAICompatProvider(LLMProvider):
         # —— 建立连接（带瞬时错误重试）——
         stream = None
         last_exc: Optional[Exception] = None
+        usage_option_enabled = True
         for attempt in range(_MAX_RETRIES):
             try:
                 stream = await self._client.chat.completions.create(**request_kwargs)
@@ -207,6 +218,13 @@ class OpenAICompatProvider(LLMProvider):
             except APIStatusError as exc:
                 last_exc = exc
                 status = getattr(exc, "status_code", None)
+                if usage_option_enabled and _stream_usage_option_unsupported(exc):
+                    # Preserve streaming compatibility, but the final response
+                    # will correctly report cache usage as unavailable.
+                    request_kwargs.pop("stream_options", None)
+                    usage_option_enabled = False
+                    logger.info("LLM 不支持流式 usage，已降级为无 usage 流式请求")
+                    continue
                 if status in _RETRYABLE_STATUS and attempt < _MAX_RETRIES - 1:
                     logger.warning("LLM 流式返回瞬时错误 %s，准备第 %d 次重试", status, attempt + 1)
                     await asyncio.sleep(_BACKOFF[attempt])
@@ -214,6 +232,11 @@ class OpenAICompatProvider(LLMProvider):
                 break
             except Exception as exc:  # noqa: BLE001 - 非预期异常也兜底
                 last_exc = exc
+                if usage_option_enabled and _stream_usage_option_unsupported(exc):
+                    request_kwargs.pop("stream_options", None)
+                    usage_option_enabled = False
+                    logger.info("LLM SDK 不支持流式 usage，已降级为无 usage 流式请求")
+                    continue
                 break
 
         if stream is None:
@@ -235,13 +258,12 @@ class OpenAICompatProvider(LLMProvider):
 
         try:
             async for chunk in stream:
+                # OpenAI emits usage in a final empty-choice chunk, but some
+                # compatible servers attach it to a normal chunk instead.
+                chunk_usage = usage_to_dict(getattr(chunk, "usage", None))
+                if chunk_usage:
+                    usage = chunk_usage
                 if not chunk.choices:
-                    # 无 choices 的 chunk 通常只携带 usage 统计
-                    if getattr(chunk, "usage", None) is not None:
-                        try:
-                            usage = chunk.usage.model_dump()
-                        except AttributeError:
-                            usage = dict(getattr(chunk.usage, "__dict__", {}))
                     continue
 
                 delta = chunk.choices[0].delta
@@ -314,5 +336,6 @@ class OpenAICompatProvider(LLMProvider):
                 finish_reason=finish_reason,
                 usage=usage,
                 reasoning_content=msg_reasoning,
+                cache_usage=parse_prompt_cache_usage(usage),
             ),
         }

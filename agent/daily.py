@@ -16,6 +16,8 @@ from datetime import datetime
 from typing import List, Optional
 
 from providers.base import LLMProvider
+from providers.usage import PromptCacheUsage
+from agent.cache_observability import stable_text_hash
 
 
 # 让模型从对话里提取「值得记进 daily 的事件」的指令
@@ -83,7 +85,7 @@ def _messages_to_text(messages: List[dict]) -> str:
     parts: List[str] = []
     for m in messages:
         role = m.get("role", "unknown")
-        content = m.get("content") or ""
+        content = _summary_content(m.get("content"))
         for tc in m.get("tool_calls") or []:
             fn = tc.get("function", {}) or {}
             args = fn.get("arguments", "")
@@ -93,11 +95,32 @@ def _messages_to_text(messages: List[dict]) -> str:
     return "\n".join(parts)
 
 
+def _summary_content(content) -> str:
+    """Keep textual context while excluding image bytes and source URLs."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return "" if content is None else "[非文本内容已省略]"
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            parts.append("[非文本内容已省略]")
+        elif item.get("type") == "text":
+            if isinstance(item.get("text"), str) and item["text"]:
+                parts.append(item["text"])
+        elif item.get("type") in ("image", "image_url"):
+            parts.append("[图片内容已省略；参考相邻对话中的视觉结论]")
+        else:
+            parts.append("[非文本内容已省略]")
+    return " ".join(parts)
+
+
 async def summarize_messages_to_daily(
     provider: LLMProvider,
     daily: Optional[DailyMemory],
     messages: List[dict],
     category: str = "会话总结",
+    cache_turn=None,
 ) -> None:
     """调模型从 messages 提取重要事件，写入 daily。
 
@@ -123,7 +146,23 @@ async def summarize_messages_to_daily(
             [{"role": "user", "content": prompt}], tools=None, model=None
         )
     except Exception:  # noqa: BLE001 - daily 失败不应影响主流程
+        if cache_turn is not None:
+            cache_turn.record(
+                PromptCacheUsage(), tool_iteration=-2, phase="daily_memory",
+                system_hash=stable_text_hash(""), tools_hash=stable_text_hash("[]"),
+                history_messages=len(messages),
+            )
         return
+
+    if cache_turn is not None:
+        cache_turn.record(
+            getattr(resp, "cache_usage", PromptCacheUsage()),
+            tool_iteration=-2,
+            phase="daily_memory",
+            system_hash=stable_text_hash(""),
+            tools_hash=stable_text_hash("[]"),
+            history_messages=len(messages),
+        )
 
     # 模型失败或空内容：静默跳过
     if resp.finish_reason == "error" or not (resp.content or "").strip():

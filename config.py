@@ -16,9 +16,23 @@ import json
 import os
 from dataclasses import dataclass, field
 from typing import Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # 硅基流动（SiliconFlow）OpenAI 兼容端点
 _SILICONFLOW_URL = "https://api.siliconflow.cn/v1"
+_DEFAULT_TIMEZONE = "Asia/Shanghai"
+
+
+def validate_iana_timezone(value: object) -> str:
+    """Return a normalized IANA timezone name or raise ``ValueError``."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("timezone 必须是非空 IANA timezone")
+    timezone = value.strip()
+    try:
+        ZoneInfo(timezone)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(f"unknown IANA timezone: {timezone}") from exc
+    return timezone
 
 # Weixin credentials are deliberately absent: bot_token, cursor and context
 # tokens belong exclusively to the ignored Bridge state directory.
@@ -44,6 +58,7 @@ _CONFIG_FIELDS = (
     "model",
     "subagent_model",
     "workspace",
+    "timezone",
     "max_iterations",
     "identity_file",
     "feishu_app_id",
@@ -81,6 +96,7 @@ class NanoClawConfig:
         model: 使用的模型名。
         subagent_model: 子 Agent 默认模型（可选）；留空则沿用 model。
         workspace: 工具可访问的工作区根目录（相对或绝对路径）。
+        timezone: 实例默认 IANA 时区，供当前时间与提醒相关工具使用。
         max_iterations: Agent 主循环单轮最大迭代次数。
         identity_file: 人设文件名（位于 workspace 下）。
     """
@@ -92,6 +108,7 @@ class NanoClawConfig:
     # 若配置其他模型，子 Agent 默认改用该模型（仍可被调用时显式 model 参数覆盖）。
     subagent_model: Optional[str] = None
     workspace: str = "."
+    timezone: str = _DEFAULT_TIMEZONE
     max_iterations: int = 32
     identity_file: str = "identity.md"
     feishu_app_id: str = ""          # 飞书自建应用 App ID（留空则不启用飞书渠道）
@@ -244,6 +261,12 @@ def load_config(config_path: str = "config.json") -> NanoClawConfig:
         pass
     except Exception as exc:  # noqa: BLE001 - 配置损坏不应阻断启动
         print(f"警告：读取配置文件 {config_path} 失败，使用默认配置：{exc}")
+
+    try:
+        cfg.timezone = validate_iana_timezone(cfg.timezone)
+    except ValueError as exc:
+        print(f"警告：实例 timezone 配置无效，回退为 {_DEFAULT_TIMEZONE}：{exc}")
+        cfg.timezone = _DEFAULT_TIMEZONE
 
     # 3) 环境变量最高优先级（API Key 与飞书凭证均支持环境变量覆盖）
     env_key = os.environ.get("NANOCLAW_API_KEY")

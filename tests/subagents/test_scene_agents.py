@@ -245,7 +245,7 @@ class SceneAgentTests(unittest.IsolatedAsyncioTestCase):
         child = FakeAgentLoop.instances[-1]
         self.assertEqual(
             child.tools.list_tools(),
-            ["read_file", "list_skills", "load_skill", "read_skill_resource"],
+            ["list_skills", "load_skill", "read_file", "read_skill_resource"],
         )
         self.assertNotIn("exec", child.tools.list_tools())
         self.assertNotIn("spawn_subagent", child.tools.list_tools())
@@ -468,6 +468,7 @@ class SceneAgentTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("coding：编程分析", dynamic.build_system_prompt())
         current["summary"] = "- writing：内容创作"
+        dynamic.refresh_context()
         self.assertIn("writing：内容创作", dynamic.build_system_prompt())
 
 

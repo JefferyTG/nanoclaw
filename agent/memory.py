@@ -21,6 +21,8 @@ from datetime import datetime
 from typing import List, Optional
 
 from providers.base import LLMProvider
+from providers.usage import PromptCacheUsage
+from agent.cache_observability import stable_text_hash
 from agent.daily import DailyMemory, summarize_messages_to_daily
 
 
@@ -62,8 +64,37 @@ class MemoryConsolidation:
         self.token_budget = token_budget
         # 每日记忆：压缩前把旧消息里的重要事件落 daily，避免关键事实随压缩丢失
         self.daily_memory = daily_memory
+        # Read-only metadata for cache/operations observability.  It contains
+        # counts only, never prompt text, tool arguments, or image bytes.
+        self.last_estimate: dict = {}
+        self.last_consolidation: dict = {"consolidated": False}
 
-    def estimate_tokens(self, messages: List[dict]) -> int:
+    @staticmethod
+    def _estimate_value(value) -> int:
+        """Estimate arbitrary OpenAI content/schema values without logging them."""
+        if value is None:
+            return 0
+        if isinstance(value, str):
+            if value.startswith("data:image/") and ";base64," in value:
+                header, payload = value.split(",", 1)
+                # Base64/image tokens vary by multimodal provider and often do
+                # not follow normal prose tokenization.  0.75 token/character
+                # is deliberately conservative; the provider may additionally
+                # meter vision patches outside text usage.
+                return _count_text(header) + int(len(payload) * 0.75) + 1
+            return _count_text(value)
+        if isinstance(value, (int, float, bool)):
+            return _count_text(str(value))
+        if isinstance(value, list):
+            return 2 + sum(MemoryConsolidation._estimate_value(item) for item in value)
+        if isinstance(value, dict):
+            return 2 + sum(
+                _count_text(str(key)) + MemoryConsolidation._estimate_value(item)
+                for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            )
+        return _count_text(str(value))
+
+    def estimate_tokens(self, messages: List[dict], tools: Optional[List[dict]] = None) -> int:
         """预估 messages 的总 token 数（极简启发式，非精确 tokenizer）。
 
         策略：每条消息固定开销 ~4 token（role 标记、结构 framing）；
@@ -74,17 +105,29 @@ class MemoryConsolidation:
         total = 0
         for msg in messages:
             total += 4  # 每条消息的结构开销
-            content = msg.get("content")
-            if isinstance(content, str):
-                total += _count_text(content)
+            total += self._estimate_value(msg.get("content"))
             # 工具调用：函数名 + 参数一并计入
             for tc in msg.get("tool_calls") or []:
                 fn = tc.get("function", {}) or {}
                 total += _count_text(fn.get("name", ""))
                 total += _count_text(fn.get("arguments", "") or "")
+        tool_tokens = self._estimate_value(tools) if tools else 0
+        self.last_estimate = {
+            "message_count": len(messages),
+            "tool_count": len(tools or []),
+            "message_tokens": total,
+            "tool_schema_tokens": tool_tokens,
+            "total_tokens": total + tool_tokens,
+        }
+        total += tool_tokens
         return total
 
-    async def maybe_consolidate(self, messages: List[dict]) -> List[dict]:
+    async def maybe_consolidate(
+        self,
+        messages: List[dict],
+        tools: Optional[List[dict]] = None,
+        cache_turn=None,
+    ) -> List[dict]:
         """若 messages 超出 token 预算，则把中间旧消息压缩成一条摘要。
 
         结构：保留 ``messages[0]``（system 提示）与末尾 6 条，中间的旧消息
@@ -92,32 +135,62 @@ class MemoryConsolidation:
         ``HISTORY.md``。预算内或无可压缩内容时，原样返回。
         """
         # 空列表直接返回，避免后续切片越界
+        self.last_consolidation = {"consolidated": False, "reason": "empty"}
         if not messages:
             return messages
 
         # 预算内：不压缩，原样返回
-        if self.estimate_tokens(messages) <= self.token_budget:
+        estimated_tokens = self.estimate_tokens(messages, tools)
+        if estimated_tokens <= self.token_budget:
+            self.last_consolidation = {
+                "consolidated": False, "reason": "within_budget",
+                "estimated_tokens": estimated_tokens, "token_budget": self.token_budget,
+            }
             return messages
 
         # 安全护栏：可压缩的中间部分至少需要 1 条，否则没必要压缩，
         # 也避免切片把首条 system 重复算进 tail 导致消息重复。
         # （正常情况下，能超 192k 预算的对话长度必然远大于 7，这里只是兜底。）
         if len(messages) <= 7:
+            self.last_consolidation = {
+                "consolidated": False, "reason": "no_stable_boundary",
+                "estimated_tokens": estimated_tokens, "token_budget": self.token_budget,
+            }
             return messages
 
         system_msg = messages[0]          # 第一条（system 提示），原样保留
-        tail = messages[-6:]              # 末尾 6 条，原样保留
-        old_messages = messages[1:-6]     # 中间待压缩的旧消息
+        tail_start = max(1, len(messages) - 6)
+        # 不能从 assistant(tool_calls) → tool... 交换中间切开；若固定 6 条
+        # 落在 tool 结果上，就向前扩展到声明这些调用的 assistant。
+        while tail_start > 1 and messages[tail_start].get("role") == "tool":
+            tail_start -= 1
+        tail = messages[tail_start:]
+        old_messages = messages[1:tail_start]
+        if not old_messages:
+            self.last_consolidation = {
+                "consolidated": False, "reason": "no_stable_boundary",
+                "estimated_tokens": estimated_tokens, "token_budget": self.token_budget,
+            }
+            return messages
 
         # 压缩前：把旧消息里的重要事件落 daily，避免关键事实随压缩丢失。
         # daily 是 nice-to-have，失败不影响压缩主流程。
         if self.daily_memory is not None:
             await summarize_messages_to_daily(
                 self.provider, self.daily_memory, old_messages,
-                category="压缩前保存",
+                category="压缩前保存", cache_turn=cache_turn,
             )
 
-        summary = await self._summarize(old_messages)
+        summary = await self._summarize(old_messages, cache_turn=cache_turn)
+        if not summary:
+            # Context correctness wins over token pressure.  A failed summary
+            # must not replace the only copy of the old conversation.
+            self.last_consolidation = {
+                "consolidated": False, "reason": "summary_failed",
+                "estimated_tokens": estimated_tokens, "token_budget": self.token_budget,
+                "candidate_messages": len(old_messages),
+            }
+            return messages
 
         summary_msg = {
             "role": "system",
@@ -127,12 +200,21 @@ class MemoryConsolidation:
         # 摘要落盘（保留审计轨迹）
         self._save_to_history(summary, len(old_messages))
 
+        self.last_consolidation = {
+            "consolidated": True,
+            "estimated_tokens": estimated_tokens,
+            "token_budget": self.token_budget,
+            "preserved_head_messages": 1,
+            "preserved_tail_messages": len(tail),
+            "summarized_messages": len(old_messages),
+        }
+
         return [system_msg, summary_msg] + tail
 
-    async def _summarize(self, messages: List[dict]) -> str:
+    async def _summarize(self, messages: List[dict], cache_turn=None) -> Optional[str]:
         """把旧消息拼接成文本，调用模型生成 3-5 句话摘要。
 
-        调用失败（含模型返回空内容）时返回固定占位串，保证压缩流程不中断。
+        调用失败（含模型返回空内容）时返回 None，由调用方保留原历史。
         """
         text = self._messages_to_text(messages)
         prompt = f"{_SUMMARY_INSTRUCTION}\n\n{text}"
@@ -141,12 +223,31 @@ class MemoryConsolidation:
         try:
             resp = await self.provider.chat(summary_messages, tools=None, model=None)
         except Exception:
+            if cache_turn is not None:
+                cache_turn.record(
+                    PromptCacheUsage(),
+                    tool_iteration=-1,
+                    phase="consolidation",
+                    system_hash=stable_text_hash(""),
+                    tools_hash=stable_text_hash("[]"),
+                    history_messages=len(messages),
+                )
             # 即便 provider 自身已捕获异常，这里再兜一层，万无一失
-            return "（摘要生成失败，旧消息已丢弃）"
+            return None
+
+        if cache_turn is not None:
+            cache_turn.record(
+                getattr(resp, "cache_usage", PromptCacheUsage()),
+                tool_iteration=-1,
+                phase="consolidation",
+                system_hash=stable_text_hash(""),
+                tools_hash=stable_text_hash("[]"),
+                history_messages=len(messages),
+            )
 
         # provider 在 API 失败时返回 finish_reason="error"；空内容也视为失败
         if resp.finish_reason == "error" or not (resp.content or "").strip():
-            return "（摘要生成失败，旧消息已丢弃）"
+            return None
 
         return resp.content.strip()
 
@@ -177,7 +278,7 @@ class MemoryConsolidation:
         parts: List[str] = []
         for m in messages:
             role = m.get("role", "unknown")
-            content = m.get("content") or ""
+            content = MemoryConsolidation._summary_content(m.get("content"))
 
             # 工具调用：简述调用的工具与参数（content 可能为空）
             for tc in m.get("tool_calls") or []:
@@ -189,3 +290,25 @@ class MemoryConsolidation:
                 parts.append(f"[{role}] {content}")
 
         return "\n".join(parts)
+
+    @staticmethod
+    def _summary_content(content) -> str:
+        """Serialize text for summaries without copying image bytes or URLs."""
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return "" if content is None else "[非文本内容已省略]"
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                parts.append("[非文本内容已省略]")
+                continue
+            if item.get("type") == "text":
+                text = item.get("text")
+                if isinstance(text, str) and text:
+                    parts.append(text)
+            elif item.get("type") in ("image", "image_url"):
+                parts.append("[图片内容已省略；参考相邻对话中的视觉结论]")
+            else:
+                parts.append("[非文本内容已省略]")
+        return " ".join(parts)

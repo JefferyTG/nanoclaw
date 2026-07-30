@@ -97,6 +97,7 @@ flowchart LR
 | 所有改动 | `git diff --check`；复核 `git status --short` | 越界文件、秘密、个人数据 |
 | Python | `uv run python -m py_compile <changed.py...>`；`uv run python -c "import main"` | import、副作用、Python 3.13 |
 | AgentLoop / Provider | 离线 mock 回归 + 正常/错误/超时 | tool-call 顺序、stream `done`、持久化恢复 |
+| Prompt Cache / Context | fake usage/clock + 相邻回合 exact-prefix + 重启恢复 | System 无墙钟、快照刷新边界、工具 hash、加权回合比率、usage unavailable |
 | Session / Memory | 临时目录测试 + 重启读取 | JSONL 顺序、坏行、自愈、key 编码、压缩覆写 |
 | Tool | schema、成功、失败、超时；同类风格对照 | workspace、symlink、参数注入、输出截断 |
 | 配置 | load/save round-trip + example 同步 | 环境变量、秘密脱敏、热更新/重启边界 |

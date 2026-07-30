@@ -32,6 +32,7 @@ from agent.tools.filesystem import ReadFileTool, WriteFileTool, ListDirTool
 from agent.tools.shell import ExecTool
 from agent.tools.web_search import WebSearchTool
 from agent.tools.web_fetch import WebFetchTool
+from agent.tools.current_time import CurrentTimeTool
 from agent.tools.skills_tools import ListSkillsTool, LoadSkillTool, ReadSkillResourceTool
 from agent.tools.spawn import SpawnSubagentTool
 from agent.tools.reminders import (
@@ -360,6 +361,8 @@ def build_shared() -> dict:
     tools.register(ExecTool(config.workspace))
     tools.register(WebSearchTool())
     tools.register(WebFetchTool())
+    # 动态墙钟不再进入 System Prompt；只有相关问题才通过此工具按实例时区查询。
+    tools.register(CurrentTimeTool(config.timezone))
     reminder_repository, reminder_service = build_reminder_service(config)
     if reminder_service is not None:
         tools.register(CreateReminderTool(reminder_service))
@@ -406,7 +409,7 @@ def build_shared() -> dict:
         )
         print(f"已加载技能：{skill_count} 个")
 
-    # 6) 上下文构建器（人设 + 时间 + 工作区 + 长期记忆 + 技能摘要）
+    # 6) 上下文构建器（稳定规则 + 会话级人设/记忆/技能/Profile 快照；无墙钟）
     agents_summary = profile_loader.build_summary()
     context = ContextBuilder(
         config.workspace,
@@ -566,6 +569,10 @@ async def amain() -> None:
             print("已加载 MCP 工具：", ", ".join(t.name for t in mcp_manager.get_tools()))
     except Exception as exc:  # noqa: BLE001 - MCP 连接失败不应阻断整体启动
         print(f"[!] MCP 初始化异常，已跳过所有 MCP 工具：{exc}")
+    # 内置与成功连接的 MCP 条件工具至此全部确定。冻结排序后的 schema，
+    # 后续所有会话复用同一个明确 cache boundary。
+    tools_hash = tools.freeze()
+    print(f"工具 Schema 已冻结：{tools_hash[:16]}（{len(tools.list_tools())} 个）")
     shared["mcp_manager"] = mcp_manager
 
     # 消息总线：渠道与 Gateway 之间的运行时解耦层

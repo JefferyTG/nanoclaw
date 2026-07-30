@@ -23,6 +23,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
+from providers.usage import PromptCacheUsage
+
 
 @dataclass
 class ToolCallRequest:
@@ -53,6 +55,8 @@ class LLMResponse:
         tool_calls: 模型请求的工具调用列表（可能为空）。
         finish_reason: 结束原因，常见 "stop"（自然结束）、"tool_calls"（因调用工具结束）。
         usage: token 用量统计等元信息，结构由具体 Provider 决定，默认空字典。
+        cache_usage: 归一后的 input/cached/uncached token 与命中率；供应商未报告时
+            保持 unavailable，不能把缺失 cached 字段解释成 0 命中。
         reasoning_content: 模型在生成本次「最终文本回复」时的推理过程（思考内容）。
             仅部分支持「思考」的模型（如 Kimi-K2.5、DeepSeek-R1）会返回，不支持时为 None。
             注意：工具调用场景下的推理过程存放在各 ToolCallRequest.reasoning_content 上，
@@ -64,6 +68,7 @@ class LLMResponse:
     finish_reason: str = "stop"
     usage: Dict = field(default_factory=dict)
     reasoning_content: Optional[str] = None
+    cache_usage: PromptCacheUsage = field(default_factory=PromptCacheUsage)
 
     @property
     def has_tool_calls(self) -> bool:

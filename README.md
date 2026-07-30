@@ -18,7 +18,7 @@ NanoClaw 把「大模型推理」与「消息渠道」解耦：模型在本地�
 - **可插拔 Provider**：基于 OpenAI 兼容接口，硅基流动 / 本地模型均可，支持流式输出。
 - **会话持久化**：对话落盘为 JSONL，重启后可侧边栏查看、接上、删除。
 - **人设可定制**：通过 `identity.md`（不随仓库发布）定义语气与角色；首次缺失时会在聊天渠道中引导用户创建。
-- **长上下文优化**：System Prompt 把易变内容（当前时间）置于末尾，固定前缀稳定命中 Prompt Cache。
+- **Prompt Cache 友好**：System、canonical 历史与工具 Schema 保持确定性；当前时间按需通过专用工具查询，并输出不含正文的命中观测。
 - **主动提醒**：CLI、Web、飞书或微信都能让 Agent 创建、查询、取消任务；到点向实例唯一显式绑定的飞书或微信私聊发送，支持静态提醒和实时 Agent 任务。
 
 ---
@@ -68,7 +68,7 @@ flowchart LR
 - **消息总线**：渠道与网关的运行时解耦层，避免相互直接依赖。
 - **网关**：把入站消息转成 AgentLoop 请求、把出站回复按渠道回写。
 - **AgentLoop**：核心推理循环，按 `tools` 定义决定是否调用工具，最多 `max_iterations` 步，整轮受 `turn_timeout_sec` 墙钟保护。
-- **System Prompt** 由 `ContextBuilder` 动态拼接：`人设 → 工作区 → 长期记忆 → 记忆指引 → 可用技能 → 当前时间（末尾）`。
+- **System Prompt** 由 `ContextBuilder` 按会话建立稳定快照：`核心规则 → 人设/工作区 → 技能 → USER/MEMORY → 场景 Agent 摘要`；不再包含当前时间。
 
 ---
 
@@ -166,6 +166,7 @@ uv run python main.py
 | `model` | 主模型名 | `Pro/moonshotai/Kimi-K2.5` |
 | `subagent_model` | 子 Agent 模型（留空沿用主模型） | 空 |
 | `workspace` | 工具可访问的工作区根目录 | `.` |
+| `timezone` | 实例默认 IANA 时区；供 `get_current_time` 与提醒时间解释使用 | `Asia/Shanghai` |
 | `max_iterations` | 单轮最大工具迭代次数 | `32` |
 | `identity_file` | 人设文件名（位于 workspace 下） | `identity.md` |
 | `feishu_app_id` / `feishu_app_secret` | 飞书自建应用凭证（留空则不启用飞书） | 空 |
@@ -266,6 +267,20 @@ correlation ID 和 Bridge 持久 context；若登录代次失效或 context 丢�
 在 `<workspace>/identity.md`（或其它 `identity_file` 指向的工作区内文件）中定义角色、语气与交互风格。人设属于本机实例数据，不随仓库发布。
 
 如果启动后没有找到非空人设文件，Web、飞书或 CLI 收到第一条普通消息时会先询问用户；用户下一条回复会被整理并原子写入人设文件。回复 `/default` 可生成默认人设。引导期间不会调用模型，也不会把人设描述写入会话历史；创建成功后需要重新发送原任务。
+
+identity、USER、MEMORY 和场景 Agent 摘要在每个会话创建时形成快照，不会每轮重扫并抖动缓存前缀；新会话或当前会话执行 `/clear` 时读取最新内容。Skill 摘要属于进程启动快照，修改 Skill 后需重启。这个边界意味着本地文件修改不会在已有会话的下一轮悄悄生效。
+
+---
+
+## Prompt Cache 与观测
+
+NanoClaw 按“只追加历史”的精确前缀组织请求：相邻回合继续复用同一 System、canonical 历史和按名称排序的工具定义。内置工具与成功连接的 MCP 工具在启动装配结束后冻结为一个工具 Schema 快照；MCP 成功集合或 Schema 改变属于新的 cache boundary，需要重启实例。不同供应商是否把工具 Schema、图片或某段前缀计入缓存键并不统一，NanoClaw 不对此作保证。
+
+当前墙钟不写入 System Prompt。只有问题涉及现在、今天/明天、星期、时间差、提醒或定时任务时，模型才应调用 `get_current_time`；工具使用实例 `timezone`，也接受经过校验的可选 IANA 时区。普通问题不应为了查时间调用 `exec` 或时间工具。
+
+每次模型调用与每个用户回合都会输出一行 `[prompt-cache]` JSON，只包含 token 计数、`system_hash`、`tools_hash`、历史消息数、`phase` 和工具迭代序号，不记录 prompt、用户文本、记忆、工具参数或密钥。压缩触发的 daily/历史摘要调用也计入同一用户回合。回合命中率按 `sum(cached_input_tokens) / sum(input_tokens)` 计算，不平均各调用百分比。若供应商未返回 cached tokens，字段为 `null` 且 `availability` 为 `partial/unavailable`，不会把缺失值伪报成 0 命中。流式请求会请求 usage；不支持 `stream_options.include_usage` 的兼容服务会降级继续流式返回，但 usage 明确不可用。
+
+冷启动、System/工具快照刷新、图片文件缺失或变化，以及历史超过预算后被摘要替换，都会形成合理的缓存断点。多模态历史在图片仍存在时按同一字节重建，避免把 Base64 写进 JSONL；它仍会随主请求再次发送，且缓存行为取决于供应商。文本摘要请求只接收图片省略占位，不重复发送 Base64。约 192k 预算触发的 MemoryConsolidation 会保留 System 与至少最后 6 条消息，并把边界向前扩展到完整工具交换，再用摘要替换中间旧历史；摘要失败时保留原历史。这是可观测但不可避免的前缀“断崖”，不能为追求缓存而牺牲上下文正确性。
 
 ---
 

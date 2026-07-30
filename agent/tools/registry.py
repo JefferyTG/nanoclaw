@@ -8,14 +8,17 @@
 设计要点：
 - 内部用 ``dict[str, Tool]`` 存工具，key 为工具名（取自 ``tool.name``），
   保证同名工具只能存在一个，后注册的会自然覆盖前一个。
-- ``get_definitions`` 直接复用每个工具自带的 ``to_function_definition``，
-  注册表本身不关心具体格式，避免两边各写一份导致不一致。
+- ``get_definitions`` 复用每个工具自带的 ``to_function_definition``，并按工具名
+  排序；最终装配后可冻结为不可变逻辑快照和稳定 hash。
 - ``execute`` 是异步的，内部 ``await tool.execute``，并捕获任何异常：
   工具找不到、执行报错都不会让 Agent 主链路炸掉，而是把错误转成字符串
   返回，模型可以据此决定下一步（重试 / 换工具 / 直接回答）。
 """
 
 from collections.abc import Iterable
+from copy import deepcopy
+import hashlib
+import json
 from typing import Dict, List, Optional
 
 import asyncio
@@ -50,6 +53,8 @@ class ToolRegistry:
     def __init__(self) -> None:
         # name -> Tool 实例 的映射表
         self._tools: Dict[str, Tool] = {}
+        self._frozen_definitions: Optional[tuple[dict, ...]] = None
+        self._schema_hash: Optional[str] = None
 
     def register(self, tool: Tool) -> None:
         """注册一个工具。
@@ -57,19 +62,65 @@ class ToolRegistry:
         以 ``tool.name`` 作为 key 存入内部映射。若同名工具已存在，
         会被新工具覆盖（即允许热替换）。
         """
+        if self._frozen_definitions is not None:
+            raise RuntimeError("工具注册表已冻结，不能再修改 Schema")
         self._tools[tool.name] = tool
+
+    def freeze(self) -> str:
+        """冻结最终工具 Schema，并返回不含参数值的稳定 SHA-256 hash。
+
+        冻结应发生在内置工具和 MCP 条件工具全部注册结束之后。工具定义按名称
+        排序并深拷贝，后续每次模型请求都复用同一份逻辑快照；工具集合变化必须
+        通过创建新的注册表（即新的显式 cache boundary）生效。
+        """
+        if self._frozen_definitions is None:
+            definitions = self._build_definitions()
+            self._frozen_definitions = tuple(deepcopy(definitions))
+            payload = json.dumps(
+                definitions,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            self._schema_hash = hashlib.sha256(payload).hexdigest()
+        return self._schema_hash or ""
+
+    @property
+    def is_frozen(self) -> bool:
+        return self._frozen_definitions is not None
+
+    @property
+    def schema_hash(self) -> str:
+        """返回当前确定性 Schema hash；未冻结时按当前内容即时计算。"""
+        if self._schema_hash is not None:
+            return self._schema_hash
+        payload = json.dumps(
+            self._build_definitions(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def _build_definitions(self) -> List[dict]:
+        return [
+            self._tools[name].to_function_definition()
+            for name in sorted(self._tools)
+        ]
 
     def get_definitions(self) -> List[dict]:
         """返回所有工具的 OpenAI function-calling 定义列表。
 
-        顺序与注册顺序一致（基于 dict 的插入序）。直接把返回值放进
+        顺序按工具名确定，不受内置/MCP 注册先后影响。直接把返回值放进
         OpenAI 接口的 ``tools`` 参数即可。
         """
-        return [tool.to_function_definition() for tool in self._tools.values()]
+        if self._frozen_definitions is not None:
+            return deepcopy(list(self._frozen_definitions))
+        return deepcopy(self._build_definitions())
 
     def list_tools(self) -> List[str]:
-        """返回所有已注册工具的名称列表（按注册顺序）。"""
-        return list(self._tools.keys())
+        """返回所有已注册工具的名称列表（按名称排序）。"""
+        return sorted(self._tools)
 
     def get(self, name: str) -> Optional[Tool]:
         """按名称返回工具实例；不存在时返回 ``None``。"""
@@ -80,8 +131,8 @@ class ToolRegistry:
         return [self._tools[name] for name in names if name in self._tools]
 
     def iter_tools(self):
-        """按注册顺序迭代工具实例，不暴露内部映射。"""
-        return iter(self._tools.values())
+        """按名称顺序迭代工具实例，不暴露内部映射。"""
+        return iter(self._tools[name] for name in sorted(self._tools))
 
     async def execute(self, name: str, arguments: dict) -> str:
         """按名称异步执行某个工具。

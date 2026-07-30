@@ -41,7 +41,7 @@ _DEFAULT_ASR_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
 # 网页可编辑的配置字段白名单（GET 返回、POST 接受均限定在此范围内）
 _CONFIG_FIELDS = (
-    "api_key", "base_url", "model", "subagent_model", "workspace",
+    "api_key", "base_url", "model", "subagent_model", "workspace", "timezone",
     "max_iterations", "identity_file", "feishu_app_id", "feishu_app_secret",
     "web_host", "web_port", "turn_timeout_sec",
     "multimodal_model", "base_model_multimodal",
@@ -163,6 +163,14 @@ class WebChannel(Channel):
                     val = int(val)
                 except (TypeError, ValueError):
                     continue
+            if k == "timezone":
+                try:
+                    from config import validate_iana_timezone
+                    val = validate_iana_timezone(val)
+                except ValueError as exc:
+                    return web.json_response(
+                        {"ok": False, "error": str(exc)}, status=400
+                    )
             setattr(self.config, k, val)
             changed[k] = val
 
@@ -178,7 +186,7 @@ class WebChannel(Channel):
         return web.json_response({
             "ok": True,
             "changed": changed,
-            "note": "新会话将使用更新后的配置；已在进行的会话保持原状。修改 web_host/web_port 需重启本实例生效。",
+            "note": "模型/人设等会在新会话使用；已在进行的会话保持原状。修改 web_host/web_port/timezone、MCP、Skill 或工具相关配置需重启本实例生效。",
         })
 
     @staticmethod

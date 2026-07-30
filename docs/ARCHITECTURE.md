@@ -129,7 +129,9 @@ nanoclaw/
    额外启动一个 Node Bridge；Python 只传状态/受控图片目录，不接触登录秘密。
 6. 启动渠道任务、Gateway 的入站/出站/流事件消费循环，以及单一 ReminderScheduler；关闭时先停止调度器，再停止出站分发和渠道。
 
-若配置的人设文件不存在或为空，Gateway 会在创建会话 Agent 前调用实例级 `IdentityBootstrapper`。首条消息只触发询问，同一会话下一条文本生成工作区内的人设文件；引导消息不调用模型、不进入会话历史。人设创建后 ContextBuilder 每轮重读文件，因此无需重启。多渠道并发由 Bootstrapper 的实例级锁协调，任一渠道完成后其它渠道直接进入正常流程。
+若配置的人设文件不存在或为空，Gateway 会在创建会话 Agent 前调用实例级 `IdentityBootstrapper`。首条消息只触发询问，同一会话下一条文本生成工作区内的人设文件；引导消息不调用模型、不进入会话历史。ContextBuilder 在会话创建时读取 identity、USER、MEMORY 与场景 Agent 摘要并形成稳定快照；新会话或 `/clear` 才显式刷新。Skill 摘要继续是进程启动快照，修改后需重启。多渠道并发由 Bootstrapper 的实例级锁协调，任一渠道完成后其它渠道直接进入正常流程。
+
+内置工具注册完成、MCP 连接尽力而为结束后，ToolRegistry 按工具名生成确定性定义并冻结。成功连接的 MCP 集合是启动期 cache boundary；冻结后禁止继续热注册。每个用户回合再取得一次深拷贝快照，确保同一轮多次工具迭代使用完全相同的 Schema。
 
 Linux 后台控制脚本通过 `setsid` 建立独立进程组，并用 PID 文件校验 `/proc` 中的工作目录和命令行，避免陈旧 PID 误杀其它进程。`SIGTERM` 在 `main.py` 中转换为 asyncio 停止事件；Gateway 先取消并等待已登记的在途消息任务，再停止渠道并关闭 MCP 连接。
 
@@ -175,12 +177,16 @@ Web 是唯一启用细粒度流事件的渠道：`thinking`、`token`、`tool_ca
 
 ### 5.3 ReAct 和工具
 
-1. ContextBuilder 每轮重读 identity、USER 和 MEMORY，构建 system prompt。
+1. ContextBuilder 使用会话级快照构建不含墙钟的稳定 System Prompt；当前时间仅在相关任务中通过 `get_current_time` 查询。
 2. 加入会话历史和当前 user；图片按基础模型是否多模态选择直传或工具路径。
-3. 超过约 192k 的启发式 token 预算时，旧消息被总结为一条 system 摘要。
+3. 估算消息、多模态 content 与工具 Schema；超过约 192k 预算时，旧消息被总结为一条 system 摘要，并记录稳定 head/tail 压缩边界。
 4. Provider 返回最终回答或 tool calls。
 5. ToolRegistry 统一按名调用工具并把异常转成字符串。普通工具默认使用 180 秒兜底超时，Shell 另有 60 秒内部超时；`spawn_subagent` 由子 Agent 自身的回合上限管理，生图使用独立的单请求超时和整次任务预算。
 6. 工具结果加入 messages 后继续模型循环，直到最终回答、单轮超时、最大迭代数或熔断。
+
+跨轮历史使用单一 canonical API 形式：`assistant(tool_calls) → tool` 顺序自愈，孤立 tool 丢弃，缺失结果用固定占位补齐；assistant 顶层 `reasoning_content`（若供应商要求工具循环重放）会在同进程、JSONL 与重启恢复中一致保留，但绝不进入单个 `tool_calls` 元素。这样最后一次工具请求能够成为下一用户回合的精确消息前缀。
+
+每次 Provider 调用都会归一 OpenAI-compatible usage，并输出隐私安全的调用指标；压缩期间的 daily/历史摘要调用也带独立 `phase` 纳入同一回合。回合聚合只在所有调用都报告 cached tokens 时计算精确 `sum(cached)/sum(input)`。System/工具只记录短 SHA-256 hash，不记录其内容。流式路径请求 `include_usage`，不支持时降级并标为 unavailable。
 
 内置能力包括文件读写/列目录、Shell、Web 搜索/抓取、技能枚举/加载、记忆检索、视觉理解、生图和临时子 Agent。MCP 工具使用 `{server}__{tool}` 命名。
 
@@ -222,6 +228,7 @@ workspace/
 
 - JSONL 保存 user、assistant 和 tool 消息；system prompt 每轮重建，不落盘。
 - 图片只落原始字节和轻量引用，不把 base64 写进 JSONL。
+- 多模态历史在文件仍存在时按原字节重建，因此进程重启前后 API 形态一致；文件删除/变化是显式内容边界，且供应商是否缓存图片未知。
 - 子 Agent 图片沿用父会话 key；父 `assistant(tool_calls)` 记录保存有界的 `subagent_runs` 回放摘要和 `generated_images`。这些 UI 元数据在恢复模型上下文前会被剥离。
 - USER 偏长期个人信息，MEMORY 偏项目/工作事实，HISTORY 保存压缩轨迹，daily 保存 best-effort 事件摘要。
 - MemorySearcher 启动时重建全部索引；每次搜索只刷新记忆文件部分，会话索引在当前进程内不会实时更新。
@@ -288,6 +295,7 @@ at-least-once：若进程在渠道接受后、SQLite 成功提交前崩溃，重
 - 已存在的 Agent 保持原配置。
 - Web host/port、MCP 连接、技能摘要、工具注册、workspace 绑定、共享记忆 Provider 等启动期对象需要重启才能一致生效。
 - `base_model_multimodal` 决定是否注册 `ask_image`，因此修改后必须重启。
+- `timezone` 是实例默认 IANA 时区；`get_current_time` 在启动时校验，修改后需重启。
 - `asr_model` 和 `tts_model` 都是启动期服务配置；页面的 TTS 喇叭开关只是当前标签页内存状态，刷新后默认关闭。
 - `reminders` 的数据库路径、超时、lease、校时与尝试上限都是启动期配置；Web 保存后需重启。
 - `weixin` 的 Bridge 命令、state dir、allowlist、IPC/登录/图片上限均为启动期配置；
@@ -320,3 +328,4 @@ at-least-once：若进程在渠道接受后、SQLite 成功提交前崩溃，重
 7. 微信社区基础仓库只在 `package.json` 声明 MIT、缺少独立 LICENSE；当前 vendor
    固定了来源和 NOTICE，但正式分发前仍需维护者/法律复核。真实腾讯端点兼容性
    也只能在明确授权扫码后手工验收，自动化使用 fake iLink HTTP/CDN/process。
+8. Prompt Cache 是供应商能力：冷启动、显式上下文刷新、工具/MCP 集合变化和历史压缩会产生新前缀；工具 Schema、图片是否参与缓存键不能由 NanoClaw 保证。

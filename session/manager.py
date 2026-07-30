@@ -8,6 +8,8 @@ import json
 import os
 from datetime import datetime
 
+from agent.history import canonicalize_history, canonicalize_history_message
+
 
 class SessionManager:
     """按会话维度管理对话历史的持久化、读取与清理。"""
@@ -36,7 +38,7 @@ class SessionManager:
         - 复制一份再附加时间戳，不污染调用方传入的原始 dict
         """
         path = self._get_session_path(session_key)
-        record = dict(message)
+        record = canonicalize_history_message(message)
         record["timestamp"] = datetime.now().isoformat(timespec="seconds")
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -54,8 +56,8 @@ class SessionManager:
         """
         path = self._get_session_path(session_key)
         with open(path, "w", encoding="utf-8") as f:
-            for message in messages:
-                record = dict(message)
+            for message in canonicalize_history(messages):
+                record = canonicalize_history_message(message)
                 record["timestamp"] = datetime.now().isoformat(timespec="seconds")
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -81,15 +83,9 @@ class SessionManager:
                 except json.JSONDecodeError:
                     # 单行损坏不影响其余历史
                     continue
-                msg.pop("timestamp", None)
-                # 思考内容（reasoning_content）是模型的临时内心独白，不应回放：
-                # 一是避免发给 API 时与 assistant(tool_calls) 消息冲突（硅基流动
-                # 等兼容实现对 tool_calls 消息上的 reasoning_content 敏感），
-                # 二是省 token。下次再需要时模型会重新推理。
-                msg.pop("reasoning_content", None)
-                messages.append(msg)
+                messages.append(canonicalize_history_message(msg))
 
-        return self._normalize_tool_history(messages)
+        return canonicalize_history(messages)
 
     @staticmethod
     def _normalize_tool_history(messages: list[dict]) -> list[dict]:
@@ -104,88 +100,7 @@ class SessionManager:
         原始 JSONL 不在读取时覆盖，避免破坏时间戳和 Web 历史展示元数据；返回给
         Agent 的内存历史始终满足 ``assistant(tool_calls) → tool...`` 契约。
         """
-        normalized: list[dict] = []
-        # 旧版错误顺序中，若干 tool 会紧邻出现在其 assistant 前面。
-        leading_tools: list[dict] = []
-        pending_ids: list[str] = []
-        pending_tools: dict[str, dict] = {}
-
-        def close_pending() -> None:
-            nonlocal pending_ids, pending_tools
-            for tool_call_id in pending_ids:
-                tool_msg = pending_tools.get(tool_call_id)
-                if tool_msg is None:
-                    tool_msg = {
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "content": (
-                            "（历史记录中缺失对应的工具结果，"
-                            "已由会话管理器自动补全）"
-                        ),
-                    }
-                normalized.append(tool_msg)
-            pending_ids = []
-            pending_tools = {}
-
-        for message in messages:
-            role = message.get("role")
-
-            if pending_ids:
-                if role == "tool":
-                    tool_call_id = message.get("tool_call_id")
-                    if (
-                        tool_call_id in pending_ids
-                        and tool_call_id not in pending_tools
-                    ):
-                        pending_tools[tool_call_id] = message
-                    if all(tcid in pending_tools for tcid in pending_ids):
-                        close_pending()
-                    continue
-                # OpenAI 协议不允许其它角色插在未完成的工具交换中间。
-                close_pending()
-
-            if role == "tool":
-                # 暂存连续的前置 tool；只有紧随其后的 assistant 引用了相同 id
-                # 才会恢复，否则它就是不可归属的孤立结果并被丢弃。
-                leading_tools.append(message)
-                continue
-
-            if role == "assistant" and message.get("tool_calls"):
-                expected_ids = []
-                for tool_call in message.get("tool_calls") or []:
-                    tool_call_id = tool_call.get("id")
-                    if tool_call_id and tool_call_id not in expected_ids:
-                        expected_ids.append(tool_call_id)
-                if not expected_ids:
-                    # tool_calls 结构本身无有效 id，去掉无效字段，保留可见正文。
-                    cleaned = dict(message)
-                    cleaned.pop("tool_calls", None)
-                    normalized.append(cleaned)
-                    leading_tools = []
-                    continue
-
-                normalized.append(message)
-                pending_ids = expected_ids
-                pending_tools = {}
-                for tool_message in leading_tools:
-                    tool_call_id = tool_message.get("tool_call_id")
-                    if (
-                        tool_call_id in pending_ids
-                        and tool_call_id not in pending_tools
-                    ):
-                        pending_tools[tool_call_id] = tool_message
-                leading_tools = []
-                if all(tcid in pending_tools for tcid in pending_ids):
-                    close_pending()
-                continue
-
-            # 普通消息构成边界；边界前仍未找到 assistant 的 tool 无法安全归属。
-            leading_tools = []
-            normalized.append(message)
-
-        if pending_ids:
-            close_pending()
-        return normalized
+        return canonicalize_history(messages)
 
     def clear(self, session_key: str) -> None:
         """删除某会话的 JSONL 文件（若不存在则静默忽略）。"""

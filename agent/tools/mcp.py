@@ -151,9 +151,11 @@ class MCPClientManager:
 
         # 4) 拉取工具清单，逐个包装成 MCPTool
         result = await session.list_tools()
-        added = 0
+        # Build per-server wrappers transactionally.  Nothing becomes visible
+        # to get_tools() until the full list has been validated and wrapped.
+        pending_tools: list[MCPTool] = []
         for tool in result.tools:
-            self._tools.append(
+            pending_tools.append(
                 MCPTool(
                     server_name=server_name,
                     tool_name=tool.name,
@@ -162,10 +164,10 @@ class MCPClientManager:
                     manager=self,
                 )
             )
-            added += 1
 
         self._sessions[server_name] = session
-        print(f"[MCP] 已连接 Server '{server_name}'，加载工具 {added} 个")
+        self._tools.extend(pending_tools)
+        print(f"[MCP] 已连接 Server '{server_name}'，加载工具 {len(pending_tools)} 个")
 
     async def connect_all(self, timeout: float = 30.0) -> None:
         """连接配置中的所有 Server。
@@ -233,6 +235,13 @@ class MCPClientManager:
             except Exception:  # noqa: BLE001 - 清理失败不抛出
                 pass
         self._sessions.pop(server_name, None)
+        # Defensive rollback for retries/legacy partial connections.  Current
+        # _connect_one commits transactionally, but cleanup must also guarantee
+        # get_tools() never exposes wrappers backed by a dead session.
+        self._tools = [
+            tool for tool in self._tools
+            if getattr(tool, "_server", None) != server_name
+        ]
 
     async def shutdown(self) -> None:
         """停止所有连接：按 session → stdio 顺序退出上下文，回收子进程。"""
