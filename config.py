@@ -75,6 +75,14 @@ _CONFIG_FIELDS = (
     # 生图模型：由 generate_image 工具调用，具体服务与模型由用户配置（见 image_gen_model）。
     # 三者皆空视为未配置；api_key 可走环境变量 IMAGE_GEN_API_KEY 覆盖。
     "image_gen_model",
+    # 视频生成模型：由 create_video / query_video 工具调用（异步任务式，见 video_gen_model）。
+    # 为空可兜底复用 image_gen_model 的 api_key / base_url；api_key 还可走 VIDEO_GEN_API_KEY 覆盖。
+    "video_gen_model",
+    # 视频生成多服务商适配层：video_provider 指定当前启用哪个 provider；
+    # video_providers 用配置描述各 provider 的创建/查询端点与响应字段映射。
+    # 不配新结构时由 video_gen_model 兜底为 agnes 单 provider（见 video.py）。
+    "video_provider",
+    "video_providers",
     # 语音识别：首版用于 Web 端录音转文字；api_key 可由 ASR_API_KEY 覆盖。
     "asr_model",
     # 文字转语音：首版使用 edge-tts；服务端能力与网页自动朗读开关相互独立。
@@ -151,6 +159,27 @@ class NanoClawConfig:
             },
         }
     )
+    # 视频生成模型配置：由 create_video / query_video 工具调用。视频生成是异步任务式
+    # ——create_video 创建任务后立即返回 video_id（绝不轮询），稍后由 query_video
+    # 查询状态并下载结果。api_key / base_url 为空时自动兜底复用 image_gen_model 的
+    # 对应字段；api_key 还可走环境变量 VIDEO_GEN_API_KEY 覆盖。model 必须显式
+    # 配置（不内置默认模型名，代码不绑定厂商）；download=false 时不落盘、仅返回直链。
+    video_gen_model: dict = field(
+        default_factory=lambda: {
+            "api_key": "",
+            "base_url": "",
+            "model": "",
+            "timeout_sec": 30,
+            "download": True,
+        }
+    )
+    # 视频生成多服务商适配层：video_provider 指定当前启用哪个 provider（缺省
+    # "agnes"）；video_providers 描述各 provider 的 api_key/base_url/model/
+    # timeout_sec/download 与 create/query/fields 映射。**不破坏旧配置**：没有
+    # 新结构时，video.py 用 video_gen_model 兜底为 agnes 单 provider（默认 schema
+    # 等价旧行为）。env VIDEO_GEN_API_KEY 仍可覆盖 api_key。
+    video_provider: str = "agnes"
+    video_providers: dict = field(default_factory=dict)
     # 语音识别与主聊天模型使用独立配置和密钥。未启用或配置不完整时，
     # 普通文字聊天不受影响，Web 录音接口返回明确的未配置错误。
     asr_model: dict = field(
@@ -291,6 +320,12 @@ def load_config(config_path: str = "config.json") -> NanoClawConfig:
         cfg.image_gen_model = dict(cfg.image_gen_model)
         cfg.image_gen_model["api_key"] = env_img_key
 
+    # 视频生成模型 API Key 走环境变量覆盖（VIDEO_GEN_API_KEY 命中即覆盖）
+    env_video_key = os.environ.get("VIDEO_GEN_API_KEY")
+    if env_video_key:
+        cfg.video_gen_model = dict(cfg.video_gen_model)
+        cfg.video_gen_model["api_key"] = env_video_key
+
     # ASR 使用独立密钥，避免默认复用主聊天模型的权限与账单边界。
     env_asr_key = os.environ.get("ASR_API_KEY")
     if env_asr_key:
@@ -311,6 +346,11 @@ def save_config(cfg: NanoClawConfig, config_path: str = "config.json") -> None:
     if os.environ.get("ASR_API_KEY") and isinstance(data.get("asr_model"), dict):
         data["asr_model"] = dict(data["asr_model"])
         data["asr_model"]["api_key"] = ""
+    # video_gen_model 同理：VIDEO_GEN_API_KEY 注入的密钥仅供进程使用，保存时
+    # 不应意外持久化到 config.json（与 ASR 相同的处理）。
+    if os.environ.get("VIDEO_GEN_API_KEY") and isinstance(data.get("video_gen_model"), dict):
+        data["video_gen_model"] = dict(data["video_gen_model"])
+        data["video_gen_model"]["api_key"] = ""
     if isinstance(data.get("weixin"), dict):
         data["weixin"] = {
             name: data["weixin"][name]

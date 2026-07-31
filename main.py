@@ -64,6 +64,8 @@ from agent.tools.search import MemorySearchTool
 from agent.tools.vision import AskImageTool
 from agent.tools.imagegen import GenerateImageTool
 from agent.imagestore import ImageStore
+from agent.tools.video import CreateVideoTool, QueryVideoTool
+from agent.videostore import VideoStore
 
 from bus.queue import MessageBus, OutboundMessage
 from gateway import Gateway
@@ -431,6 +433,10 @@ def build_shared() -> dict:
     #      现有 .jsonl 结构零改动；供 ask_image 工具与多模态直传使用。
     image_store = ImageStore(sessions_dir)
 
+    # 7.3) 视频存储：与 sessions 同目录，按会话落盘到 <safe_key>_videos/，
+    #      供 create_video / query_video 下载保存生成的视频（文件可能几十 MB）。
+    video_store = VideoStore(sessions_dir)
+
     # 7.5) 记忆检索：SQLite + LIKE 索引 USER/MEMORY/daily/sessions，
     #      启动时全量重建。注册 memory_search 工具（唯一新增工具——检索是
     #      read_file 做不到的真新能力，符合大道至简的例外）。
@@ -451,6 +457,12 @@ def build_shared() -> dict:
     # 生图工具 generate_image：始终注册（与 base_model_multimodal 无关）。
     # 未配置 image_gen_model 时仍注册，工具内部返回友好提示，由主模型用文字继续。
     tools.register(GenerateImageTool(image_store, config))
+
+    # 视频生成工具 create_video / query_video：始终注册（异步任务式——创建任务
+    # 立即返回 video_id、绝不轮询；稍后由 query_video 查询并下载结果）。未配置
+    # video_gen_model 时仍注册，工具内部返回友好提示，由主模型用文字继续。
+    tools.register(CreateVideoTool(video_store, config))
+    tools.register(QueryVideoTool(video_store, config))
 
     # 子 Agent 工具最后注册，确保 Profile 创建/派遣时可见完整的内置工具集合。
     # MCP 工具稍后仍会注入同一个 registry，因此执行时同样可被校验和选用。
@@ -495,6 +507,7 @@ def build_shared() -> dict:
         "identity_bootstrapper": identity_bootstrapper,
         "session_manager": session_manager,
         "image_store": image_store,
+        "video_store": video_store,
         "memory": memory,
         "daily_memory": daily_memory,
         "searcher": searcher,
@@ -608,6 +621,7 @@ async def amain() -> None:
             agents_registry.pop(session_key, None)
             await asyncio.to_thread(shared["session_manager"].clear, session_key)
             await asyncio.to_thread(shared["image_store"].clear, session_key)
+            await asyncio.to_thread(shared["video_store"].clear, session_key)
 
         async def scheduled_agent_runner(prompt: str, session_key: str) -> str:
             # A scheduled execution is deliberately isolated from daily chat and
@@ -694,6 +708,10 @@ async def amain() -> None:
         image_store = shared.get("image_store")
         if image_store is not None:
             image_store.clear(session_key)
+        # 清除该会话落盘的视频目录（视频文件可能几十 MB，避免无限堆积）。
+        video_store = shared.get("video_store")
+        if video_store is not None:
+            video_store.clear(session_key)
 
     cli_channel._clear_callback = clear_callback
 

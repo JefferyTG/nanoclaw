@@ -579,10 +579,11 @@ class AgentLoop:
             self._print_tool_call(tc.name, sig_args)
             if stream_sink is not None:
                 await stream_sink({"type": "tool_call", "name": tc.name, "args": sig_args})
-            # ask_image / generate_image 都是跨会话共享单例，需注入当前 session_key
-            # 才能按会话定位图片落盘路径；其它工具忽略该参数。
+            # ask_image / generate_image / create_video / query_video 都是跨会话
+            # 共享单例，需注入当前 session_key 才能按会话定位图片/视频落盘路径；
+            # 其它工具忽略该参数。
             exec_args = dict(tc.arguments)
-            if tc.name in ("ask_image", "generate_image"):
+            if tc.name in ("ask_image", "generate_image", "create_video", "query_video"):
                 exec_args["session_key"] = self.session_key
             # generate_image 还需挂载 stream_sink（实时把图片推给网页端内联显示）
             # 与一个收集列表（把生成的 image_id 回写给主循环，用于历史回放持久化）；

@@ -91,5 +91,67 @@
     "max_ipc_line_bytes": 1048576,
     "max_inbound_image_bytes": 20971520,
     "max_outbound_image_bytes": 20971520
+  },
+  "video_gen_model": {
+    "api_key": "",
+    "base_url": "",
+    "model": "",
+    "timeout_sec": 30,
+    "download": true
+  },
+  "video_provider": "agnes",
+  "video_providers": {
+    "agnes": {
+      "api_key": "",
+      "base_url": "https://apihub.agnes-ai.com/v1",
+      "model": "agnes-video-v2.0",
+      "create": {
+        "method": "POST",
+        "path": "/videos"
+      },
+      "query": {
+        "method": "GET",
+        "path": "/agnesapi",
+        "id_in": "query",
+        "id_param": "video_id"
+      },
+      "fields": {
+        "task_id": "video_id",
+        "status": "status",
+        "progress": "progress",
+        "seconds": "seconds",
+        "size": "size",
+        "url": "metadata.url",
+        "url_fallback": "url"
+      },
+      "timeout_sec": 30,
+      "download": true
+    },
+    "kling": {
+      "api_key": "",
+      "base_url": "https://api.klingai.com",
+      "model": "kling-v2.6-pro",
+      "create": {
+        "method": "POST",
+        "path": "/v1/videos/text2video"
+      },
+      "query": {
+        "method": "GET",
+        "path": "/v1/videos/{id}",
+        "id_in": "path",
+        "id_placeholder": "{id}"
+      },
+      "fields": {
+        "task_id": "task_id",
+        "status": "status",
+        "progress": "progress",
+        "seconds": "seconds",
+        "size": "size",
+        "url": "result.videos[0].url",
+        "url_fallback": ""
+      },
+      "timeout_sec": 30,
+      "download": true
+    }
   }
 }
