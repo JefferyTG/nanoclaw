@@ -22,6 +22,7 @@ sessions/
 *.log
 run.log
 nanoclaw.launchd.log
+output/
 
 # 人设（个人定制，仓库使用内置默认人设兜底）
 identity.md
@@ -40,3 +41,4 @@ scripts/
 avatar*.png
 lolita_prompt.md
 小红书参考图/
+Camera_*.jpg
