@@ -336,6 +336,212 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.bus.outbound_queue.empty())
         self.assertNotIn("secret-token", "\n".join(captured.output))
 
+    # —— /new 多会话专项测试 ——
+
+    async def test_new_command_replies_with_new_session_text_and_skips_agent(self):
+        target = encode_weixin_target("account", "user")
+        handler = asyncio.create_task(self.channel._handle_inbound({
+            "account_id": "account", "user_id": "user", "delivery_id": "new",
+            "text": "/new", "images": [],
+        }))
+        reply = await asyncio.wait_for(self.bus.consume_outbound(), 1)
+        self.assertEqual(reply.chat_id, target)
+        self.assertIn("已新建会话", reply.content)
+        self.assertIn("#1", reply.content)
+        self.assertEqual(self.channel._sessions[target], {"seq": 1, "current": 1})
+        request = await self._respond(method="ack_inbound")
+        self.assertEqual(request["params"]["delivery_id"], "new")
+        await handler
+        # /new 本身绝不投递给 Agent（不进 Gateway/Agent）
+        self.assertTrue(self.bus.inbound_queue.empty())
+
+    async def test_text_after_new_uses_suffixed_sender_id_and_same_chat_id(self):
+        target = encode_weixin_target("account", "user")
+        new_task = asyncio.create_task(self.channel._handle_inbound({
+            "account_id": "account", "user_id": "user", "delivery_id": "new",
+            "text": "/new", "images": [],
+        }))
+        reply = await asyncio.wait_for(self.bus.consume_outbound(), 1)
+        self.assertIn("已新建会话", reply.content)
+        await self._respond(method="ack_inbound")
+        await new_task
+
+        # /new 之后的普通文本：sender_id 带新会话序号，chat_id 仍为 target
+        inbound = await self._deliver_inbound({
+            "account_id": "account", "user_id": "user", "delivery_id": "text",
+            "text": "你好", "images": [],
+        }, consume=True)
+        self.assertEqual(inbound.sender_id, f"{target}:1")
+        self.assertEqual(inbound.chat_id, target)
+        self.assertEqual(inbound.content, "你好")
+
+    async def test_first_message_before_any_new_keeps_legacy_unsuffixed_sender(self):
+        target = encode_weixin_target("account", "user")
+        inbound = await self._deliver_inbound({
+            "account_id": "account", "user_id": "user", "delivery_id": "first",
+            "text": "你好", "images": [],
+        }, consume=True)
+        # 会话 0（老会话）sender_id 不带后缀，保证升级后记忆连续
+        self.assertEqual(inbound.sender_id, target)
+        self.assertEqual(inbound.chat_id, target)
+        self.assertEqual(self.channel._sessions[target], {"seq": 0, "current": 0})
+
+    async def test_new_with_image_is_ordinary_image_turn_not_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inbound_dir = Path(tmp) / "inbound"
+            inbound_dir.mkdir()
+            image = inbound_dir / "new.png"
+            image.write_bytes(b"image")
+            self.channel.state_dir = Path(tmp).resolve()
+            self.channel.image_store = _Store()
+            self.channel.image_merge_window_sec = 0
+            target = encode_weixin_target("account", "user")
+            inbound = await self._deliver_inbound({
+                "account_id": "account", "user_id": "user", "delivery_id": "new-image",
+                "text": "/new", "images": [{"file_path": str(image), "mime_type": "image/png"}],
+            }, consume=True)
+        # 带图片的 /new 不算命令：仍按图文轮投递给 Agent
+        self.assertEqual(inbound.content, "/new")
+        self.assertEqual(len(inbound.images), 1)
+        self.assertEqual(inbound.sender_id, target)
+        # 未切换会话，也未产生「已新建会话」回复
+        self.assertEqual(self.channel._sessions[target], {"seq": 0, "current": 0})
+        self.assertTrue(self.bus.outbound_queue.empty())
+
+    async def test_new_flushes_pending_image_batch_into_old_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inbound_dir = Path(tmp) / "inbound"
+            inbound_dir.mkdir()
+            image = inbound_dir / "in.png"
+            image.write_bytes(b"image")
+            self.channel.state_dir = Path(tmp).resolve()
+            self.channel.image_store = _Store()
+            self.channel.image_merge_window_sec = 60
+            target = encode_weixin_target("account", "user")
+
+            # 先来一张纯图片：进入在途批次，尚未投递 Agent
+            await self._deliver_inbound({
+                "account_id": "account", "user_id": "user", "delivery_id": "img",
+                "text": "", "images": [{"file_path": str(image), "mime_type": "image/png"}],
+            })
+            self.assertTrue(self.bus.inbound_queue.empty())
+            batch = next(iter(self.channel._pending_image_batches.values()))
+            self.assertEqual(batch.sequence, 0)
+
+            # /new：先把在途图片 flush 进旧会话（sender_id 无后缀），再切新会话
+            new_task = asyncio.create_task(self.channel._handle_inbound({
+                "account_id": "account", "user_id": "user", "delivery_id": "new",
+                "text": "/new", "images": [],
+            }))
+            flushed = await asyncio.wait_for(self.bus.consume_inbound(), 1)
+            self.assertEqual(flushed.sender_id, target)
+            self.assertEqual(flushed.content, "请分析这张图片。")
+            self.assertEqual(len(flushed.images), 1)
+            reply = await asyncio.wait_for(self.bus.consume_outbound(), 1)
+            self.assertIn("已新建会话", reply.content)
+            await self._respond(method="ack_inbound")
+            await new_task
+            # flush 成功后批次应被移除
+            self.assertFalse(self.channel._pending_image_batches)
+
+            # 新会话的文本 sender_id 带 :1 后缀
+            text = await self._deliver_inbound({
+                "account_id": "account", "user_id": "user", "delivery_id": "text",
+                "text": "续聊", "images": [],
+            }, consume=True)
+            self.assertEqual(text.sender_id, f"{target}:1")
+            self.assertEqual(text.content, "续聊")
+
+    async def test_consecutive_new_commands_increment_session_sequence(self):
+        target = encode_weixin_target("account", "user")
+        for index in (1, 2):
+            handler = asyncio.create_task(self.channel._handle_inbound({
+                "account_id": "account", "user_id": "user", "delivery_id": f"new-{index}",
+                "text": "/new", "images": [],
+            }))
+            reply = await asyncio.wait_for(self.bus.consume_outbound(), 1)
+            self.assertIn(f"#{index}", reply.content)
+            await self._respond(method="ack_inbound")
+            await handler
+        self.assertEqual(self.channel._sessions[target], {"seq": 2, "current": 2})
+        inbound = await self._deliver_inbound({
+            "account_id": "account", "user_id": "user", "delivery_id": "text",
+            "text": "再续聊", "images": [],
+        }, consume=True)
+        self.assertEqual(inbound.sender_id, f"{target}:2")
+
+    async def test_new_requires_exact_text_command(self):
+        target = encode_weixin_target("account", "user")
+        # 首尾空白会被 strip，仍算 /new 命令
+        handler = asyncio.create_task(self.channel._handle_inbound({
+            "account_id": "account", "user_id": "user", "delivery_id": "new-space",
+            "text": " /new ", "images": [],
+        }))
+        reply = await asyncio.wait_for(self.bus.consume_outbound(), 1)
+        self.assertIn("已新建会话", reply.content)
+        await self._respond(method="ack_inbound")
+        await handler
+
+        # 非精确命令（/newxxx）应作为普通文本投递给 Agent，且落在上一轮新会话
+        inbound = await self._deliver_inbound({
+            "account_id": "account", "user_id": "user", "delivery_id": "not-new",
+            "text": "/newxxx", "images": [],
+        }, consume=True)
+        self.assertEqual(inbound.content, "/newxxx")
+        self.assertEqual(inbound.sender_id, f"{target}:1")
+
+    async def test_pending_batch_after_new_persists_and_restores_into_session_1(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            inbound_dir = state / "inbound"
+            inbound_dir.mkdir(parents=True)
+            image = inbound_dir / "in.png"
+            image.write_bytes(b"image")
+            store = ImageStore(str(Path(tmp) / "sessions"))
+            self.channel.state_dir = state.resolve()
+            self.channel.image_store = store
+            self.channel.image_merge_window_sec = 60
+            target = encode_weixin_target("account", "user")
+
+            # 先切到会话 1
+            new_task = asyncio.create_task(self.channel._handle_inbound({
+                "account_id": "account", "user_id": "user", "delivery_id": "new",
+                "text": "/new", "images": [],
+            }))
+            reply = await asyncio.wait_for(self.bus.consume_outbound(), 1)
+            self.assertIn("已新建会话", reply.content)
+            await self._respond(method="ack_inbound")
+            await new_task
+
+            # 会话 1 下发一张图片 → 在途批次 session_key 带 :1 后缀并落盘
+            await self._deliver_inbound({
+                "account_id": "account", "user_id": "user", "delivery_id": "img",
+                "text": "", "images": [{"file_path": str(image), "mime_type": "image/png"}],
+            })
+            batch = next(iter(self.channel._pending_image_batches.values()))
+            self.assertEqual(batch.sequence, 1)
+            self.assertEqual(batch.session_key, f"weixin:{target}:1")
+            self.assertTrue((state / "pending_image_batches.json").exists())
+
+            # 让批次过期后落盘，模拟进程重启前的持久化状态
+            batch.deadline_ms = int(time.time() * 1000) - 1
+            self.channel._persist_pending_image_batches_locked()
+
+            # 新通道恢复：过期批次应 flush 进会话 1（sender_id target:1）
+            restored_bus = MessageBus()
+            restored = WeixinChannel(
+                bus=restored_bus, bridge_command=["fake"], state_dir=state,
+                allowed_user_ids=["user"], image_store=store,
+            )
+            restore = asyncio.create_task(restored._restore_pending_image_batches())
+            inbound = await asyncio.wait_for(restored_bus.consume_inbound(), 0.5)
+            await restore
+            self.assertEqual(inbound.sender_id, f"{target}:1")
+            self.assertEqual(inbound.content, "请分析这张图片。")
+            self.assertEqual(len(inbound.images), 1)
+            self.assertFalse((state / "pending_image_batches.json").exists())
+            await restored.stop()
+
     async def test_stop_cancels_pending_session_reauthentication(self):
         self.channel.restart_backoff_sec = 0
         await self.channel._handle_event("session_expired", {"code": -14})

@@ -68,6 +68,7 @@ class _PendingImageBatch:
     user_id: str
     target: str
     session_key: str
+    sequence: int = 0
     images: list = field(default_factory=list)
     delivery_ids: set[str] = field(default_factory=set)
     deadline_ms: int = 0
@@ -180,6 +181,9 @@ class WeixinChannel(Channel):
         self._pending_image_batches: dict[tuple[str, str], _PendingImageBatch] = {}
         self._inbound_lock = asyncio.Lock()
         self._pending_batches_restored = False
+        # 多会话状态：target -> {"seq": 已建会话数, "current": 当前活动序号}。
+        # key 用 target（含 account_id），多账号天然隔离；与飞书 /new 机制对称。
+        self._sessions: dict[str, dict] = {}
         # ReminderService owns authorization and persistence.  This adapter
         # only recognizes deterministic private-message commands and forwards
         # the stable, credential-free target identity.
@@ -594,14 +598,20 @@ class WeixinChannel(Channel):
         into its in-memory image batch and may therefore be acknowledged.
         """
         target = encode_weixin_target(account_id, user_id)
-        session_key = f"{self.name}:{target}"
+        st = self._session_state(target)
+        sequence = st["current"]
+        sender_id = self._session_sender_id(target, sequence)
+        session_key = f"{self.name}:{sender_id}"
         text = data.get("text") if isinstance(data.get("text"), str) else ""
         text = text.strip()
         # These are deliberately exact, text-only commands.  In particular a
         # command with an image remains an ordinary image turn, so it cannot
         # unexpectedly bind a reminder target or consume a pending batch.
-        if not data.get("images") and text in {"/bind-reminders", "/unbind-reminders"}:
-            await self._handle_reminder_command(target, text)
+        if not data.get("images") and text in {"/bind-reminders", "/unbind-reminders", "/new"}:
+            if text == "/new":
+                await self._handle_new_command(account_id, user_id, target)
+            else:
+                await self._handle_reminder_command(target, text)
             return True
         batch = self._pending_image_batches.get((account_id, user_id))
         if batch is not None and delivery_id in batch.delivery_ids:
@@ -626,7 +636,7 @@ class WeixinChannel(Channel):
                 await self._flush_image_batch_locked(key, text, data, images)
             else:
                 try:
-                    await self._publish_inbound(target, text, images, data)
+                    await self._publish_inbound(sender_id, target, text, images, data)
                 except Exception:
                     self._delete_image_refs(images)
                     raise
@@ -634,7 +644,7 @@ class WeixinChannel(Channel):
         if self.image_merge_window_sec == 0:
             prompt = "请分析这张图片。" if len(images) == 1 else "请分析这些图片。"
             try:
-                await self._publish_inbound(target, prompt, images, data)
+                await self._publish_inbound(sender_id, target, prompt, images, data)
             except Exception:
                 self._delete_image_refs(images)
                 raise
@@ -642,9 +652,10 @@ class WeixinChannel(Channel):
         old_batch = batch
         new_batch = _PendingImageBatch(
             account_id, user_id, target, session_key,
-            list(old_batch.images) if old_batch is not None else [],
-            set(old_batch.delivery_ids) if old_batch is not None else set(),
-            int((time.time() + self.image_merge_window_sec) * 1000),
+            sequence=sequence,
+            images=list(old_batch.images) if old_batch is not None else [],
+            delivery_ids=set(old_batch.delivery_ids) if old_batch is not None else set(),
+            deadline_ms=int((time.time() + self.image_merge_window_sec) * 1000),
         )
         new_batch.images.extend(images)
         new_batch.delivery_ids.add(delivery_id)
@@ -662,6 +673,23 @@ class WeixinChannel(Channel):
             old_batch.timer.cancel()
         self._schedule_image_batch_timer_locked(key, new_batch)
         return True
+
+    # —— 多会话辅助（与飞书 /new 机制对称）——
+    # 每个 target 维护自己的会话序号：普通文本 sender_id 形如 "<target>:<序号>"，
+    # Gateway 据此派生独立 session_key，从而同一聊天框内可开多个互不干扰的会话。
+    # 会话 0 复用原有无后缀 sender_id（weixin:<target>），保证升级后老会话记忆连续。
+    def _session_state(self, target: str) -> dict:
+        """取（或建）某 target 的会话状态；首条消息前默认序号 0。"""
+        st = self._sessions.get(target)
+        if st is None:
+            st = {"seq": 0, "current": 0}
+            self._sessions[target] = st
+        return st
+
+    @staticmethod
+    def _session_sender_id(target: str, sequence: int) -> str:
+        """把会话序号拼进 sender_id；会话 0 保持无后缀以延续既有会话。"""
+        return target if sequence == 0 else f"{target}:{sequence}"
 
     async def _handle_reminder_command(self, target: str, command: str) -> None:
         """Persist a reminder binding before acknowledging its inbound command."""
@@ -691,6 +719,21 @@ class WeixinChannel(Channel):
             channel=self.name,
             chat_id=target,
             content=outcome,
+        ))
+
+    async def _handle_new_command(self, account_id: str, user_id: str, target: str) -> None:
+        """/new：先让在途图片落进旧会话，再切到新会话并直接回复（不经 Agent）。"""
+        key = (account_id, user_id)
+        batch = self._pending_image_batches.get(key)
+        if batch is not None:
+            await self._flush_image_batch_locked(key, None, {})
+        st = self._session_state(target)
+        st["seq"] += 1
+        st["current"] = st["seq"]
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=self.name,
+            chat_id=target,
+            content=f"🆕 已新建会话 #{st['current']}（旧会话已保留）",
         ))
 
     async def _suspend_reminders(self) -> None:
@@ -733,7 +776,10 @@ class WeixinChannel(Channel):
             "请分析这张图片。" if len(batch.images) == 1 else "请分析这些图片。"
         )
         try:
-            await self._publish_inbound(batch.target, content, batch.images + extra_images, raw)
+            await self._publish_inbound(
+                self._session_sender_id(batch.target, batch.sequence),
+                batch.target, content, batch.images + extra_images, raw,
+            )
         except Exception:
             self._delete_image_refs(extra_images)
             raise
@@ -746,10 +792,10 @@ class WeixinChannel(Channel):
         if batch.timer is not None and batch.timer is not asyncio.current_task():
             batch.timer.cancel()
 
-    async def _publish_inbound(self, target: str, text: str, images: list, raw: dict[str, Any]) -> None:
+    async def _publish_inbound(self, sender_id: str, target: str, text: str, images: list, raw: dict[str, Any]) -> None:
         acceptance = asyncio.get_running_loop().create_future()
         await self.bus.publish_inbound(InboundMessage(
-            self.name, target, target, text,
+            self.name, sender_id, target, text,
             raw={"message_id": raw.get("message_id"), "delivery_id": raw.get("delivery_id")},
             images=images or None,
             acceptance_future=acceptance,
@@ -888,7 +934,18 @@ class WeixinChannel(Channel):
                     continue
                 if not self._allowed(user_id):
                     continue
-                if target != encode_weixin_target(account_id, user_id) or session_key != f"{self.name}:{target}":
+                if target != encode_weixin_target(account_id, user_id):
+                    continue
+                # 兼容两种批次格式：旧格式 session_key=weixin:<target> 表示会话 0
+                # （sender_id 无后缀）；新格式 weixin:<target>:<N> 表示会话 N。
+                prefix = f"{self.name}:{target}"
+                sequence = 0
+                if session_key.startswith(prefix + ":"):
+                    suffix = session_key[len(prefix) + 1:]
+                    if not suffix.isdigit() or int(suffix) <= 0:
+                        continue
+                    sequence = int(suffix)
+                elif session_key != prefix:
                     continue
                 image_items = item.get("images")
                 delivery_items = item.get("delivery_ids")
@@ -923,8 +980,9 @@ class WeixinChannel(Channel):
                 if key in loaded:
                     continue
                 batch = _PendingImageBatch(
-                    account_id, user_id, target, session_key, images,
-                    set(delivery_items), int(deadline),
+                    account_id, user_id, target, session_key,
+                    sequence=sequence, images=images,
+                    delivery_ids=set(delivery_items), deadline_ms=int(deadline),
                 )
                 loaded[key] = batch
                 if batch.deadline_ms <= int(time.time() * 1000):
