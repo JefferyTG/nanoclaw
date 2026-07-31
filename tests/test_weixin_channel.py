@@ -50,7 +50,14 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.patcher.stop)
         self.bus = MessageBus()
         self._responded_request_ids = set()
-        self.channel = WeixinChannel(bus=self.bus, bridge_command=["fake"], allowed_user_ids=["user"], state_dir=tempfile.gettempdir(), request_timeout_sec=0.01, stop_timeout_sec=0.01)
+        # 每个用例独立的 state_dir，避免跨用例共享系统 tempdir 造成批次状态串扰。
+        self._state_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._state_tmp.cleanup)
+        self.channel = WeixinChannel(
+            bus=self.bus, bridge_command=["fake"], allowed_user_ids=["user"],
+            state_dir=self._state_tmp.name,
+            request_timeout_sec=0.01, stop_timeout_sec=0.01,
+        )
 
     async def asyncTearDown(self):
         await self.channel.stop()
@@ -184,7 +191,7 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
             await allow_restore.wait()
 
         with patch.object(
-            self.channel, "_restore_pending_image_batches", side_effect=blocked_restore
+            self.channel, "_restore_pending_message_batches", side_effect=blocked_restore
         ):
             start = asyncio.create_task(self.channel.start())
             await self._respond(method="hello")
@@ -302,7 +309,7 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
         await handler
 
         # A text/image message is an ordinary image turn, never a bind command.
-        self.channel.image_merge_window_sec = 0
+        self.channel.merge_window_sec = 0
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp) / "state"
             inbound_dir = state / "inbound"
@@ -367,6 +374,7 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
         await new_task
 
         # /new 之后的普通文本：sender_id 带新会话序号，chat_id 仍为 target
+        self.channel.merge_window_sec = 0  # 关闭合并以立即拿到单条投递
         inbound = await self._deliver_inbound({
             "account_id": "account", "user_id": "user", "delivery_id": "text",
             "text": "你好", "images": [],
@@ -377,6 +385,7 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_first_message_before_any_new_keeps_legacy_unsuffixed_sender(self):
         target = encode_weixin_target("account", "user")
+        self.channel.merge_window_sec = 0  # 立即投递，验证 sender_id 不带后缀
         inbound = await self._deliver_inbound({
             "account_id": "account", "user_id": "user", "delivery_id": "first",
             "text": "你好", "images": [],
@@ -394,7 +403,7 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
             image.write_bytes(b"image")
             self.channel.state_dir = Path(tmp).resolve()
             self.channel.image_store = _Store()
-            self.channel.image_merge_window_sec = 0
+            self.channel.merge_window_sec = 0
             target = encode_weixin_target("account", "user")
             inbound = await self._deliver_inbound({
                 "account_id": "account", "user_id": "user", "delivery_id": "new-image",
@@ -416,7 +425,7 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
             image.write_bytes(b"image")
             self.channel.state_dir = Path(tmp).resolve()
             self.channel.image_store = _Store()
-            self.channel.image_merge_window_sec = 60
+            self.channel.merge_window_sec = 60
             target = encode_weixin_target("account", "user")
 
             # 先来一张纯图片：进入在途批次，尚未投递 Agent
@@ -425,7 +434,7 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
                 "text": "", "images": [{"file_path": str(image), "mime_type": "image/png"}],
             })
             self.assertTrue(self.bus.inbound_queue.empty())
-            batch = next(iter(self.channel._pending_image_batches.values()))
+            batch = next(iter(self.channel._pending_message_batches.values()))
             self.assertEqual(batch.sequence, 0)
 
             # /new：先把在途图片 flush 进旧会话（sender_id 无后缀），再切新会话
@@ -442,9 +451,10 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
             await self._respond(method="ack_inbound")
             await new_task
             # flush 成功后批次应被移除
-            self.assertFalse(self.channel._pending_image_batches)
+            self.assertFalse(self.channel._pending_message_batches)
 
             # 新会话的文本 sender_id 带 :1 后缀
+            self.channel.merge_window_sec = 0  # 关闭合并以立即拿到单条投递
             text = await self._deliver_inbound({
                 "account_id": "account", "user_id": "user", "delivery_id": "text",
                 "text": "续聊", "images": [],
@@ -464,6 +474,7 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
             await self._respond(method="ack_inbound")
             await handler
         self.assertEqual(self.channel._sessions[target], {"seq": 2, "current": 2})
+        self.channel.merge_window_sec = 0  # 关闭合并以立即拿到单条投递
         inbound = await self._deliver_inbound({
             "account_id": "account", "user_id": "user", "delivery_id": "text",
             "text": "再续聊", "images": [],
@@ -483,6 +494,7 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
         await handler
 
         # 非精确命令（/newxxx）应作为普通文本投递给 Agent，且落在上一轮新会话
+        self.channel.merge_window_sec = 0  # 关闭合并以立即拿到单条投递
         inbound = await self._deliver_inbound({
             "account_id": "account", "user_id": "user", "delivery_id": "not-new",
             "text": "/newxxx", "images": [],
@@ -500,7 +512,7 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
             store = ImageStore(str(Path(tmp) / "sessions"))
             self.channel.state_dir = state.resolve()
             self.channel.image_store = store
-            self.channel.image_merge_window_sec = 60
+            self.channel.merge_window_sec = 60
             target = encode_weixin_target("account", "user")
 
             # 先切到会话 1
@@ -518,14 +530,14 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
                 "account_id": "account", "user_id": "user", "delivery_id": "img",
                 "text": "", "images": [{"file_path": str(image), "mime_type": "image/png"}],
             })
-            batch = next(iter(self.channel._pending_image_batches.values()))
+            batch = next(iter(self.channel._pending_message_batches.values()))
             self.assertEqual(batch.sequence, 1)
             self.assertEqual(batch.session_key, f"weixin:{target}:1")
             self.assertTrue((state / "pending_image_batches.json").exists())
 
             # 让批次过期后落盘，模拟进程重启前的持久化状态
             batch.deadline_ms = int(time.time() * 1000) - 1
-            self.channel._persist_pending_image_batches_locked()
+            self.channel._persist_pending_message_batches_locked()
 
             # 新通道恢复：过期批次应 flush 进会话 1（sender_id target:1）
             restored_bus = MessageBus()
@@ -533,7 +545,7 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
                 bus=restored_bus, bridge_command=["fake"], state_dir=state,
                 allowed_user_ids=["user"], image_store=store,
             )
-            restore = asyncio.create_task(restored._restore_pending_image_batches())
+            restore = asyncio.create_task(restored._restore_pending_message_batches())
             inbound = await asyncio.wait_for(restored_bus.consume_inbound(), 0.5)
             await restore
             self.assertEqual(inbound.sender_id, f"{target}:1")
@@ -566,6 +578,7 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
             image.write_bytes(b"image")
             self.channel.state_dir = Path(tmp).resolve()
             self.channel.image_store = _Store()
+            self.channel.merge_window_sec = 0  # 关闭合并：文本+图片立即投递
             handler = asyncio.create_task(self.channel._handle_inbound({"account_id": "account", "user_id": "user", "delivery_id": "d1", "text": "look", "images": [{"file_path": str(image), "mime_type": "image/png"}]}))
             inbound = await asyncio.wait_for(self.bus.consume_inbound(), 1)
             self.assertEqual(inbound.sender_id, encode_weixin_target("account", "user"))
@@ -587,7 +600,7 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
             image.write_bytes(b"image")
             self.channel.state_dir = state.resolve()
             self.channel.image_store = ImageStore(str(Path(tmp) / "sessions"))
-            self.channel.image_merge_window_sec = 0
+            self.channel.merge_window_sec = 0
             inbound = await self._deliver_inbound({
                 "account_id": "account", "user_id": "user", "delivery_id": "resolve",
                 "text": "caption", "images": [{"file_path": str(image), "mime_type": "image/png"}],
@@ -616,7 +629,7 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
             image.write_bytes(b"image")
             self.channel.state_dir = Path(tmp).resolve()
             self.channel.image_store = _Store()
-            self.channel.image_merge_window_sec = 0.05
+            self.channel.merge_window_sec = 0.05
             await self._deliver_inbound({
                 "account_id": "account", "user_id": "user", "delivery_id": "image-only",
                 "text": "", "images": [{"file_path": str(image), "mime_type": "image/png"}],
@@ -634,15 +647,18 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
             image.write_bytes(b"image")
             self.channel.state_dir = Path(tmp).resolve()
             self.channel.image_store = _Store()
-            self.channel.image_merge_window_sec = 1
+            self.channel.merge_window_sec = 0.08
             await self._deliver_inbound({
                 "account_id": "account", "user_id": "user", "delivery_id": "image",
                 "text": "", "images": [{"file_path": str(image), "mime_type": "image/png"}],
             })
-            inbound = await self._deliver_inbound({
+            # 文本在窗口内并入图片批次：不再立即 flush，窗口到期后整批投递
+            await self._deliver_inbound({
                 "account_id": "account", "user_id": "user", "delivery_id": "text",
                 "text": "这是什么？", "images": [],
-            }, consume=True)
+            })
+            self.assertTrue(self.bus.inbound_queue.empty())
+            inbound = await asyncio.wait_for(self.bus.consume_inbound(), 0.5)
             self.assertEqual(inbound.content, "这是什么？")
             self.assertEqual(len(inbound.images), 1)
             self.assertTrue(self.bus.inbound_queue.empty())
@@ -656,7 +672,7 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
             second.write_bytes(b"two")
             self.channel.state_dir = Path(tmp).resolve()
             self.channel.image_store = _Store()
-            self.channel.image_merge_window_sec = 0.15
+            self.channel.merge_window_sec = 0.15
             await self._deliver_inbound({"account_id": "account", "user_id": "user", "delivery_id": "one", "text": "", "images": [{"file_path": str(first), "mime_type": "image/png"}]})
             await asyncio.sleep(0.05)
             await self._deliver_inbound({"account_id": "account", "user_id": "user", "delivery_id": "two", "text": "", "images": [{"file_path": str(second), "mime_type": "image/png"}]})
@@ -675,14 +691,16 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
             self.channel.state_dir = Path(tmp).resolve()
             self.channel.image_store = _Store()
             self.channel.allowed_user_ids = frozenset({"user", "other"})
-            self.channel.image_merge_window_sec = 0.05
+            self.channel.merge_window_sec = 0.05
             await self._deliver_inbound({"account_id": "account", "user_id": "user", "delivery_id": "image", "text": "", "images": [{"file_path": str(image), "mime_type": "image/png"}]})
-            other = await self._deliver_inbound({"account_id": "account", "user_id": "other", "delivery_id": "text", "text": "other text", "images": []}, consume=True)
-            self.assertEqual(other.content, "other text")
-            self.assertEqual(other.sender_id, encode_weixin_target("account", "other"))
+            # 另一用户的文本独立成批（按 (account_id, user_id) 隔离），不与 user 的图片批次混淆
+            await self._deliver_inbound({"account_id": "account", "user_id": "other", "delivery_id": "text", "text": "other text", "images": []})
             image_message = await asyncio.wait_for(self.bus.consume_inbound(), 0.5)
             self.assertEqual(image_message.sender_id, encode_weixin_target("account", "user"))
             self.assertEqual(len(image_message.images), 1)
+            other = await asyncio.wait_for(self.bus.consume_inbound(), 0.5)
+            self.assertEqual(other.content, "other text")
+            self.assertEqual(other.sender_id, encode_weixin_target("account", "other"))
 
     async def test_stop_cancels_pending_image_timer_but_preserves_durable_batch(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -693,14 +711,14 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
             image.write_bytes(b"one")
             self.channel.state_dir = state.resolve()
             self.channel.image_store = ImageStore(str(Path(tmp) / "sessions"))
-            self.channel.image_merge_window_sec = 60
+            self.channel.merge_window_sec = 60
             await self._deliver_inbound({"account_id": "account", "user_id": "user", "delivery_id": "pending", "text": "", "images": [{"file_path": str(image), "mime_type": "image/png"}]})
-            batch = next(iter(self.channel._pending_image_batches.values()))
+            batch = next(iter(self.channel._pending_message_batches.values()))
             saved_path = Path(batch.images[0].path)
             self.assertTrue(saved_path.exists())
             await self.channel.stop()
             self.assertTrue(saved_path.exists())
-            self.assertTrue(self.channel._pending_image_batches)
+            self.assertTrue(self.channel._pending_message_batches)
             pending_path = state / "pending_image_batches.json"
             self.assertTrue(pending_path.exists())
             self.assertEqual(state.stat().st_mode & 0o777, 0o700)
@@ -718,17 +736,17 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
             store = ImageStore(str(Path(tmp) / "sessions"))
             self.channel.state_dir = state.resolve()
             self.channel.image_store = store
-            self.channel.image_merge_window_sec = 60
+            self.channel.merge_window_sec = 60
             await self._deliver_inbound({"account_id": "account", "user_id": "user", "delivery_id": "persisted", "text": "", "images": [{"file_path": str(image), "mime_type": "image/png"}]})
-            batch = next(iter(self.channel._pending_image_batches.values()))
+            batch = next(iter(self.channel._pending_message_batches.values()))
             batch.deadline_ms = int(time.time() * 1000) - 1
-            self.channel._persist_pending_image_batches_locked()
+            self.channel._persist_pending_message_batches_locked()
             restored_bus = MessageBus()
             restored = WeixinChannel(
                 bus=restored_bus, bridge_command=["fake"], state_dir=state,
                 allowed_user_ids=["user"], image_store=store,
             )
-            restore = asyncio.create_task(restored._restore_pending_image_batches())
+            restore = asyncio.create_task(restored._restore_pending_message_batches())
             inbound = await asyncio.wait_for(restored_bus.consume_inbound(), 0.5)
             await restore
             self.assertEqual(inbound.content, "请分析这张图片。")
@@ -745,12 +763,12 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
             duplicate.write_bytes(b"duplicate")
             self.channel.state_dir = Path(tmp).resolve()
             self.channel.image_store = _Store()
-            self.channel.image_merge_window_sec = 60
+            self.channel.merge_window_sec = 60
             event = {"account_id": "account", "user_id": "user", "delivery_id": "same", "text": "", "images": [{"file_path": str(first), "mime_type": "image/png"}]}
             await self._deliver_inbound(event)
             duplicate_event = {**event, "images": [{"file_path": str(duplicate), "mime_type": "image/png"}]}
             await self._deliver_inbound(duplicate_event)
-            batch = next(iter(self.channel._pending_image_batches.values()))
+            batch = next(iter(self.channel._pending_message_batches.values()))
             self.assertEqual(len(batch.images), 1)
             self.assertEqual(len(self.channel.image_store.saved), 1)
             self.assertFalse(duplicate.exists())
@@ -764,16 +782,16 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
             first.write_bytes(b"first")
             self.channel.state_dir = Path(tmp).resolve()
             self.channel.image_store = _Store()
-            self.channel.image_merge_window_sec = 60
+            self.channel.merge_window_sec = 60
             event = {"account_id": "account", "user_id": "user", "delivery_id": "retryable", "text": "", "images": [{"file_path": str(first), "mime_type": "image/png"}]}
-            with patch.object(self.channel, "_persist_pending_image_batches_locked", side_effect=OSError("disk full")):
+            with patch.object(self.channel, "_persist_pending_message_batches_locked", side_effect=OSError("disk full")):
                 await self.channel._handle_inbound(event)
             self.assertFalse(self.process.stdin.lines)
-            self.assertFalse(self.channel._pending_image_batches)
+            self.assertFalse(self.channel._pending_message_batches)
             self.assertTrue(self.bus.inbound_queue.empty())
             retry.write_bytes(b"retry")
             await self._deliver_inbound({**event, "images": [{"file_path": str(retry), "mime_type": "image/png"}]})
-            batch = next(iter(self.channel._pending_image_batches.values()))
+            batch = next(iter(self.channel._pending_message_batches.values()))
             self.assertEqual(batch.delivery_ids, {"retryable"})
             self.assertEqual(len(batch.images), 1)
             self.assertEqual(len(self.channel.image_store.saved), 2)
@@ -790,14 +808,14 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
             self.channel.state_dir = state.resolve()
             self.channel.image_store = store
             self.channel.allowed_user_ids = frozenset({"user", "other"})
-            self.channel.image_merge_window_sec = 60
+            self.channel.merge_window_sec = 60
             await self._deliver_inbound({"account_id": "account", "user_id": "user", "delivery_id": "expired", "text": "", "images": [{"file_path": str(first), "mime_type": "image/png"}]})
             await self._deliver_inbound({"account_id": "account", "user_id": "other", "delivery_id": "future", "text": "", "images": [{"file_path": str(second), "mime_type": "image/png"}]})
-            self.channel._pending_image_batches[("account", "user")].deadline_ms = int(time.time() * 1000) - 1
-            self.channel._persist_pending_image_batches_locked()
+            self.channel._pending_message_batches[("account", "user")].deadline_ms = int(time.time() * 1000) - 1
+            self.channel._persist_pending_message_batches_locked()
             restored_bus = MessageBus()
             restored = WeixinChannel(bus=restored_bus, bridge_command=["fake"], state_dir=state, allowed_user_ids=["user", "other"], image_store=store)
-            restore = asyncio.create_task(restored._restore_pending_image_batches())
+            restore = asyncio.create_task(restored._restore_pending_message_batches())
             inbound = await asyncio.wait_for(restored_bus.consume_inbound(), 0.5)
             await restore
             self.assertEqual(inbound.sender_id, encode_weixin_target("account", "user"))
@@ -816,7 +834,8 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
             image.write_bytes(b"one")
             self.channel.state_dir = state.resolve()
             self.channel.image_store = ImageStore(str(Path(tmp) / "sessions"))
-            self.channel.image_merge_window_sec = 60
+            self.channel.merge_window_sec = 60
+            self.channel.merge_max_messages = 2  # 第二条消息（文本）达到上限立即 flush
             await self._deliver_inbound({"account_id": "account", "user_id": "user", "delivery_id": "image", "text": "", "images": [{"file_path": str(image), "mime_type": "image/png"}]})
 
             handler = asyncio.create_task(self.channel._handle_inbound({
@@ -830,14 +849,14 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
             else:
                 self.fail("merged image was not handed to MessageBus")
             self.assertTrue((state / "pending_image_batches.json").exists())
-            self.assertTrue(self.channel._pending_image_batches)
+            self.assertTrue(self.channel._pending_message_batches)
             inbound = await self.bus.consume_inbound()
             request = await self._respond(method="ack_inbound")
             self.assertEqual(request["params"]["delivery_id"], "caption")
             await handler
             self.assertEqual(inbound.content, "describe")
             self.assertFalse((state / "pending_image_batches.json").exists())
-            self.assertFalse(self.channel._pending_image_batches)
+            self.assertFalse(self.channel._pending_message_batches)
 
     async def test_stop_cancels_unaccepted_bus_handoff_without_losing_batch(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -848,7 +867,8 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
             image.write_bytes(b"one")
             self.channel.state_dir = state.resolve()
             self.channel.image_store = ImageStore(str(Path(tmp) / "sessions"))
-            self.channel.image_merge_window_sec = 60
+            self.channel.merge_window_sec = 60
+            self.channel.merge_max_messages = 2  # 第二条消息（文本）达到上限立即 flush
             await self._deliver_inbound({"account_id": "account", "user_id": "user", "delivery_id": "image", "text": "", "images": [{"file_path": str(image), "mime_type": "image/png"}]})
             self.channel._spawn(self.channel._handle_inbound({
                 "account_id": "account", "user_id": "user",
@@ -865,7 +885,7 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
             await self._respond(method="stop", result={"stopped": True})
             await asyncio.wait_for(stop, 0.5)
             self.assertTrue((state / "pending_image_batches.json").exists())
-            self.assertTrue(self.channel._pending_image_batches)
+            self.assertTrue(self.channel._pending_message_batches)
 
     async def test_failed_pending_restore_can_be_retried(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -876,10 +896,10 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
             self.channel.state_dir = state.resolve()
             self.channel.image_store = ImageStore(str(Path(tmp) / "sessions"))
             with self.assertRaises(json.JSONDecodeError):
-                await self.channel._restore_pending_image_batches()
+                await self.channel._restore_pending_message_batches()
             self.assertFalse(self.channel._pending_batches_restored)
             pending.write_text('{"version":1,"batches":[]}', encoding="utf-8")
-            await self.channel._restore_pending_image_batches()
+            await self.channel._restore_pending_message_batches()
             self.assertTrue(self.channel._pending_batches_restored)
 
     async def test_empty_or_unsupported_inbound_is_acked_without_bus_publish(self):
@@ -958,6 +978,253 @@ class WeixinChannelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.code, "timeout")
         await self.channel.stop()
         self.assertIsNone(self.channel._process)
+
+
+    # —— 统一消息合并专项测试 ——
+
+    async def test_text_messages_merge_within_window_joined_by_newline(self):
+        self.channel.merge_window_sec = 0.08
+        await self._deliver_inbound({
+            "account_id": "account", "user_id": "user", "delivery_id": "t1",
+            "text": "第一句", "images": [],
+        })
+        await self._deliver_inbound({
+            "account_id": "account", "user_id": "user", "delivery_id": "t2",
+            "text": "第二句", "images": [],
+        })
+        self.assertTrue(self.bus.inbound_queue.empty())
+        inbound = await asyncio.wait_for(self.bus.consume_inbound(), 0.5)
+        self.assertEqual(inbound.content, "第一句\n第二句")
+        self.assertIsNone(inbound.images)
+        self.assertEqual(inbound.sender_id, encode_weixin_target("account", "user"))
+        self.assertTrue(self.bus.inbound_queue.empty())
+
+    async def test_merge_limit_flushes_immediately_without_waiting_window(self):
+        self.channel.merge_window_sec = 60
+        self.channel.merge_max_messages = 2
+        await self._deliver_inbound({
+            "account_id": "account", "user_id": "user", "delivery_id": "m1",
+            "text": "甲", "images": [],
+        })
+        self.assertTrue(self.bus.inbound_queue.empty())
+        inbound = await self._deliver_inbound({
+            "account_id": "account", "user_id": "user", "delivery_id": "m2",
+            "text": "乙", "images": [],
+        }, consume=True)
+        self.assertEqual(inbound.content, "甲\n乙")
+        self.assertEqual(inbound.sender_id, encode_weixin_target("account", "user"))
+        self.assertTrue(self.bus.inbound_queue.empty())
+
+    async def test_merge_limit_flush_failure_keeps_timer_and_retries(self):
+        # 回归：上限触发 flush 时先挂窗口定时器；发布失败后批次仍持有定时器，
+        # 窗口到期自动重试，不会卡死到"下一条消息或重启"。
+        self.channel.merge_window_sec = 0.08
+        self.channel.merge_max_messages = 2
+        await self._deliver_inbound({
+            "account_id": "account", "user_id": "user", "delivery_id": "m1",
+            "text": "甲", "images": [],
+        })
+        self.assertTrue(self.bus.inbound_queue.empty())
+        with patch.object(
+            self.channel, "_publish_inbound",
+            side_effect=RuntimeError("bus down"),
+        ):
+            handler = asyncio.create_task(self.channel._handle_inbound({
+                "account_id": "account", "user_id": "user", "delivery_id": "m2",
+                "text": "乙", "images": [],
+            }))
+            await handler
+        batch = self.channel._pending_message_batches.get(("account", "user"))
+        self.assertIsNotNone(batch)
+        self.assertEqual(batch.delivery_ids, {"m1", "m2"})
+        self.assertIsNotNone(batch.timer)
+        self.assertTrue(self.bus.inbound_queue.empty())
+        # 窗口到期后定时器自动重试：整批成功投递，不再滞留
+        inbound = await asyncio.wait_for(self.bus.consume_inbound(), 0.5)
+        self.assertEqual(inbound.content, "甲\n乙")
+        self.assertEqual(inbound.sender_id, encode_weixin_target("account", "user"))
+        self.assertTrue(self.bus.inbound_queue.empty())
+
+    async def test_window_flush_failure_reschedules_timer_and_retries(self):
+        # 回归：窗口到期 flush 失败后重新调度窗口定时器，而不是滞留到
+        # "下一条消息或重启"。
+        self.channel.merge_window_sec = 0.08
+        await self._deliver_inbound({
+            "account_id": "account", "user_id": "user", "delivery_id": "w1",
+            "text": "滞留", "images": [],
+        })
+        self.assertTrue(self.bus.inbound_queue.empty())
+        with patch.object(
+            self.channel, "_publish_inbound",
+            side_effect=RuntimeError("bus down"),
+        ):
+            await asyncio.sleep(0.2)  # 首个窗口到期并失败，且已重调度
+            batch = self.channel._pending_message_batches.get(("account", "user"))
+            self.assertIsNotNone(batch)
+            self.assertIsNotNone(batch.timer)
+            self.assertTrue(self.bus.inbound_queue.empty())
+        # 解除故障后，重调度的定时器在下一窗口到期时自动重试成功
+        inbound = await asyncio.wait_for(self.bus.consume_inbound(), 0.5)
+        self.assertEqual(inbound.content, "滞留")
+        self.assertEqual(inbound.sender_id, encode_weixin_target("account", "user"))
+        self.assertTrue(self.bus.inbound_queue.empty())
+
+    async def test_restore_full_batch_flushes_immediately_without_waiting_timer(self):
+        # 恢复的批次若已 >= merge_max_messages：不等定时器，直接 flush。
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            state.mkdir()
+            target = encode_weixin_target("account", "user")
+            payload = {
+                "version": 1,
+                "batches": [{
+                    "account_id": "account", "user_id": "user", "target": target,
+                    "session_key": f"weixin:{target}",
+                    "delivery_ids": ["full-1", "full-2"],
+                    "deadline_ms": int(time.time() * 1000) + 60_000,
+                    "texts": ["满一", "满二"],
+                    "images": [],
+                }],
+            }
+            (state / "pending_image_batches.json").write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+            )
+            restored_bus = MessageBus()
+            restored = WeixinChannel(
+                bus=restored_bus, bridge_command=["fake"], state_dir=state,
+                allowed_user_ids=["user"], merge_max_messages=2,
+            )
+            restore = asyncio.create_task(restored._restore_pending_message_batches())
+            inbound = await asyncio.wait_for(restored_bus.consume_inbound(), 0.5)
+            await restore
+            self.assertEqual(inbound.content, "满一\n满二")
+            self.assertIsNone(inbound.images)
+            self.assertEqual(inbound.sender_id, encode_weixin_target("account", "user"))
+            self.assertFalse((state / "pending_image_batches.json").exists())
+            await restored.stop()
+
+    async def test_merge_window_zero_processes_text_immediately(self):
+        self.channel.merge_window_sec = 0
+        inbound = await self._deliver_inbound({
+            "account_id": "account", "user_id": "user", "delivery_id": "z",
+            "text": "立即处理", "images": [],
+        }, consume=True)
+        self.assertEqual(inbound.content, "立即处理")
+        self.assertIsNone(inbound.images)
+        self.assertTrue(self.bus.inbound_queue.empty())
+
+    async def test_text_and_image_merge_into_single_turn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inbound_dir = Path(tmp) / "inbound"
+            inbound_dir.mkdir()
+            image = inbound_dir / "in.png"
+            image.write_bytes(b"image")
+            self.channel.state_dir = Path(tmp).resolve()
+            self.channel.image_store = _Store()
+            self.channel.merge_window_sec = 0.08
+            await self._deliver_inbound({
+                "account_id": "account", "user_id": "user", "delivery_id": "say",
+                "text": "看图说话", "images": [],
+            })
+            await self._deliver_inbound({
+                "account_id": "account", "user_id": "user", "delivery_id": "pic",
+                "text": "", "images": [{"file_path": str(image), "mime_type": "image/png"}],
+            })
+            self.assertTrue(self.bus.inbound_queue.empty())
+            inbound = await asyncio.wait_for(self.bus.consume_inbound(), 0.5)
+            self.assertEqual(inbound.content, "看图说话")
+            self.assertEqual(len(inbound.images), 1)
+            self.assertEqual(inbound.sender_id, encode_weixin_target("account", "user"))
+            self.assertTrue(self.bus.inbound_queue.empty())
+
+    async def test_command_message_does_not_merge_into_batch(self):
+        self.channel.merge_window_sec = 60
+        target = encode_weixin_target("account", "user")
+        await self._deliver_inbound({
+            "account_id": "account", "user_id": "user", "delivery_id": "t",
+            "text": "在途文本", "images": [],
+        })
+        self.assertEqual(len(self.channel._pending_message_batches), 1)
+        # /new 是命令：不并入批次，先把在途批次 flush 进旧会话，再切新会话
+        handler = asyncio.create_task(self.channel._handle_inbound({
+            "account_id": "account", "user_id": "user", "delivery_id": "cmd",
+            "text": "/new", "images": [],
+        }))
+        flushed = await asyncio.wait_for(self.bus.consume_inbound(), 1)
+        self.assertEqual(flushed.content, "在途文本")
+        reply = await asyncio.wait_for(self.bus.consume_outbound(), 1)
+        self.assertIn("已新建会话", reply.content)
+        await self._respond(method="ack_inbound")
+        await handler
+        self.assertFalse(self.channel._pending_message_batches)
+
+    async def test_text_batch_persists_and_restores_with_joined_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            state.mkdir()
+            self.channel.state_dir = state.resolve()
+            self.channel.image_store = ImageStore(str(Path(tmp) / "sessions"))
+            self.channel.merge_window_sec = 60
+            await self._deliver_inbound({
+                "account_id": "account", "user_id": "user", "delivery_id": "p1",
+                "text": "持久化一", "images": [],
+            })
+            await self._deliver_inbound({
+                "account_id": "account", "user_id": "user", "delivery_id": "p2",
+                "text": "持久化二", "images": [],
+            })
+            batch = next(iter(self.channel._pending_message_batches.values()))
+            self.assertEqual(batch.texts, ["持久化一", "持久化二"])
+            batch.deadline_ms = int(time.time() * 1000) - 1
+            self.channel._persist_pending_message_batches_locked()
+
+            restored_bus = MessageBus()
+            restored = WeixinChannel(
+                bus=restored_bus, bridge_command=["fake"], state_dir=state,
+                allowed_user_ids=["user"], image_store=ImageStore(str(Path(tmp) / "sessions2")),
+            )
+            restore = asyncio.create_task(restored._restore_pending_message_batches())
+            inbound = await asyncio.wait_for(restored_bus.consume_inbound(), 0.5)
+            await restore
+            self.assertEqual(inbound.content, "持久化一\n持久化二")
+            self.assertIsNone(inbound.images)
+            self.assertEqual(inbound.sender_id, encode_weixin_target("account", "user"))
+            self.assertFalse((state / "pending_image_batches.json").exists())
+            await restored.stop()
+
+    async def test_restore_legacy_image_batch_without_texts_field(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            state.mkdir()
+            store = ImageStore(str(Path(tmp) / "sessions"))
+            target = encode_weixin_target("account", "user")
+            saved = store.save(f"weixin:{target}", b"image", "png", "image/png")
+            # 手工构造旧格式批次文件：无 texts 字段（升级前遗留的仅图片批次）
+            payload = {
+                "version": 1,
+                "batches": [{
+                    "account_id": "account", "user_id": "user", "target": target,
+                    "session_key": f"weixin:{target}", "delivery_ids": ["legacy"],
+                    "deadline_ms": int(time.time() * 1000) - 1,
+                    "images": [{"id": saved.id, "mime": "image/png"}],
+                }],
+            }
+            (state / "pending_image_batches.json").write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+            )
+            restored_bus = MessageBus()
+            restored = WeixinChannel(
+                bus=restored_bus, bridge_command=["fake"], state_dir=state,
+                allowed_user_ids=["user"], image_store=store,
+            )
+            restore = asyncio.create_task(restored._restore_pending_message_batches())
+            inbound = await asyncio.wait_for(restored_bus.consume_inbound(), 0.5)
+            await restore
+            self.assertEqual(inbound.content, "请分析这张图片。")
+            self.assertEqual(len(inbound.images), 1)
+            self.assertEqual(inbound.sender_id, encode_weixin_target("account", "user"))
+            await restored.stop()
+
 
 
 if __name__ == "__main__":

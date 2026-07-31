@@ -27,6 +27,7 @@ class WeixinCompositionTests(unittest.TestCase):
                 "bridge_command": ["node", "bridge.mjs"],
                 "allowed_user_ids": ["user-1"],
                 "image_merge_window_sec": 3.5,
+                "merge_max_messages": 15,
                 "request_timeout_sec": 12,
             }
             channel = build_weixin_channel(
@@ -41,7 +42,11 @@ class WeixinCompositionTests(unittest.TestCase):
         self.assertEqual(channel.bridge_command, ("node", "bridge.mjs"))
         self.assertEqual(channel.allowed_user_ids, frozenset({"user-1"}))
         self.assertEqual(channel.command_timeout_sec, 12)
+        # main.py（冻结）仍按 image_merge_window_sec 传参：通道把旧名映射到新名
+        self.assertEqual(channel.merge_window_sec, 3.5)
         self.assertEqual(channel.image_merge_window_sec, 3.5)
+        # main.py 现按 merge_max_messages 透传：配置 15 → 通道 15
+        self.assertEqual(channel.merge_max_messages, 15)
         self.assertTrue(channel.auto_login)
         self.assertIs(channel._bind_callback, bind)
         self.assertIs(channel._unbind_callback, unbind)
@@ -103,6 +108,88 @@ class ChannelStartupWatchTests(unittest.IsolatedAsyncioTestCase):
             await watch_channel_start_failures(
                 [task], [type("Channel", (), {"name": "weixin"})()]
             )
+
+
+class WeixinCompositionMergeConfigTests(unittest.TestCase):
+    def test_new_merge_config_flows_through_load_config_into_channel(self):
+        import json
+        import tempfile
+
+        from config import load_config
+        from main import build_weixin_channel
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "config.json"), "w", encoding="utf-8") as f:
+                json.dump({
+                    "workspace": tmp,
+                    "weixin": {
+                        "enabled": True,
+                        "bridge_command": ["node", "bridge.mjs"],
+                        "allowed_user_ids": ["user-1"],
+                        "merge_window_sec": 3.5,
+                        "merge_max_messages": 15,
+                    },
+                }, f)
+            cfg = load_config(os.path.join(tmp, "config.json"))
+            channel = build_weixin_channel(
+                cfg,
+                MessageBus(),
+                object(),
+                bind_callback=None,
+                unbind_callback=None,
+                suspend_callback=None,
+            )
+
+        self.assertEqual(cfg.weixin["merge_window_sec"], 3.5)
+        # 兼容镜像：main.py 读 image_merge_window_sec 时得到同一生效值
+        self.assertEqual(cfg.weixin["image_merge_window_sec"], 3.5)
+        self.assertEqual(channel.merge_window_sec, 3.5)
+        # merge_max_messages 经配置层解析后由 main.py 透传 → 通道生效
+        self.assertEqual(cfg.weixin["merge_max_messages"], 15)
+        self.assertEqual(channel.merge_max_messages, 15)
+
+    def test_invalid_merge_config_values_fall_back_to_constructor_defaults(self):
+        # 回归：非法字符串（如 "abc"）不再在 main.py 强转时抛 ValueError，
+        # 而是下沉到 WeixinChannel 构造器兜底到默认值。
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = NanoClawConfig(workspace=tmp)
+            cfg.weixin = {
+                **cfg.weixin,
+                "enabled": True,
+                "bridge_command": ["node", "bridge.mjs"],
+                "allowed_user_ids": ["user-1"],
+                "image_merge_window_sec": "abc",
+                "merge_max_messages": "xyz",
+            }
+            channel = build_weixin_channel(
+                cfg,
+                MessageBus(),
+                object(),
+                bind_callback=None,
+                unbind_callback=None,
+                suspend_callback=None,
+            )
+
+        self.assertEqual(channel.merge_window_sec, 8.0)
+        self.assertEqual(channel.image_merge_window_sec, 8.0)
+        self.assertEqual(channel.merge_max_messages, 10)
+
+    def test_missing_merge_config_uses_defaults_consistent_with_constructor(self):
+        # 未配置合并窗口时，main.py 兜底 8.0 与 config.py/构造器默认一致。
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = NanoClawConfig(workspace=tmp)
+            cfg.weixin = {
+                **cfg.weixin,
+                "enabled": True,
+                "bridge_command": ["node", "bridge.mjs"],
+                "allowed_user_ids": ["user-1"],
+            }
+            channel = build_weixin_channel(cfg, MessageBus(), object())
+
+        self.assertEqual(channel.merge_window_sec, 8.0)
+        self.assertEqual(channel.merge_max_messages, 10)
+
+
 
 
 if __name__ == "__main__":

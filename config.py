@@ -41,7 +41,8 @@ _WEIXIN_FIELDS = (
     "bridge_command",
     "state_dir",
     "allowed_user_ids",
-    "image_merge_window_sec",
+    "merge_window_sec",
+    "merge_max_messages",
     "request_timeout_sec",
     "login_timeout_sec",
     "inbound_ack_timeout_sec",
@@ -240,7 +241,8 @@ class NanoClawConfig:
             ],
             "state_dir": "workspace/weixin",
             "allowed_user_ids": [],
-            "image_merge_window_sec": 10.0,
+            "merge_window_sec": 8.0,
+            "merge_max_messages": 10,
             "request_timeout_sec": 30,
             "login_timeout_sec": 480,
             "inbound_ack_timeout_sec": 30,
@@ -277,9 +279,17 @@ def load_config(config_path: str = "config.json") -> NanoClawConfig:
                 if key in ("asr_model", "tts_model", "reminders", "weixin") and isinstance(data[key], dict):
                     merged = dict(getattr(cfg, key))
                     if key == "weixin":
+                        weixin_data = data[key]
                         merged.update(
-                            {name: data[key][name] for name in _WEIXIN_FIELDS if name in data[key]}
+                            {name: weixin_data[name] for name in _WEIXIN_FIELDS if name in weixin_data}
                         )
+                        # 旧配置兼容：image_merge_window_sec 未出现在新配置时读入 merge_window_sec
+                        # （旧名优先）；新名已显式配置则以新名为准。
+                        if "merge_window_sec" not in weixin_data and "image_merge_window_sec" in weixin_data:
+                            merged["merge_window_sec"] = weixin_data["image_merge_window_sec"]
+                        # 兼容镜像：main.py 等组合根仍读取 image_merge_window_sec，
+                        # 保留该键为当前生效的合并窗口值；save_config 会按 _WEIXIN_FIELDS 过滤丢弃。
+                        merged["image_merge_window_sec"] = merged.get("merge_window_sec", 8.0)
                     else:
                         merged.update(data[key])
                     setattr(cfg, key, merged)

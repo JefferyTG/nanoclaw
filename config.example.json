@@ -83,14 +83,15 @@
     ],
     "state_dir": "workspace/weixin",
     "allowed_user_ids": [],
-    "image_merge_window_sec": 10,
     "request_timeout_sec": 30,
     "login_timeout_sec": 480,
     "inbound_ack_timeout_sec": 30,
     "stop_timeout_sec": 10,
     "max_ipc_line_bytes": 1048576,
     "max_inbound_image_bytes": 20971520,
-    "max_outbound_image_bytes": 20971520
+    "max_outbound_image_bytes": 20971520,
+    "merge_window_sec": 8,
+    "merge_max_messages": 10
   },
   "video_gen_model": {
     "api_key": "",

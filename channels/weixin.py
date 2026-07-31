@@ -61,14 +61,21 @@ _SECRET_RE = re.compile(
 
 
 @dataclass
-class _PendingImageBatch:
-    """Saved images awaiting an optional text description from one peer."""
+class _PendingMessageBatch:
+    """Messages from one peer awaiting the merge window before dispatch.
+
+    Texts and images are merged together: each inbound text is appended to
+    ``texts`` (joined with newlines on flush) and every image goes to
+    ``images``; the batch is flushed when the window expires or when the
+    number of merged messages reaches the merge limit.
+    """
 
     account_id: str
     user_id: str
     target: str
     session_key: str
     sequence: int = 0
+    texts: list = field(default_factory=list)
     images: list = field(default_factory=list)
     delivery_ids: set[str] = field(default_factory=set)
     deadline_ms: int = 0
@@ -140,7 +147,9 @@ class WeixinChannel(Channel):
         max_inbound_image_bytes: int = _MAX_IMAGE_BYTES,
         max_outbound_image_bytes: int = _MAX_IMAGE_BYTES,
         restart_backoff_sec: float = 1.0,
-        image_merge_window_sec: float = 10.0,
+        merge_window_sec: float | None = None,
+        merge_max_messages: int = 10,
+        image_merge_window_sec: float | None = None,
         auto_login: bool = False,
         bind_callback=None,
         unbind_callback=None,
@@ -162,10 +171,20 @@ class WeixinChannel(Channel):
         self.max_outbound_image_bytes = max(1, int(max_outbound_image_bytes))
         self.restart_backoff_sec = max(0.0, float(restart_backoff_sec))
         try:
-            merge_window = float(image_merge_window_sec)
+            if merge_window_sec is not None:
+                merge_window = float(merge_window_sec)
+            elif image_merge_window_sec is not None:
+                merge_window = float(image_merge_window_sec)
+            else:
+                merge_window = 8.0
         except (TypeError, ValueError):
-            merge_window = 10.0
-        self.image_merge_window_sec = max(0.0, min(60.0, merge_window))
+            merge_window = 8.0
+        self.merge_window_sec = max(0.0, min(60.0, merge_window))
+        try:
+            merge_max = int(merge_max_messages)
+        except (TypeError, ValueError):
+            merge_max = 10
+        self.merge_max_messages = max(1, merge_max)
         self.auto_login = auto_login
         self._process = None
         self._reader_task: asyncio.Task | None = None
@@ -178,7 +197,7 @@ class WeixinChannel(Channel):
         self._stopping = False
         self._started = False
         self._supervisor_task: asyncio.Task | None = None
-        self._pending_image_batches: dict[tuple[str, str], _PendingImageBatch] = {}
+        self._pending_message_batches: dict[tuple[str, str], _PendingMessageBatch] = {}
         self._inbound_lock = asyncio.Lock()
         self._pending_batches_restored = False
         # 多会话状态：target -> {"seq": 已建会话数, "current": 当前活动序号}。
@@ -190,6 +209,19 @@ class WeixinChannel(Channel):
         self._bind_callback = bind_callback
         self._unbind_callback = unbind_callback
         self._suspend_callback = suspend_callback
+
+    @property
+    def image_merge_window_sec(self) -> float:
+        """兼容别名：旧调用方读写 ``image_merge_window_sec`` 等价于读写 ``merge_window_sec``。"""
+        return self.merge_window_sec
+
+    @image_merge_window_sec.setter
+    def image_merge_window_sec(self, value: float) -> None:
+        try:
+            merge_window = float(value)
+        except (TypeError, ValueError):
+            merge_window = 8.0
+        self.merge_window_sec = max(0.0, min(60.0, merge_window))
 
     def target(self, account_id: str, user_id: str) -> str:
         return encode_weixin_target(account_id, user_id)
@@ -207,11 +239,11 @@ class WeixinChannel(Channel):
         if self.auto_login:
             await self.login()
         try:
-            await self._restore_pending_image_batches()
+            await self._restore_pending_message_batches()
         except Exception as exc:
             raise WeixinBridgeError(
                 "state_restore_failed",
-                "unable to restore pending Weixin images",
+                "unable to restore pending Weixin messages",
                 retryable=True,
             ) from exc
         await self.start_polling()
@@ -374,7 +406,7 @@ class WeixinChannel(Channel):
             task.cancel()
         if inbound_tasks:
             await asyncio.gather(*inbound_tasks, return_exceptions=True)
-        await self._cancel_pending_image_timers()
+        await self._cancel_pending_message_timers()
         if self._supervisor_task is not None:
             self._supervisor_task.cancel()
             await asyncio.gather(self._supervisor_task, return_exceptions=True)
@@ -595,7 +627,7 @@ class WeixinChannel(Channel):
         """Persist/merge an inbound event while serializing timer races.
 
         Returning true means the event was either published or durably accepted
-        into its in-memory image batch and may therefore be acknowledged.
+        into its in-memory message batch and may therefore be acknowledged.
         """
         target = encode_weixin_target(account_id, user_id)
         st = self._session_state(target)
@@ -613,7 +645,8 @@ class WeixinChannel(Channel):
             else:
                 await self._handle_reminder_command(target, text)
             return True
-        batch = self._pending_image_batches.get((account_id, user_id))
+        key = (account_id, user_id)
+        batch = self._pending_message_batches.get(key)
         if batch is not None and delivery_id in batch.delivery_ids:
             for descriptor in data.get("images") or []:
                 self._discard_duplicate_inbound_image(descriptor)
@@ -629,49 +662,51 @@ class WeixinChannel(Channel):
         if not text and not images:
             logger.info("discarded empty or unsupported Weixin inbound message")
             return True
-        key = (account_id, user_id)
-        batch = self._pending_image_batches.get(key)
-        if text:
-            if batch is not None:
-                await self._flush_image_batch_locked(key, text, data, images)
-            else:
-                try:
-                    await self._publish_inbound(sender_id, target, text, images, data)
-                except Exception:
-                    self._delete_image_refs(images)
-                    raise
-            return True
-        if self.image_merge_window_sec == 0:
-            prompt = "请分析这张图片。" if len(images) == 1 else "请分析这些图片。"
+        # 合并关闭：每条消息立即独立投递，不进批次。
+        if self.merge_window_sec == 0:
+            content = text or (
+                "请分析这张图片。" if len(images) == 1 else "请分析这些图片。"
+            )
             try:
-                await self._publish_inbound(sender_id, target, prompt, images, data)
+                await self._publish_inbound(sender_id, target, content, images, data)
             except Exception:
                 self._delete_image_refs(images)
                 raise
             return True
+        # 统一消息合并：文本/图片/图文混合全部进入同一批次。窗口内到达的
+        # 新消息追加进当前批次（文本按行追加、图片随附）；窗口到期或批次
+        # 内消息数达到 merge_max_messages 时整批 flush。
         old_batch = batch
-        new_batch = _PendingImageBatch(
+        new_batch = _PendingMessageBatch(
             account_id, user_id, target, session_key,
             sequence=sequence,
+            texts=list(old_batch.texts) if old_batch is not None else [],
             images=list(old_batch.images) if old_batch is not None else [],
             delivery_ids=set(old_batch.delivery_ids) if old_batch is not None else set(),
-            deadline_ms=int((time.time() + self.image_merge_window_sec) * 1000),
+            deadline_ms=int((time.time() + self.merge_window_sec) * 1000),
         )
+        if text:
+            new_batch.texts.append(text)
         new_batch.images.extend(images)
         new_batch.delivery_ids.add(delivery_id)
-        self._pending_image_batches[key] = new_batch
+        self._pending_message_batches[key] = new_batch
         try:
-            self._persist_pending_image_batches_locked()
+            self._persist_pending_message_batches_locked()
         except Exception:
             if old_batch is None:
-                self._pending_image_batches.pop(key, None)
+                self._pending_message_batches.pop(key, None)
             else:
-                self._pending_image_batches[key] = old_batch
+                self._pending_message_batches[key] = old_batch
             self._delete_image_refs(images)
             raise
         if old_batch is not None and old_batch.timer is not None:
             old_batch.timer.cancel()
-        self._schedule_image_batch_timer_locked(key, new_batch)
+        # 条数上限：每条入站消息恰好贡献一个 delivery_id，故 len == 消息数。
+        # 先挂窗口定时器再 flush：若上限 flush 发布失败（异常上抛），新批次
+        # 仍持有定时器，窗口到期会自动重试，不会卡死到"下一条消息或重启"。
+        self._schedule_message_batch_timer_locked(key, new_batch)
+        if len(new_batch.delivery_ids) >= self.merge_max_messages:
+            await self._flush_message_batch_locked(key, data)
         return True
 
     # —— 多会话辅助（与飞书 /new 机制对称）——
@@ -722,11 +757,11 @@ class WeixinChannel(Channel):
         ))
 
     async def _handle_new_command(self, account_id: str, user_id: str, target: str) -> None:
-        """/new：先让在途图片落进旧会话，再切到新会话并直接回复（不经 Agent）。"""
+        """/new：先让在途消息落进旧会话，再切到新会话并直接回复（不经 Agent）。"""
         key = (account_id, user_id)
-        batch = self._pending_image_batches.get(key)
+        batch = self._pending_message_batches.get(key)
         if batch is not None:
-            await self._flush_image_batch_locked(key, None, {})
+            await self._flush_message_batch_locked(key, {})
         st = self._session_state(target)
         st["seq"] += 1
         st["current"] = st["seq"]
@@ -752,42 +787,59 @@ class WeixinChannel(Channel):
             # disable the credential-free QR reauthentication path.
             logger.warning("failed to suspend Weixin reminders after session expiry")
 
-    async def _flush_image_batch_after_window(
-        self, key: tuple[str, str], batch: _PendingImageBatch
+    async def _flush_message_batch_after_window(
+        self, key: tuple[str, str], batch: _PendingMessageBatch
     ) -> None:
         try:
             await asyncio.sleep(max(0, batch.deadline_ms / 1000 - time.time()))
             async with self._inbound_lock:
-                if self._pending_image_batches.get(key) is batch:
-                    await self._flush_image_batch_locked(key, None, {})
+                if self._pending_message_batches.get(key) is batch:
+                    await self._flush_message_batch_locked(key, {})
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("failed to publish queued Weixin images")
+            logger.exception("failed to publish queued Weixin messages")
+            # 发布失败：批次保留。重新调度一个窗口定时器到期自动重试，避免批次
+            # 滞留到"下一条消息或重启"。先推进 deadline，防止旧的已过期 deadline
+            # 导致 sleep(0) 的紧循环重试。
+            async with self._inbound_lock:
+                if self._pending_message_batches.get(key) is batch:
+                    batch.deadline_ms = int((time.time() + self.merge_window_sec) * 1000)
+                    self._schedule_message_batch_timer_locked(key, batch)
 
-    async def _flush_image_batch_locked(
-        self, key: tuple[str, str], text: str | None, raw: dict[str, Any], extra_images: list | None = None
+    async def _flush_message_batch_locked(
+        self, key: tuple[str, str], raw: dict[str, Any] | None = None
     ) -> None:
-        batch = self._pending_image_batches.get(key)
+        """Publish a whole batch (merged texts + images) and drop it durably.
+
+        Must be called while holding :attr:`_inbound_lock`.  The current
+        message (if any) has already been merged into the batch before this
+        call, so a failed publish restores the batch untouched and no image
+        reference is released.
+        """
+        batch = self._pending_message_batches.get(key)
         if batch is None:
             return
-        extra_images = extra_images or []
-        content = text or (
-            "请分析这张图片。" if len(batch.images) == 1 else "请分析这些图片。"
-        )
+        raw = raw or {}
+        if batch.texts:
+            content = "\n".join(batch.texts)
+        elif batch.images:
+            content = "请分析这张图片。" if len(batch.images) == 1 else "请分析这些图片。"
+        else:
+            content = ""
         try:
             await self._publish_inbound(
                 self._session_sender_id(batch.target, batch.sequence),
-                batch.target, content, batch.images + extra_images, raw,
+                batch.target, content, batch.images, raw,
             )
         except Exception:
-            self._delete_image_refs(extra_images)
+            # 发布失败：保留批次（含其文本与图片引用），等待重投/重试。
             raise
-        self._pending_image_batches.pop(key, None)
+        self._pending_message_batches.pop(key, None)
         try:
-            self._persist_pending_image_batches_locked()
+            self._persist_pending_message_batches_locked()
         except Exception:
-            self._pending_image_batches[key] = batch
+            self._pending_message_batches[key] = batch
             raise
         if batch.timer is not None and batch.timer is not asyncio.current_task():
             batch.timer.cancel()
@@ -802,13 +854,13 @@ class WeixinChannel(Channel):
         ))
         await acceptance
 
-    async def _cancel_pending_image_timers(self) -> None:
+    async def _cancel_pending_message_timers(self) -> None:
         # A timer can be holding _inbound_lock while it waits for MessageBus to
-        # accept a flush.  Cancel it before acquiring that lock so shutdown can
+        # accept a flush.  Cancel it before acquiring that lock so a stop can
         # never deadlock behind an unconsumed in-memory handoff.
         timers = [
             batch.timer
-            for batch in self._pending_image_batches.values()
+            for batch in self._pending_message_batches.values()
             if batch.timer is not None
         ]
         for timer in timers:
@@ -816,32 +868,36 @@ class WeixinChannel(Channel):
         if timers:
             await asyncio.gather(*timers, return_exceptions=True)
         async with self._inbound_lock:
-            for batch in self._pending_image_batches.values():
+            for batch in self._pending_message_batches.values():
                 if batch.timer in timers:
                     batch.timer = None
 
-    def _schedule_image_batch_timer_locked(
-        self, key: tuple[str, str], batch: _PendingImageBatch
+    def _schedule_message_batch_timer_locked(
+        self, key: tuple[str, str], batch: _PendingMessageBatch
     ) -> None:
         batch.timer = asyncio.create_task(
-            self._flush_image_batch_after_window(key, batch),
-            name="weixin-image-merge",
+            self._flush_message_batch_after_window(key, batch),
+            name="weixin-message-merge",
         )
 
     def _pending_batches_path(self) -> Path:
         if self.state_dir is None:
-            raise ValueError("weixin state_dir is required for image batching")
+            raise ValueError("weixin state_dir is required for message batching")
         self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         if self.state_dir.is_symlink() or not self.state_dir.is_dir():
             raise ValueError("invalid Weixin state directory")
         os.chmod(self.state_dir, 0o700)
+        # 持久化文件名故意保留旧名 pending_image_batches.json（含 image 字样）：
+        # 目的是兼容旧版本遗留的数据文件，避免升级后旧批次被忽略而丢失。
+        # 注意：文件内容现在存的是统一消息批次（文本 + 图片），已不只是图片。
+        # 请勿随意改名；若要改名，必须先实现文件迁移逻辑（旧名 → 新名）再切换。
         return self.state_dir / "pending_image_batches.json"
 
-    def _persist_pending_image_batches_locked(self) -> None:
+    def _persist_pending_message_batches_locked(self) -> None:
         path = self._pending_batches_path()
         if os.path.lexists(path) and path.is_symlink():
-            raise ValueError("invalid pending image state file")
-        if not self._pending_image_batches:
+            raise ValueError("invalid pending message state file")
+        if not self._pending_message_batches:
             try:
                 path.unlink()
             except FileNotFoundError:
@@ -859,17 +915,18 @@ class WeixinChannel(Channel):
                     "session_key": batch.session_key,
                     "delivery_ids": sorted(batch.delivery_ids),
                     "deadline_ms": batch.deadline_ms,
+                    "texts": batch.texts,
                     "images": [{"id": image.id, "mime": image.mime} for image in batch.images],
                 }
-                for batch in self._pending_image_batches.values()
+                for batch in self._pending_message_batches.values()
             ],
         }
         encoded = json.dumps(
             payload, ensure_ascii=False, separators=(",", ":")
         ).encode("utf-8")
         if len(encoded) > _MAX_PENDING_STATE_BYTES:
-            raise ValueError("pending image state exceeds size limit")
-        fd, temporary = tempfile.mkstemp(prefix=".pending-images-", dir=self.state_dir)
+            raise ValueError("pending message state exceeds size limit")
+        fd, temporary = tempfile.mkstemp(prefix=".pending-messages-", dir=self.state_dir)
         try:
             os.fchmod(fd, 0o600)
             with os.fdopen(fd, "wb") as output:
@@ -893,10 +950,10 @@ class WeixinChannel(Channel):
         finally:
             os.close(directory_fd)
 
-    async def _restore_pending_image_batches(self) -> None:
+    async def _restore_pending_message_batches(self) -> None:
         if self._pending_batches_restored:
             return
-        if self.state_dir is None or self.image_store is None:
+        if self.state_dir is None:
             self._pending_batches_restored = True
             return
         async with self._inbound_lock:
@@ -905,7 +962,7 @@ class WeixinChannel(Channel):
                 self._pending_batches_restored = True
                 return
             if path.is_symlink():
-                raise ValueError("invalid pending image state file")
+                raise ValueError("invalid pending message state file")
             fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
             info = os.fstat(fd)
             if (
@@ -914,7 +971,7 @@ class WeixinChannel(Channel):
                 or info.st_size > _MAX_PENDING_STATE_BYTES
             ):
                 os.close(fd)
-                raise ValueError("invalid pending image state file")
+                raise ValueError("invalid pending message state file")
             with os.fdopen(fd, encoding="utf-8") as source:
                 payload = json.load(source)
             if (
@@ -922,8 +979,8 @@ class WeixinChannel(Channel):
                 or payload.get("version") != 1
                 or not isinstance(payload.get("batches"), list)
             ):
-                raise ValueError("invalid pending image state")
-            loaded: dict[tuple[str, str], _PendingImageBatch] = {}
+                raise ValueError("invalid pending message state")
+            loaded: dict[tuple[str, str], _PendingMessageBatch] = {}
             expired: list[tuple[str, str]] = []
             for item in payload["batches"]:
                 if not isinstance(item, dict):
@@ -947,11 +1004,16 @@ class WeixinChannel(Channel):
                     sequence = int(suffix)
                 elif session_key != prefix:
                     continue
+                text_items = item.get("texts")
+                if text_items is None:
+                    text_items = []  # 旧格式（仅图片批次）无 texts 字段，视为空文本
                 image_items = item.get("images")
                 delivery_items = item.get("delivery_ids")
                 deadline = item.get("deadline_ms")
                 if (
-                    not isinstance(image_items, list)
+                    not isinstance(text_items, list)
+                    or not all(isinstance(value, str) for value in text_items)
+                    or not isinstance(image_items, list)
                     or not isinstance(delivery_items, list)
                     or not delivery_items
                     or not all(
@@ -964,36 +1026,41 @@ class WeixinChannel(Channel):
                 ):
                     continue
                 images = []
-                for image_data in image_items:
-                    if (
-                        not isinstance(image_data, dict)
-                        or not isinstance(image_data.get("id"), str)
-                        or not 0 < len(image_data["id"]) <= 128
-                    ):
-                        continue
-                    image = self.image_store.resolve(session_key, image_data["id"])
-                    if image is not None:
-                        images.append(image)
-                if not images:
+                if self.image_store is not None:
+                    for image_data in image_items:
+                        if (
+                            not isinstance(image_data, dict)
+                            or not isinstance(image_data.get("id"), str)
+                            or not 0 < len(image_data["id"]) <= 128
+                        ):
+                            continue
+                        image = self.image_store.resolve(session_key, image_data["id"])
+                        if image is not None:
+                            images.append(image)
+                if not images and not text_items:
                     continue
                 key = (account_id, user_id)
                 if key in loaded:
                     continue
-                batch = _PendingImageBatch(
+                batch = _PendingMessageBatch(
                     account_id, user_id, target, session_key,
-                    sequence=sequence, images=images,
+                    sequence=sequence, texts=list(text_items), images=images,
                     delivery_ids=set(delivery_items), deadline_ms=int(deadline),
                 )
                 loaded[key] = batch
-                if batch.deadline_ms <= int(time.time() * 1000):
+                # 已过期或已达条数上限的批次直接 flush，不等定时器。
+                if (
+                    batch.deadline_ms <= int(time.time() * 1000)
+                    or len(batch.delivery_ids) >= self.merge_max_messages
+                ):
                     expired.append(key)
-            self._pending_image_batches.update(loaded)
-            self._persist_pending_image_batches_locked()
+            self._pending_message_batches.update(loaded)
+            self._persist_pending_message_batches_locked()
             for key in expired:
-                await self._flush_image_batch_locked(key, None, {})
+                await self._flush_message_batch_locked(key, {})
             for key, batch in loaded.items():
-                if key in self._pending_image_batches and key not in expired:
-                    self._schedule_image_batch_timer_locked(key, batch)
+                if key in self._pending_message_batches and key not in expired:
+                    self._schedule_message_batch_timer_locked(key, batch)
             self._pending_batches_restored = True
 
     def _discard_duplicate_inbound_image(self, descriptor: Any) -> None:

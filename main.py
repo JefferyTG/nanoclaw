@@ -274,9 +274,10 @@ def build_weixin_channel(
         bind_callback=bind_callback,
         unbind_callback=unbind_callback,
         suspend_callback=suspend_callback,
-        image_merge_window_sec=float(
-            settings.get("image_merge_window_sec", 10)
-        ),
+        # 默认值与 config.py / WeixinChannel 构造器一致（8.0 / 10），且不在组合根
+        # 强转：非法值（如 "abc"）由构造器的 try/except 兜底，而不是在此抛 ValueError。
+        image_merge_window_sec=settings.get("image_merge_window_sec", 8.0),
+        merge_max_messages=settings.get("merge_max_messages", 10),
         request_timeout_sec=float(settings.get("request_timeout_sec", 30)),
         login_timeout_sec=float(settings.get("login_timeout_sec", 480)),
         inbound_ack_timeout_sec=float(
