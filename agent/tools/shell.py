@@ -59,7 +59,7 @@ class ExecTool(Tool):
         r"sudo\s+",          # 提权执行
         r"\bsu\b",           # 切换到 root
         r"chmod\s+777",      # 危险权限开放
-        r">\s*/dev/",        # 覆写设备文件
+        r">\s*/dev/(?!null\b)",  # 覆写设备文件（排除黑洞 /dev/null 的误伤）
         r"wget\s+.*\|\s*sh",     # 下载后直接执行脚本
         r"curl\s+.*\|\s*bash",   # 下载后直接执行脚本
         r"nc\s+-l",          # 监听端口开后门
