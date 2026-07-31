@@ -117,7 +117,11 @@ class IdentityBootstrapperTests(unittest.IsolatedAsyncioTestCase):
             normal = await bus.consume_outbound()
             self.assertEqual(normal.content, "normal reply")
             self.assertEqual(len(agents), 1)
-            self.assertEqual(agents[0].calls[0][0], "重新发送的任务")
+            # 消息经 Gateway 注入时间戳前缀后整体交给 Agent（内容仍完整保留）
+            self.assertRegex(
+                agents[0].calls[0][0],
+                r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\] 重新发送的任务$",
+            )
 
     async def test_gateway_shutdown_cancels_and_waits_for_inflight_messages(self):
         bus = MessageBus()

@@ -784,6 +784,7 @@ async def amain() -> None:
         channels,
         factory,
         identity_bootstrapper=shared["identity_bootstrapper"],
+        timezone=cfg.timezone,
     )
 
     # 并发启动各渠道的 start() + 入站消费 + 出站分发协程。

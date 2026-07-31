@@ -117,8 +117,11 @@ class ContextBuilder:
     def _time_tool_instructions() -> str:
         return (
             "## 当前时间\n"
-            "只有涉及当前时间、今天/明天、星期、时间差、提醒或定时任务时，"
-            "先调用 get_current_time 获取时间和时区；其他场景不要调用它，也不要自行猜测当前时间。"
+            "每一轮用户消息开头已自动带有当前时间戳前缀（格式 [YYYY-MM-DD HH:MM]，"
+            "实例默认时区），可直接作为当前时间依据，无需再调用工具。\n"
+            "仅当需要精确到秒的时间、查询其它时区的当前时间，"
+            "或处理提醒/定时任务等需要标准时间格式的场景时，"
+            "才调用 get_current_time 工具。"
         )
 
     def build_system_prompt(self) -> str:

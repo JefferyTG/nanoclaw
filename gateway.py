@@ -13,7 +13,11 @@ Gateway 是「渠道无关」的运行时核心。它不关心消息具体来自
 """
 
 import asyncio
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Callable, Dict, List
+from zoneinfo import ZoneInfo
+
+from config import validate_iana_timezone
 
 from bus.queue import MessageBus, InboundMessage, OutboundMessage, StreamEvent
 from channels.base import Channel
@@ -44,6 +48,22 @@ def _delivery_result(
     )
 
 
+def _timestamp_prefix(timezone: str, now=None) -> str:
+    """Return the "[YYYY-MM-DD HH:MM]" prefix for ``now`` in an IANA timezone.
+
+    Emits only date and minute (no seconds / weekday / UTC offset) so every
+    inbound user turn carries a cheap wall-clock anchor.  The prefix is built
+    once when the message arrives and then stays fixed in the appended history,
+    leaving the session-stable System Prompt (and therefore the Prompt Cache
+    prefix) untouched.
+    """
+    selected = validate_iana_timezone(timezone)
+    instant = now if now is not None else datetime.now(UTC)
+    if getattr(instant, "tzinfo", None) is None:
+        instant = instant.replace(tzinfo=UTC)
+    return instant.astimezone(ZoneInfo(selected)).strftime("[%Y-%m-%d %H:%M]")
+
+
 class Gateway:
     """消息网关：驱动所有渠道与 Agent 协同工作。"""
 
@@ -53,11 +73,14 @@ class Gateway:
         channels: List[Channel],
         agent_factory: Callable[[str], AgentLoop],
         identity_bootstrapper: IdentityBootstrapper | None = None,
+        timezone: str = "Asia/Shanghai",
     ) -> None:
         self.bus = bus
         self.channels = channels
         self.agent_factory = agent_factory
         self.identity_bootstrapper = identity_bootstrapper
+        # 实例默认时区：注入到每轮用户消息的时间戳前缀使用它（配置已验证）
+        self.timezone = validate_iana_timezone(timezone)
         # 按渠道名索引，出站分发时 O(1) 查找
         self._channel_map: Dict[str, Channel] = {ch.name: ch for ch in channels}
         # 按 session_key 缓存 Agent 实例（同一会话复用，互不干扰）
@@ -126,12 +149,19 @@ class Gateway:
                     agent = self.agent_factory(session_key)
                     self._agents[session_key] = agent
 
+            # 每轮用户消息在进入 AgentLoop 之前，注入当前时间戳前缀（实例默认时区）。
+            # 时间戳在消息进入时生成一次，整体作为本轮模型输入并原样持久化进会话
+            # 历史（追加式、固定不变）；System Prompt 保持会话级稳定快照，不影响
+            # Prompt Cache 前缀命中。图片消息的默认文本（如「请分析这张图片。」）
+            # 已由渠道写入 msg.content，同样会被前缀。
+            content = f"{_timestamp_prefix(self.timezone)} {msg.content}"
+
             # 仅网页渠道挂载流式事件接收方：把 Agent 的逐步事件实时推给网页端。
             stream_sink = self._make_stream_sink(msg) if msg.channel == "web" else None
             try:
                 # 把随消息附带的图片引用一并交给 Agent；纯文本消息 images 为 None
                 reply = await agent.run(
-                    msg.content, images=msg.images, stream_sink=stream_sink
+                    content, images=msg.images, stream_sink=stream_sink
                 )
             except Exception as exc:
                 reply = f"⚠️ 处理消息时出错：{exc}"
