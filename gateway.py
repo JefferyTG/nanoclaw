@@ -92,6 +92,10 @@ class Gateway:
         # _process_inbound 为每条消息创建的在途任务。显式登记后，SIGTERM
         # 关闭可以先取消并等待它们，让子 Agent / 工具的 finally 正常回收资源。
         self._inflight_tasks: set[asyncio.Task] = set()
+        # session_key -> 当前正在执行该会话回合的 asyncio.Task（仅持锁运行的那条）。
+        # 网页「停止」按钮经总线发来 ctl/cancel 控制消息时，据此取消在途回合；
+        # 同一会话排队等锁的消息未持锁，不会被误取消。
+        self._active_tasks: Dict[str, asyncio.Task] = {}
 
     async def run(self) -> None:
         """并发启动所有渠道、入站消费循环与出站分发循环。"""
@@ -111,6 +115,11 @@ class Gateway:
         while True:
             msg = await self.bus.consume_inbound()
             session_key = f"{msg.channel}:{msg.sender_id}"
+
+            # 网页「停止」控制消息：取消该会话当前回合，不进入聊天流程
+            if msg.raw and msg.raw.get("ctl") == "cancel":
+                self._cancel_session(session_key)
+                continue
 
             # 取/建该会话的锁（保护并发创建，避免同会话首条消息竞态）
             async with self._reg_lock:
@@ -133,43 +142,56 @@ class Gateway:
         # 同一会话串行跑（持锁）；首次人设引导也在锁内完成，避免连续两条消息
         # 竞态地都被当成“第一条”。不同会话还会由 Bootstrapper 的实例级锁协调。
         async with lock:
-            if self.identity_bootstrapper is not None:
-                bootstrap_reply = await self.identity_bootstrapper.handle(
-                    session_key, msg.content
-                )
-                if bootstrap_reply is not None:
-                    await self.outbound_safe(bootstrap_reply, msg, None)
-                    return
-
-            # 人设就绪后才惰性创建 Agent，避免把首次引导文本写入会话历史或
-            # 在缺少人设时发起模型请求。
-            async with self._reg_lock:
-                agent = self._agents.get(session_key)
-                if agent is None:
-                    agent = self.agent_factory(session_key)
-                    self._agents[session_key] = agent
-
-            # 每轮用户消息在进入 AgentLoop 之前，注入当前时间戳前缀（实例默认时区）。
-            # 时间戳在消息进入时生成一次，整体作为本轮模型输入并原样持久化进会话
-            # 历史（追加式、固定不变）；System Prompt 保持会话级稳定快照，不影响
-            # Prompt Cache 前缀命中。图片消息的默认文本（如「请分析这张图片。」）
-            # 已由渠道写入 msg.content，同样会被前缀。
-            content = f"{_timestamp_prefix(self.timezone)} {msg.content}"
-
-            # 仅网页渠道挂载流式事件接收方：把 Agent 的逐步事件实时推给网页端。
-            stream_sink = self._make_stream_sink(msg) if msg.channel == "web" else None
+            # 登记为当前会话的在途回合（网页「停止」取消用）。只有持锁运行的
+            # 这条消息才算「当前回合」；同一会话排队等锁的消息不会被误取消。
+            active_task = asyncio.current_task()
+            self._active_tasks[session_key] = active_task
             try:
-                # 把随消息附带的图片引用一并交给 Agent；纯文本消息 images 为 None
-                reply = await agent.run(
-                    content, images=msg.images, stream_sink=stream_sink
-                )
-            except Exception as exc:
-                reply = f"⚠️ 处理消息时出错：{exc}"
-                if stream_sink is not None:
-                    try:
-                        await stream_sink({"type": "done", "content": reply})
-                    except Exception:
-                        pass
+                if self.identity_bootstrapper is not None:
+                    bootstrap_reply = await self.identity_bootstrapper.handle(
+                        session_key, msg.content
+                    )
+                    if bootstrap_reply is not None:
+                        await self.outbound_safe(bootstrap_reply, msg, None)
+                        return
+
+                # 人设就绪后才惰性创建 Agent，避免把首次引导文本写入会话历史或
+                # 在缺少人设时发起模型请求。
+                async with self._reg_lock:
+                    agent = self._agents.get(session_key)
+                    if agent is None:
+                        agent = self.agent_factory(session_key)
+                        self._agents[session_key] = agent
+
+                # 每轮用户消息在进入 AgentLoop 之前，注入当前时间戳前缀（实例默认时区）。
+                # 时间戳在消息进入时生成一次，整体作为本轮模型输入并原样持久化进会话
+                # 历史（追加式、固定不变）；System Prompt 保持会话级稳定快照，不影响
+                # Prompt Cache 前缀命中。图片消息的默认文本（如「请分析这张图片。」）
+                # 已由渠道写入 msg.content，同样会被前缀。
+                content = f"{_timestamp_prefix(self.timezone)} {msg.content}"
+
+                # 仅网页渠道挂载流式事件接收方：把 Agent 的逐步事件实时推给网页端。
+                stream_sink = self._make_stream_sink(msg) if msg.channel == "web" else None
+                try:
+                    # 把随消息附带的图片引用一并交给 Agent；纯文本消息 images 为 None
+                    reply = await agent.run(
+                        content, images=msg.images, stream_sink=stream_sink
+                    )
+                except asyncio.CancelledError:
+                    # 用户「停止」：agent.run 已向 stream_sink 补发 done；这里让
+                    # CancelledError 继续向上传播，保证任务真正取消、锁被释放。
+                    raise
+                except Exception as exc:
+                    reply = f"⚠️ 处理消息时出错：{exc}"
+                    if stream_sink is not None:
+                        try:
+                            await stream_sink({"type": "done", "content": reply})
+                        except Exception:
+                            pass
+            finally:
+                # 回合结束（正常/错误/被取消）都解除在途登记
+                if self._active_tasks.get(session_key) is active_task:
+                    self._active_tasks.pop(session_key, None)
 
         reply_images = []
         image_store = getattr(agent, "image_store", None)
@@ -185,6 +207,17 @@ class Gateway:
         await self.outbound_safe(
             reply, msg, stream_sink, images=reply_images or None
         )
+
+    def _cancel_session(self, session_key: str) -> None:
+        """取消指定会话当前正在执行的回合（网页「停止」按钮）。
+
+        只取消已持锁运行的任务；``async with`` 保证取消后锁被释放，同会话
+        后续消息仍可正常排队处理。找不到在途任务时静默忽略（如回合刚结束、
+        或取消请求早于任务真正开始）。
+        """
+        task = self._active_tasks.get(session_key)
+        if task is not None and not task.done():
+            task.cancel()
 
     async def outbound_safe(
         self, reply: str, msg: InboundMessage, stream_sink, images=None

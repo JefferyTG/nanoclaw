@@ -490,6 +490,21 @@ class WebChannel(Channel):
                                     await self._ws_send_json(
                                         ws, {"type": "session_changed", "key": key}
                                     )
+                            elif ctype == "cancel":
+                                # 网页「停止」：把取消请求投递到网关。复用入站消息
+                                # 总线（与普通聊天消息同一通道、跨线程投递到主循环），
+                                # 用 raw 里的 ctl/cancel 标记，网关在 _process_inbound
+                                # 拦截后取消该会话在途回合，绝不进入聊天流程。
+                                inbound = InboundMessage(
+                                    channel=self.name,
+                                    sender_id=st["current_key"],
+                                    chat_id=conn_id,
+                                    content="",
+                                    raw={"ctl": "cancel"},
+                                )
+                                asyncio.run_coroutine_threadsafe(
+                                    self.bus.publish_inbound(inbound), self._loop
+                                )
                             # 控制消息不进入聊天流程
                             continue
                     # 聊天用 JSON（不带 ctl 标记）：{"text":..., "images":[id,...]}

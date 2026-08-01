@@ -240,6 +240,18 @@ class AgentLoop:
         self._active_cache_turn = None
         try:
             return await self._run(user_message, images=images, stream_sink=stream_sink)
+        except asyncio.CancelledError:
+            # 网页「停止」：回合被取消时必须向流式 sink 补发 done，让前端把
+            # 回合标记为「已停止」并恢复发送按钮；随后原样向上抛出，保证任务
+            # 真正取消、锁与资源由上层 finally / async with 正常回收。绝不能
+            # 用 except Exception 吞掉 CancelledError（它是 BaseException）。
+            self.last_run_status = "cancelled"
+            if stream_sink is not None:
+                try:
+                    await stream_sink({"type": "done", "content": "⏹ 已停止"})
+                except Exception:  # noqa: BLE001 - 停止标记发送失败不影响取消本身
+                    pass
+            raise
         finally:
             if self._active_cache_turn is not None:
                 self.last_cache_metrics = self._active_cache_turn.finish()

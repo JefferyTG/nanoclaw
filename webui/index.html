@@ -83,6 +83,9 @@
   #bar #attachBtn:hover, #bar #recordBtn:hover, #bar #ttsBtn:hover { border-color:var(--accent); }
   #bar #ttsBtn.enabled { color:var(--ok); border-color:var(--ok); }
   #bar #recordBtn.recording { background:#b13d4b; border-color:#e86b78; color:#fff; }
+  /* 停止键：回合进行中 sendBtn 变「⏹ 停止」，红色警示；防重复点击时禁用 */
+  #bar #sendBtn.stop { background:#b13d4b; border-color:#e86b78; }
+  #bar #sendBtn:disabled { opacity:.6; cursor:default; }
 
   /* —— 待发送图片预览条（粘贴/选择后、发送前）—— */
   #attach { display:none; gap:8px; padding:8px 16px 0; flex-wrap:wrap; }
@@ -199,6 +202,7 @@
 (function () {
   var chat = document.getElementById('chat');
   var input = document.getElementById('input');
+  var sendBtn = document.getElementById('sendBtn');
   // —— 聊天区 sticky scroll：贴底才自动跟随，用户上滑读历史时不被拉回 ——
   var nearBottom = true;   // 是否在底部附近（阈值 80px）；贴底才自动滚动到底
   function scrollChatToBottom() {
@@ -681,11 +685,11 @@
     }
     var t = ev.type;
     if (t === 'subagent_event') {
-      if (!cur) cur = newTurn();
+      if (!cur) { cur = newTurn(); updateSendBtn(); }
       onSubagentEvent(cur, ev);
       return;
     }
-    if (!cur) cur = newTurn();
+    if (!cur) { cur = newTurn(); updateSendBtn(); }
     if (t === 'thinking') {
       // 全文累积到 body（仅展开时可见），单行预览随思考流式刷新
       cur.thinkBody.textContent += (ev.content || '');
@@ -737,6 +741,7 @@
       cur.botImages.appendChild(im);
       scrollChatToBottom();
     } else if (t === 'done') {
+      var wasStopping = stopping;   // 记录是否因用户点「停止」而结束
       // 兜底：清理任何残留的工具计时器（如某工具异常未回传 tool_result）
       if (cur.activity) cur.activity.querySelectorAll('.tool-card').forEach(function (tc) {
         if (tc._timer) { clearInterval(tc._timer); tc._timer = null; }
@@ -750,12 +755,16 @@
         cur.answerStarted = true;
         // 兼容未逐 token 推送、仅在 done 给出完整正文的 Provider；不会与流式正文重复。
         collectTtsToken(cur, ev.content);
+      } else if (wasStopping && cur.answerStarted && ev.content) {
+        // 用户点击「停止」且已有部分回答：保留已生成内容，末尾追加停止标记
+        cur.answer.textContent += '\n' + ev.content;
       }
       if (!cur.answer.textContent.trim()) cur.answer.textContent = '（本轮未生成正式回答）';
       // token 已增量分句；done 只清空尾部，避免把完整 content 重复朗读。
       flushTtsSegments(cur, true);
       ttsDiscardUntilDone = false;
       cur = null;
+      updateSendBtn();   // 回合结束：按钮恢复「发送」
       scrollChatToBottom();
       loadSessions();   // 刷新侧边栏：新会话出现 / 预览与末次时间更新
     }
@@ -797,6 +806,7 @@
       ttsDiscardUntilDone = false;
       clearSubagentTimers(cur);
       cur = null;
+      updateSendBtn();   // 断线回合作废：按钮恢复「发送」
       statusEl.textContent = '已断开 · 重连中…';
       statusEl.style.color = '#d98c00';
       if (_reconnectTimer) clearTimeout(_reconnectTimer);
@@ -825,6 +835,7 @@
       cur.answer.textContent += data;
       cur.think.classList.remove('live');
       cur = null;
+      updateSendBtn();   // 兜底路径也要恢复按钮
     };
   }
   connectWS();
@@ -895,6 +906,49 @@
       });
   }
 
+  // —— 停止键：回合进行中 sendBtn 变「⏹ 停止」，点击后取消当前回合 ——
+  var stopping = false;          // 停止请求已发出（防重复点击）
+  var stopRetryTimer = null;     // 兜底：done 迟迟未到则恢复可点击，允许重试
+
+  function updateSendBtn() {
+    if (stopRetryTimer) { clearTimeout(stopRetryTimer); stopRetryTimer = null; }
+    if (cur) {
+      sendBtn.textContent = '⏹ 停止';
+      sendBtn.classList.add('stop');
+      sendBtn.disabled = stopping;
+    } else {
+      sendBtn.textContent = '发送';
+      sendBtn.classList.remove('stop');
+      sendBtn.disabled = false;
+      stopping = false;
+    }
+  }
+
+  function stopTurn() {
+    if (!cur || stopping) return;
+    stopping = true;
+    updateSendBtn();
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      // 连接已断开：本地直接结束回合状态（已生成内容保留在界面）
+      cur = null;
+      updateSendBtn();
+      return;
+    }
+    try {
+      ws.send(JSON.stringify({ ctl: true, type: 'cancel' }));
+    } catch (err) {
+      stopping = false;
+      updateSendBtn();
+      return;
+    }
+    // 防抖兜底：8s 内未收到 done（服务端异常/取消未生效）则恢复可点击以便重试
+    stopRetryTimer = setTimeout(function () {
+      stopRetryTimer = null;
+      stopping = false;
+      updateSendBtn();
+    }, 8000);
+  }
+
   var sending = false;   // 上传期间防重复发送
   function send() {
     if (recorder || recordingBusy) {
@@ -910,6 +964,7 @@
       stopTtsForTransition();
       addUser(text);
       cur = newTurn();
+      updateSendBtn();   // 回合开始：按钮变「⏹ 停止」
       ws.send(text);
       input.value = '';
       return;
@@ -925,6 +980,7 @@
         stopTtsForTransition();
         addUser(text, imgs.map(function (it) { return it.url; }));   // 本地预览 URL 直接回显
         cur = newTurn();
+        updateSendBtn();   // 回合开始：按钮变「⏹ 停止」
         ws.send(JSON.stringify({ text: text, images: ids }));
         input.value = '';
         pendingImages = [];
@@ -937,7 +993,10 @@
       })
       .finally(function () { sending = false; });
   }
-  document.getElementById('sendBtn').onclick = send;
+  sendBtn.onclick = function () {
+    if (cur) { stopTurn(); return; }   // 回合进行中：按钮是「停止」
+    send();
+  };
   // 回车发送；但输入法（IME）组字过程中的回车（确认候选词）不算发送，
   // 用 isComposing / keyCode===229 区分，避免中文上屏误发。
   input.addEventListener('keydown', function (e) {
@@ -1048,6 +1107,7 @@
           stopTtsForTransition();
           addUser(text);
           cur = newTurn();
+          updateSendBtn();   // 回合开始：按钮变「⏹ 停止」
           ws.send(text);
         }).catch(function (err) {
           addSys('语音转写失败：' + ((err && err.message) || err));
@@ -1165,6 +1225,7 @@
       chat.innerHTML = '';
       nearBottom = true;   // 历史回放从底部开始跟随
       cur = null;
+      updateSendBtn();
       renderHistory((d && d.messages) || []);
       loadSessions();
     }).catch(function (e) { addSys('打开会话失败：' + e); });
@@ -1180,6 +1241,7 @@
     chat.innerHTML = '';
     nearBottom = true;   // 新会话从底部开始跟随
     cur = null;
+    updateSendBtn();
     currentKey = null;
   }
 
