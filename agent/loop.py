@@ -29,6 +29,7 @@ B. 工具调用防爆（循环熔断）
 import asyncio
 import base64
 import json
+import logging
 import os
 import time
 from typing import List, Optional
@@ -41,6 +42,8 @@ from agent.history import canonicalize_history
 from session.manager import SessionManager
 from agent.memory import MemoryConsolidation
 from providers.usage import PromptCacheUsage
+
+logger = logging.getLogger("nanoclaw.agent.loop")
 
 
 class AgentLoop:
@@ -96,6 +99,23 @@ class AgentLoop:
         # 当前一轮由 generate_image（含子 Agent）产出的图片 ID。Gateway 在
         # run() 返回后把它们解析为 ImageRef，交给支持图片出站的渠道。
         self.last_generated_image_ids: list[str] = []
+
+        # —— 网页「停止」取消回合时补历史的暂存状态（命名风格与 last_run_status 一致）——
+        # 本轮 user_record（_run 里构造、_persist 写盘的那条），取消时补进
+        # _session_history / 磁盘，让下一轮「继续」能看到上一轮用户消息。
+        self._last_user_record: Optional[dict] = None
+        # 上述 user_record 是否已写盘（_run 的 _persist 成功后置 True；取消发生在
+        # _persist(user_record) 之前时仍为 False，需由取消分支补写）。
+        self._user_record_persisted: bool = False
+        # 本轮已生成的部分回答文本（流式 token 累积 / 离散 response.content），
+        # 取消时随中断占位 assistant 记录一并保留，供模型下一轮正确接续。
+        self._partial_answer: Optional[str] = None
+        # 工具执行中取消时 _execute_tools 已落盘的中断 assistant 记录（生图/子 Agent
+        # 场景，含 generated_images / subagent_runs 元数据）；取消分支直接复用，
+        # 避免再补一条通用占位导致重复。
+        self._interrupt_record: Optional[dict] = None
+        # 本轮取消补历史是否已完成（幂等：重复取消 / 重复调用不重复追加）。
+        self._cancel_history_recorded: bool = False
 
         # 工具调用签名滑动窗口（防爆用），存 "name:args_json"
         self._tool_call_history: List[str] = []
@@ -246,6 +266,13 @@ class AgentLoop:
             # 真正取消、锁与资源由上层 finally / async with 正常回收。绝不能
             # 用 except Exception 吞掉 CancelledError（它是 BaseException）。
             self.last_run_status = "cancelled"
+            # 先把本轮 user 消息与中断占位 assistant 补进历史（同步、无 await，
+            # 先于可能被再次取消打断的 done 发送），这样下一轮「继续」能看到
+            # 「上一轮 user + 回答被停止」，模型才能正确接续上下文。
+            try:
+                self._record_cancelled_turn()
+            except Exception:  # noqa: BLE001 - 补历史失败不能影响取消语义本身
+                logger.exception("AgentLoop 取消时补历史失败，session_key=%s", self.session_key)
             if stream_sink is not None:
                 try:
                     await stream_sink({"type": "done", "content": "⏹ 已停止"})
@@ -256,6 +283,62 @@ class AgentLoop:
             if self._active_cache_turn is not None:
                 self.last_cache_metrics = self._active_cache_turn.finish()
                 self._active_cache_turn = None
+
+    def _record_cancelled_turn(self) -> None:
+        """网页「停止」取消回合后，把本轮 user 消息与中断占位 assistant 补进历史。
+
+        正常回合在结束时用 ``_persist(final_msg) + _save_to_history(messages)``
+        同时更新磁盘与内存 ``_session_history``；取消回合不会走到那里，导致下一轮
+        ``_run`` 用 ``_session_history`` 构建 messages 时缺上一轮 user 与 assistant
+        回复，模型看到连续两条 user 消息、不知道「继续」接什么。本方法把：
+
+            [上一条 user, 中断占位 assistant（含已生成的部分回答）]
+
+        以与 ``canonicalize_history`` 兼容的格式补进 ``_session_history`` 并写盘
+        （user_record 若已由 ``_run`` 写盘则跳过，幂等），让下一轮模型能看到
+        「上一轮回答被停止」从而正确接续。
+
+        幂等保证：
+        - ``_cancel_history_recorded`` 守卫，整轮只补一次；
+        - user_record 磁盘已写则不再写（``_user_record_persisted``）；
+        - 工具执行中取消时 ``_execute_tools`` 已落盘的中断记录直接复用
+          （``self._interrupt_record``），不重复生成通用占位；
+        - 取消发生在 user_record 构造之前（如会话压缩阶段）时磁盘上没有任何
+          本轮记录，直接返回，避免产生孤立的占位 assistant。
+        """
+        if self._cancel_history_recorded:
+            return
+        self._cancel_history_recorded = True
+        if self._last_user_record is None:
+            return
+
+        records_to_append: List[dict] = []
+
+        # 1) 用户消息：_run 的 _persist 已写盘则跳过，否则补写（幂等）
+        if not self._user_record_persisted:
+            self._persist(self._last_user_record)
+            self._user_record_persisted = True
+        records_to_append.append(self._last_user_record)
+
+        # 2) 中断占位 assistant：工具取消已落盘则复用，否则生成通用占位
+        #    （若已有部分回答文本则带上，让模型知道上一轮生成到哪一步）。
+        if self._interrupt_record is not None:
+            interrupt_record = self._interrupt_record
+        else:
+            partial = self._partial_answer or ""
+            if partial:
+                content = f"{partial}\n\n（⏹ 回答被用户停止）"
+            else:
+                content = "（上一轮回答被用户手动停止）"
+            interrupt_record = {"role": "assistant", "content": content}
+            self._persist(interrupt_record)
+        records_to_append.append(interrupt_record)
+
+        # 统一走 canonicalize_history：保证与磁盘格式、_history_item_to_api 兼容，
+        # 且重复调用（_cancel_history_recorded 已拦）也不会产生重复/脏数据。
+        self._session_history = canonicalize_history(
+            [*self._session_history, *records_to_append]
+        )
 
     async def _run(self, user_message: str, images=None, stream_sink=None) -> str:
         """处理一轮用户消息，返回模型最终文本回复。
@@ -273,6 +356,12 @@ class AgentLoop:
         """
         self.last_run_status = "running"
         self.last_generated_image_ids = []
+        # 重置取消补历史的本轮暂存（上一轮取消/异常残留不允许泄漏进本轮）
+        self._last_user_record = None
+        self._user_record_persisted = False
+        self._partial_answer = None
+        self._interrupt_record = None
+        self._cancel_history_recorded = False
         base_mm = self.base_model_multimodal
 
         # 1. 构建初始 messages（注入跨轮历史 + 当前输入）
@@ -323,7 +412,13 @@ class AgentLoop:
             user_record["images"] = [
                 {"id": self._img_id(r), "mime": self._img_mime(r)} for r in images
             ]
+        # 提升到 self：取消（停止）时 run() 的取消分支据此补历史。user_record
+        # 构造与 _persist 之间无 await，取消只会发生在 _persist 成功之后；
+        # _user_record_persisted 用于「取消发生在写盘之前」边界的幂等保护。
+        self._last_user_record = user_record
+        self._user_record_persisted = False
         self._persist(user_record)
+        self._user_record_persisted = True
 
         # 是否走流式路径：仅当挂载了 sink 且 Provider 支持 chat_stream 时。
         # 否则走原有的 chat() 离散路径（有 sink 时也 emit 离散事件，保证网页可见）。
@@ -374,7 +469,10 @@ class AgentLoop:
                         await stream_sink({"type": "done", "content": msg})
                     self.last_run_status = "timed_out"
                     return msg
-                # 离散路径：把整轮响应作为一次性事件推给 sink（无 sink 则返回正文）
+                # 离散路径：把整轮响应作为一次性事件推给 sink（无 sink 则返回正文）。
+                # 先记录部分回答文本（含工具轮的前置正文），供取消分支补历史；
+                # 取消若发生在 _emit_discrete 的 sink await 期间也不丢。
+                self._partial_answer = getattr(response, "content", None) or ""
                 final_content = await self._emit_discrete(response, stream_sink)
 
             self._active_cache_turn.record(
@@ -470,39 +568,44 @@ class AgentLoop:
         """
         content_buf: list = []
         call_start = time.monotonic()
-        async for ev in self.provider.chat_stream(
-            messages, tool_definitions, self.model
-        ):
-            # 单次流式模型调用也受整轮超时约束，避免模型连接挂死拖垮整轮
-            if time.monotonic() - call_start > self.turn_timeout:
+        try:
+            async for ev in self.provider.chat_stream(
+                messages, tool_definitions, self.model
+            ):
+                # 单次流式模型调用也受整轮超时约束，避免模型连接挂死拖垮整轮
+                if time.monotonic() - call_start > self.turn_timeout:
+                    response = type(
+                        "R", (), {"finish_reason": "error", "reasoning_content": None,
+                                  "content": "模型响应超时，已终止本轮。", "has_tool_calls": False}
+                    )()
+                    return response, "模型响应超时，已终止本轮。"
+                etype = ev.get("type")
+                if etype == "reasoning":
+                    await stream_sink({"type": "thinking", "content": ev["content"]})
+                elif etype == "token":
+                    await stream_sink({"type": "token", "content": ev["content"]})
+                    content_buf.append(ev["content"])
+                elif etype == "done":
+                    response = ev["response"]
+                    break
+            else:
+                # 正常不会走到（chat_stream 必 yield 一个 done），兜底为 error
                 response = type(
                     "R", (), {"finish_reason": "error", "reasoning_content": None,
-                              "content": "模型响应超时，已终止本轮。", "has_tool_calls": False}
+                              "content": "", "has_tool_calls": False}
                 )()
-                return response, "模型响应超时，已终止本轮。"
-            etype = ev.get("type")
-            if etype == "reasoning":
-                await stream_sink({"type": "thinking", "content": ev["content"]})
-            elif etype == "token":
-                await stream_sink({"type": "token", "content": ev["content"]})
-                content_buf.append(ev["content"])
-            elif etype == "done":
-                response = ev["response"]
-                break
-        else:
-            # 正常不会走到（chat_stream 必 yield 一个 done），兜底为 error
-            response = type(
-                "R", (), {"finish_reason": "error", "reasoning_content": None,
-                          "content": "", "has_tool_calls": False}
-            )()
-        final_content = "".join(content_buf)
+            final_content = "".join(content_buf)
 
-        # 终端打印本轮推理/正文（与离散路径日志风格一致）
-        if getattr(response, "reasoning_content", None):
-            self._print_thinking(response.reasoning_content)
-        if getattr(response, "content", None):
-            print("\033[2;3;90m  " + response.content.strip() + "\033[0m")
-        return response, final_content
+            # 终端打印本轮推理/正文（与离散路径日志风格一致）
+            if getattr(response, "reasoning_content", None):
+                self._print_thinking(response.reasoning_content)
+            if getattr(response, "content", None):
+                print("\033[2;3;90m  " + response.content.strip() + "\033[0m")
+            return response, final_content
+        finally:
+            # 取消 / 超时 / 异常时也要把已生成的文本留在 self（try/finally 保证
+            # 任何退出路径都执行），供 run() 的取消分支补历史使用。
+            self._partial_answer = "".join(content_buf)
 
     async def _emit_discrete(self, response, stream_sink) -> str:
         """离散路径（非流式）：把整轮响应作为一次性事件推给 sink。
@@ -632,6 +735,9 @@ class AgentLoop:
                     if subagent_runs:
                         interrupted_record["subagent_runs"] = list(subagent_runs)
                     self._persist(interrupted_record)
+                    # 交给 run() 的取消分支复用（已落盘，直接进 _session_history），
+                    # 避免再补一条通用占位导致同一轮出现两条中断记录。
+                    self._interrupt_record = interrupted_record
                 raise
             self._remember_generated_ids(gen_ids)
             duration_ms = int((time.monotonic() - t_start) * 1000)
