@@ -199,6 +199,14 @@
 (function () {
   var chat = document.getElementById('chat');
   var input = document.getElementById('input');
+  // —— 聊天区 sticky scroll：贴底才自动跟随，用户上滑读历史时不被拉回 ——
+  var nearBottom = true;   // 是否在底部附近（阈值 80px）；贴底才自动滚动到底
+  function scrollChatToBottom() {
+    if (nearBottom) chat.scrollTop = chat.scrollHeight;
+  }
+  chat.addEventListener('scroll', function () {
+    nearBottom = (chat.scrollHeight - chat.scrollTop - chat.clientHeight < 80);
+  });
   var statusEl = document.getElementById('status');
   var cfgBtn = document.getElementById('cfgBtn');
   var cfgPanel = document.getElementById('config');
@@ -477,11 +485,11 @@
       });
       m.appendChild(strip);
     }
-    chat.appendChild(m); chat.scrollTop = chat.scrollHeight;
+    chat.appendChild(m); scrollChatToBottom();
   }
   function addSys(text) {
     var m = document.createElement('div'); m.className = 'msg sys'; m.textContent = text;
-    chat.appendChild(m); chat.scrollTop = chat.scrollHeight;
+    chat.appendChild(m); scrollChatToBottom();
   }
 
   // —— 一个 bot 回合 = 思考面板(默认折叠) + 工具活动(默认折叠) + 正式回答 ——
@@ -511,7 +519,7 @@
     root.appendChild(subagents);
     root.appendChild(botImages);
     root.appendChild(ansWrap);
-    chat.appendChild(root); chat.scrollTop = chat.scrollHeight;
+    chat.appendChild(root); scrollChatToBottom();
     return { root: root, think: think,
              thinkBody: think.querySelector('.think-body'),
              thinkPreview: think.querySelector('.sum-preview'),
@@ -634,7 +642,7 @@
     } else if (type === 'done' || type === 'error') {
       finishSubagentPanel(panel, ev);
     }
-    chat.scrollTop = chat.scrollHeight;
+    scrollChatToBottom();
   }
   function clearSubagentTimers(turn) {
     if (!turn || !turn.subagentRuns) return;
@@ -682,7 +690,7 @@
       // 全文累积到 body（仅展开时可见），单行预览随思考流式刷新
       cur.thinkBody.textContent += (ev.content || '');
       cur.thinkPreview.textContent = cur.thinkBody.textContent;
-      chat.scrollTop = chat.scrollHeight;
+      scrollChatToBottom();
     } else if (t === 'token') {
       if (!cur.answerStarted) {
         cur.answer.classList.remove('empty'); cur.answer.textContent = ''; cur.answerStarted = true;
@@ -690,7 +698,7 @@
       }
       cur.answer.textContent += (ev.content || '');
       collectTtsToken(cur, ev.content || '');
-      chat.scrollTop = chat.scrollHeight;
+      scrollChatToBottom();
     } else if (t === 'tool_call') {
       // 工具卡片默认折叠：标题只显示「名称 + 状态」，点开才看入参/出参
       var card = document.createElement('div'); card.className = 'tool-card';
@@ -706,7 +714,7 @@
       card._timer = setInterval(function () {
         card.querySelector('.tc-dur').textContent = fmtDur(performance.now() - card._start);
       }, 100);
-      chat.scrollTop = chat.scrollHeight;
+      scrollChatToBottom();
     } else if (t === 'tool_result') {
       var card2 = cur.lastTool;
       if (card2) {
@@ -719,7 +727,7 @@
         card2.querySelector('.tc-dur').textContent = (durMs != null) ? fmtDur(durMs) : '';
         card2.querySelector('.tc-status').textContent = '✅ 完成';
       }
-      chat.scrollTop = chat.scrollHeight;
+      scrollChatToBottom();
     } else if (t === 'image') {
       // 生图工具 generate_image 内联图片：把 <img> 塞进当前回合的图片条
       var iu = ev.url || ('/image?key=' + encodeURIComponent(currentKey)
@@ -727,7 +735,7 @@
       var im = document.createElement('img');
       im.src = iu; im.loading = 'lazy';
       cur.botImages.appendChild(im);
-      chat.scrollTop = chat.scrollHeight;
+      scrollChatToBottom();
     } else if (t === 'done') {
       // 兜底：清理任何残留的工具计时器（如某工具异常未回传 tool_result）
       if (cur.activity) cur.activity.querySelectorAll('.tool-card').forEach(function (tc) {
@@ -748,7 +756,7 @@
       flushTtsSegments(cur, true);
       ttsDiscardUntilDone = false;
       cur = null;
-      chat.scrollTop = chat.scrollHeight;
+      scrollChatToBottom();
       loadSessions();   // 刷新侧边栏：新会话出现 / 预览与末次时间更新
     }
   }
@@ -1155,6 +1163,7 @@
     fetch('/api/session?key=' + encodeURIComponent(key)).then(function (r) { return r.json(); }).then(function (d) {
       currentKey = key;
       chat.innerHTML = '';
+      nearBottom = true;   // 历史回放从底部开始跟随
       cur = null;
       renderHistory((d && d.messages) || []);
       loadSessions();
@@ -1169,6 +1178,7 @@
     clearSubagentTimers(cur);
     ws.send(JSON.stringify({ ctl: true, type: 'new' }));
     chat.innerHTML = '';
+    nearBottom = true;   // 新会话从底部开始跟随
     cur = null;
     currentKey = null;
   }
@@ -1286,7 +1296,7 @@
       }
       // system / tool 消息在侧边栏回放中省略（不污染主对话视图）
     });
-    chat.scrollTop = chat.scrollHeight;
+    scrollChatToBottom();
   }
 
   newBtn.onclick = newSession;
