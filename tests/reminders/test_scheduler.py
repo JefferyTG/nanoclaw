@@ -93,6 +93,62 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         await scheduler._drain_due()
         self.assertEqual([item[0] for item in repo.failed], ["a", "b"])
 
+    async def test_non_retryable_provider_rejection_is_retried_instead_of_failed(self):
+        # api_rejected (retryable=False) must never become terminal: the channel
+        # is temporarily unable to accept the send (e.g. a stale WeChat context
+        # token), so the scheduler keeps the execution alive for a later retry.
+        clock = FakeClock(); repo = Repository(clock, [Execution("e1", output_text="saved")])
+        async def agent(_, __): self.fail("agent must not run")
+        async def delivery(_, __): return Result(False, retryable=False, code="api_rejected", error="provider rejected request")
+        scheduler = self.make(repo, clock, agent, delivery)
+        await scheduler._drain_due()
+        self.assertEqual(len(repo.retries), 1)
+        self.assertEqual(repo.retries[0][0], "e1")
+        self.assertEqual(repo.failed, [])
+        self.assertEqual(repo.deferred, [])
+
+    async def test_provider_rejection_recovers_on_a_later_retry_with_persisted_output(self):
+        clock = FakeClock()
+        first = Execution("e1", scheduled_for=clock.now(), output_text="saved")
+        second = Execution("e1", scheduled_for=clock.now(), output_text="saved", delivery_attempts=1)
+        repo = Repository(clock, [first, second]); delivered = []
+        async def agent(_, __): self.fail("agent must not run")
+        async def delivery(_, text):
+            delivered.append(text)
+            if len(delivered) == 1:
+                return Result(False, retryable=False, code="api_rejected", message="provider rejected request")
+            return Result(True, code="ok")
+        scheduler = self.make(repo, clock, agent, delivery)
+        await scheduler._drain_due()
+        self.assertEqual(delivered, ["saved", "saved"])
+        self.assertEqual(len(repo.retries), 1)
+        self.assertEqual(repo.failed, [])
+        self.assertEqual(repo.deferred, [])
+        self.assertEqual(repo.advanced, ["task"])
+
+    async def test_temporary_rejection_cap_eventually_fails(self):
+        clock = FakeClock()
+        repo = Repository(clock, [Execution("e1", output_text="saved", delivery_attempts=2)])
+        async def agent(_, __): self.fail("agent must not run")
+        async def delivery(_, __): return Result(False, retryable=False, code="api_rejected", error="provider rejected request")
+        scheduler = self.make(repo, clock, agent, delivery, max_temporary_retries=2)
+        await scheduler._drain_due()
+        self.assertEqual(repo.retries, [])
+        self.assertEqual([item[0] for item in repo.failed], ["e1"])
+
+    async def test_temporary_rejection_delay_is_capped(self):
+        clock = FakeClock(); repo = Repository(clock, [Execution("e1", output_text="saved")])
+        async def agent(_, __): self.fail("agent must not run")
+        async def delivery(_, __): return Result(False, retryable=False, code="api_rejected", error="provider rejected request")
+        scheduler = ReminderScheduler(
+            repo, agent, delivery, clock=clock,
+            retry_delay=lambda attempt: timedelta(hours=10 ** attempt),
+            temporary_retry_max_delay=timedelta(minutes=30),
+        )
+        await scheduler._drain_due()
+        retry_at = repo.retries[0][1]
+        self.assertEqual(retry_at - clock.now(), timedelta(minutes=30))
+
     async def test_agent_exception_is_recoverable_and_delivery_timeout_retries(self):
         clock = FakeClock(); repo = Repository(clock, [Execution("agent"), Execution("timeout", output_text="saved")])
         async def agent(_, __): raise RuntimeError("model down")

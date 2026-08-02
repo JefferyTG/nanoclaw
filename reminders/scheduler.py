@@ -87,6 +87,12 @@ class ReminderScheduler:
     _DEFERRED_DELIVERY_CODES = frozenset(
         {"target_unbound", "context_missing", "session_expired"}
     )
+    # A provider rejection (e.g. a stale WeChat context token that only
+    # refreshes on the next inbound message) usually clears on its own within
+    # minutes to hours.  Such a rejection must never silently drop a scheduled
+    # reminder, so it is retried with a growing backoff instead of being
+    # treated as a terminal delivery failure.
+    _TEMPORARY_REJECTION_CODES = frozenset({"api_rejected"})
 
     def __init__(
         self,
@@ -101,6 +107,8 @@ class ReminderScheduler:
         max_delivery_attempts: int = 3,
         max_agent_attempts: int = 3,
         retry_delay: Callable[[int], timedelta] | None = None,
+        temporary_retry_max_delay: timedelta = timedelta(minutes=30),
+        max_temporary_retries: int = 96,
         wait: Callable[[asyncio.Event, float], Awaitable[None]] = _default_wait,
     ) -> None:
         if lease_duration <= timedelta():
@@ -109,8 +117,12 @@ class ReminderScheduler:
             raise ValueError("max_sleep must be at least one minute; do not poll by seconds")
         if max_delivery_attempts < 1 or max_agent_attempts < 1:
             raise ValueError("attempt limits must be positive")
+        if max_temporary_retries < 1:
+            raise ValueError("max_temporary_retries must be positive")
         if delivery_timeout <= 0:
             raise ValueError("delivery_timeout must be positive")
+        if temporary_retry_max_delay <= timedelta():
+            raise ValueError("temporary_retry_max_delay must be positive")
         self.repository = repository
         self.agent_runner = agent_runner
         self.deliver = deliver
@@ -121,6 +133,8 @@ class ReminderScheduler:
         self.max_delivery_attempts = max_delivery_attempts
         self.max_agent_attempts = max_agent_attempts
         self.retry_delay = retry_delay or (lambda attempt: timedelta(minutes=2 ** (attempt - 1)))
+        self.temporary_retry_max_delay = temporary_retry_max_delay
+        self.max_temporary_retries = max_temporary_retries
         self._wait = wait
         self._wake_event = asyncio.Event()
         self._stopped = False
@@ -279,6 +293,18 @@ class ReminderScheduler:
             # do not consume a Scheduler delivery attempt or become terminal.
             await self.repository.defer_delivery(execution_id, code)
             return
+        if (
+            code in self._TEMPORARY_REJECTION_CODES
+            and not bool(getattr(result, "retryable", False))
+        ):
+            # The provider rejected the send but the target is still valid
+            # (e.g. an expired WeChat context token that only refreshes when
+            # the recipient next messages).  Keep the already-persisted output
+            # and re-attempt with a growing backoff instead of permanently
+            # dropping the reminder.  Retryable rejections (-1/429/5xx) keep
+            # using the bounded path below.
+            await self._handle_temporary_rejection(execution, result)
+            return
         await self._handle_delivery_failure(
             execution,
             str(getattr(result, "error", None) or getattr(result, "message", "delivery failed")),
@@ -296,3 +322,31 @@ class ReminderScheduler:
             )
         else:
             await self.repository.mark_failed(execution_id, error)
+
+    async def _handle_temporary_rejection(self, execution: Any, result: Any) -> None:
+        """Retry a provider-rejected delivery with a growing, capped backoff.
+
+        The execution's output was persisted before delivery, so each retry
+        reuses it and never re-runs the Agent.  Unlike ``_handle_delivery_failure``
+        the bounded ``max_delivery_attempts`` budget does not apply here: the
+        rejection is expected to clear on its own (a fresh context token arrives
+        with the recipient's next message), so the reminder is kept alive until
+        it either succeeds or the generous ``max_temporary_retries`` cap is hit.
+        """
+        attempts = int(getattr(execution, "delivery_attempts", 0)) + 1
+        execution_id = str(getattr(execution, "id"))
+        error = str(
+            getattr(result, "error", None)
+            or getattr(result, "message", "provider rejected delivery")
+        )
+        if attempts >= self.max_temporary_retries:
+            await self.repository.mark_failed(execution_id, error)
+            return
+        await self.repository.schedule_retry(
+            execution_id,
+            self.clock.now() + self._temporary_retry_delay(attempts),
+            error,
+        )
+
+    def _temporary_retry_delay(self, attempt: int) -> timedelta:
+        return min(self.retry_delay(attempt), self.temporary_retry_max_delay)
