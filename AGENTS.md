@@ -15,6 +15,7 @@ git log -1 --oneline
 
 项目入口和长期文档：
 
+- `PROJECT.md`：项目总览入口（定位、能力、模块、命令速查）。
 - `README.md`：安装、配置和使用方法。
 - `docs/ARCHITECTURE.md`：当前架构、模块边界和数据流。
 - `docs/DECISIONS.md`：历史决策、已知限制和遗留问题。
