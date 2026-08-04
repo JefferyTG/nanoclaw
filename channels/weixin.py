@@ -99,6 +99,31 @@ class _ReminderCommandError(RuntimeError):
     """A binding callback failed without exposing its error to the bridge."""
 
 
+class _TypingActivity:
+    """Opaque local handoff for one Agent turn's Weixin typing activity.
+
+    The object intentionally contains only a stable target and a random
+    activity identifier.  The Bridge, not Python, owns the typing ticket and
+    context token.  ``close`` is synchronous so cleanup can be called from
+    cancellation/finally paths without adding another await point.
+    """
+
+    __slots__ = ("channel", "target", "activity_id", "closed", "started")
+
+    def __init__(self, channel: "WeixinChannel", target: str) -> None:
+        self.channel = channel
+        self.target = target
+        self.activity_id = uuid.uuid4().hex
+        self.closed = False
+        self.started = False
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self.channel._release_typing_activity(self)
+
+
 def encode_weixin_target(account_id: str, user_id: str) -> str:
     """Return a stable reversible target without delimiter-collision hazards."""
     if not isinstance(account_id, str) or not isinstance(user_id, str) or not account_id or not user_id:
@@ -200,6 +225,12 @@ class WeixinChannel(Channel):
         self._pending_message_batches: dict[tuple[str, str], _PendingMessageBatch] = {}
         self._inbound_lock = asyncio.Lock()
         self._pending_batches_restored = False
+        # Weixin-native typing is an optional, in-process lifecycle.  These
+        # handles never contain provider secrets; the Bridge owns all ticket
+        # and context state and performs the actual getconfig/sendtyping calls.
+        self.typing_start_delay_sec = 0.25
+        self._typing_activities: dict[str, dict[str, _TypingActivity]] = {}
+        self._typing_tasks: set[asyncio.Task] = set()
         # 多会话状态：target -> {"seq": 已建会话数, "current": 当前活动序号}。
         # key 用 target（含 account_id），多账号天然隔离；与飞书 /new 机制对称。
         self._sessions: dict[str, dict] = {}
@@ -229,6 +260,112 @@ class WeixinChannel(Channel):
     @staticmethod
     def parse_target(target: str) -> tuple[str, str]:
         return decode_weixin_target(target)
+
+    def begin_activity(self, chat_id: str):
+        """Begin a best-effort native typing activity for one Agent turn.
+
+        This method is deliberately synchronous and cheap: the actual IPC is
+        scheduled in the background so a broken Bridge can never delay model
+        execution.  The short delay avoids a visible typing flash for quick
+        replies.
+        """
+        if self._stopping:
+            return None
+        try:
+            _account_id, user_id = decode_weixin_target(chat_id)
+        except ValueError:
+            return None
+        if not self._allowed(user_id):
+            return None
+        activity = _TypingActivity(self, chat_id)
+        self._typing_activities.setdefault(chat_id, {})[activity.activity_id] = activity
+        self._track_typing_task(
+            asyncio.create_task(
+                self._start_typing_after_delay(activity),
+                name="weixin-typing-start",
+            )
+        )
+        return activity
+
+    async def _start_typing_after_delay(self, activity: _TypingActivity) -> None:
+        try:
+            if self.typing_start_delay_sec:
+                await asyncio.sleep(self.typing_start_delay_sec)
+            if self._stopping or activity.closed:
+                return
+            activity.started = True
+            await self._request_typing("typing_start", activity)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - typing is never answer-critical
+            if not self._stopping:
+                logger.warning(
+                    "Weixin typing start failed: %s",
+                    getattr(exc, "code", "unavailable"),
+                )
+
+    def _release_typing_activity(self, activity: _TypingActivity) -> None:
+        activities = self._typing_activities.get(activity.target)
+        if activities is None or activities.pop(activity.activity_id, None) is None:
+            return
+        if not activities:
+            self._typing_activities.pop(activity.target, None)
+        # If the short delay has not elapsed, no native state was started and
+        # there is nothing to cancel.  This is the no-flicker fast-reply path.
+        # Otherwise every activity gets its own stop.  The Bridge tracks all
+        # activity ids and only cancels native typing after the last one ends.
+        if not activity.started:
+            return
+        self._schedule_typing_request("typing_stop", activity)
+
+    def _track_typing_task(self, task: asyncio.Task) -> None:
+        self._typing_tasks.add(task)
+        task.add_done_callback(self._typing_tasks.discard)
+
+    def _schedule_typing_request(self, method: str, activity: _TypingActivity) -> None:
+        if self._stopping:
+            return
+        self._track_typing_task(
+            asyncio.create_task(
+                self._request_typing(method, activity),
+                name=f"weixin-{method}",
+            )
+        )
+
+    async def _request_typing(self, method: str, activity: _TypingActivity) -> None:
+        try:
+            account_id, user_id = decode_weixin_target(activity.target)
+            await self._request(
+                method,
+                {
+                    "account_id": account_id,
+                    "user_id": user_id,
+                    "activity_id": activity.activity_id,
+                },
+                timeout=self.command_timeout_sec,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - cleanup/status is best-effort
+            if method == "typing_start" and not self._stopping:
+                logger.warning(
+                    "Weixin typing request failed: %s",
+                    getattr(exc, "code", "unavailable"),
+                )
+
+    async def _drain_typing_tasks(self) -> None:
+        tasks = list(self._typing_tasks)
+        if not tasks:
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=self.stop_timeout_sec,
+            )
+        except asyncio.TimeoutError:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def _allowed(self, user_id: str) -> bool:
         return "*" in self.allowed_user_ids or user_id in self.allowed_user_ids
@@ -400,6 +537,15 @@ class WeixinChannel(Channel):
         )
 
     async def stop(self) -> None:
+        # Release active handles before marking the channel stopped so their
+        # best-effort typing_stop IPC can be queued.  The Bridge also performs
+        # a final idempotent cleanup during its own stop command.
+        for activity in [
+            activity
+            for activities in self._typing_activities.values()
+            for activity in activities.values()
+        ]:
+            activity.close()
         self._stopping = True
         inbound_tasks = list(self._background)
         for task in inbound_tasks:
@@ -407,6 +553,7 @@ class WeixinChannel(Channel):
         if inbound_tasks:
             await asyncio.gather(*inbound_tasks, return_exceptions=True)
         await self._cancel_pending_message_timers()
+        await self._drain_typing_tasks()
         if self._supervisor_task is not None:
             self._supervisor_task.cancel()
             await asyncio.gather(self._supervisor_task, return_exceptions=True)

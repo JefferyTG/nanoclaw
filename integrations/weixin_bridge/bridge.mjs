@@ -12,6 +12,7 @@ import {
   MessageItemType,
   MessageState,
   MessageType,
+  TypingStatus,
   UploadMediaType,
 } from 'wechat-ilink-client';
 
@@ -53,6 +54,20 @@ const MAX_OUTBOUND_IMAGE_BYTES = positiveInt(
   20 * 1024 * 1024,
 );
 const MAX_QR_REFRESHES = 3;
+// Typing tickets are short-lived provider state. Keep them in memory only;
+// activity IDs are the sole typing-related values crossing JSONL IPC.
+const TYPING_RENEW_MS = positiveInt(
+  process.env.NANOCLAW_WEIXIN_TYPING_RENEW_MS,
+  10_000,
+);
+const TYPING_RETRY_MS = positiveInt(
+  process.env.NANOCLAW_WEIXIN_TYPING_RETRY_MS,
+  1_000,
+);
+const TYPING_CLEANUP_TIMEOUT_MS = positiveInt(
+  process.env.NANOCLAW_WEIXIN_TYPING_CLEANUP_TIMEOUT_MS,
+  500,
+);
 const PROTOCOL_DIAGNOSTICS = new Set([
   'invalid_json_response',
   'response_too_large',
@@ -70,8 +85,10 @@ const store = new StateStore(stateDir);
 let state = store.load();
 let stopped = false;
 let pollAbort;
+let sessionExpiryInProgress = false;
 const pending = new Map();
 const pendingInbound = new Map();
+const typingActivities = new Map();
 
 function positiveInt(raw, fallback) {
   const value = Number(raw);
@@ -185,6 +202,230 @@ async function transport(endpoint, body, signal, timeoutMs = API_TIMEOUT_MS) {
     });
     return assertAccepted(await readJsonResponse(response));
   }, timeoutMs, signal);
+}
+
+function typingKey(accountId, userId) {
+  return JSON.stringify([accountId, userId]);
+}
+
+function requireTypingParams(params) {
+  requireParams(params, ['account_id', 'user_id', 'activity_id']);
+  if (
+    typeof params.activity_id !== 'string'
+    || params.activity_id.length > 128
+    || !/^[A-Za-z0-9_-]+$/.test(params.activity_id)
+  ) {
+    throw bridgeError('invalid_request', 'invalid typing activity');
+  }
+}
+
+function getTypingRecord(accountId, userId) {
+  const key = typingKey(accountId, userId);
+  let record = typingActivities.get(key);
+  if (!record) {
+    record = {
+      accountId,
+      userId,
+      activities: new Set(),
+      operation: Promise.resolve(),
+      timer: undefined,
+      ticket: undefined,
+      active: false,
+    };
+    typingActivities.set(key, record);
+  }
+  return record;
+}
+
+function hasTypingActivities(record) {
+  return record.activities.size > 0;
+}
+
+function clearTypingTimer(record) {
+  if (record.timer !== undefined) {
+    clearTimeout(record.timer);
+    record.timer = undefined;
+  }
+}
+
+function enqueueTyping(record, operation) {
+  const next = record.operation.catch(() => {}).then(operation);
+  record.operation = next;
+  return next;
+}
+
+async function typingEndpoint(record, status, signal) {
+  if (!state.account || record.accountId !== state.account.account_id) {
+    throw Object.assign(new Error('account unavailable'), {providerCode: -14});
+  }
+
+  const context = state.context_tokens[record.accountId]?.[record.userId]?.token;
+  if (!context && (status === TypingStatus.TYPING || !record.ticket)) {
+    throw bridgeError('context_missing', 'no context for typing');
+  }
+  const timeoutMs = status === TypingStatus.CANCEL
+    ? Math.min(API_TIMEOUT_MS, TYPING_CLEANUP_TIMEOUT_MS)
+    : API_TIMEOUT_MS;
+
+  // The request shapes and status values are the vendor client's
+  // getConfig/getTypingTicket + sendTyping contract.  The Bridge keeps the
+  // same protocol on its cancellable transport so HTTP and JSON acceptance,
+  // route headers, and request aborts remain consistent with sendmessage.
+  if (status === TypingStatus.TYPING || !record.ticket) {
+    const config = await transport(
+      '/ilink/bot/getconfig',
+      {
+        ilink_user_id: record.userId,
+        context_token: context,
+      },
+      signal,
+      timeoutMs,
+    );
+    requireFields(config, ['typing_ticket']);
+    record.ticket = String(config.typing_ticket);
+  }
+  if (!record.ticket) throw bridgeError('typing_unavailable', 'typing is unavailable');
+
+  // Cancellation is auxiliary work.  Keep its individual wait short so a
+  // dead provider cannot hold the Agent or outbound dispatcher open.
+  await transport(
+    '/ilink/bot/sendtyping',
+    {
+      ilink_user_id: record.userId,
+      typing_ticket: record.ticket,
+      status,
+    },
+    signal,
+    timeoutMs,
+  );
+  return record.ticket;
+}
+
+function scheduleTypingRetry(record) {
+  clearTypingTimer(record);
+  if (stopped || !hasTypingActivities(record)) return;
+  record.timer = setTimeout(() => {
+    record.timer = undefined;
+    if (!hasTypingActivities(record) || stopped) return;
+    const operation = enqueueTyping(record, async () => {
+      try {
+        await typingEndpoint(record, TypingStatus.TYPING);
+        record.active = true;
+        scheduleTypingRenew(record);
+      } catch (err) {
+        record.active = false;
+        scheduleTypingRetry(record);
+        throw err;
+      }
+    });
+    void operation.catch(handleTypingBackgroundError);
+  }, TYPING_RETRY_MS);
+}
+
+function scheduleTypingRenew(record) {
+  clearTypingTimer(record);
+  if (stopped || !hasTypingActivities(record)) return;
+  record.timer = setTimeout(() => {
+    record.timer = undefined;
+    if (!hasTypingActivities(record) || stopped) return;
+    const operation = enqueueTyping(record, async () => {
+      try {
+        await typingEndpoint(record, TypingStatus.TYPING);
+        record.active = true;
+        scheduleTypingRenew(record);
+      } catch (err) {
+        record.active = false;
+        scheduleTypingRetry(record);
+        throw err;
+      }
+    });
+    void operation.catch(handleTypingBackgroundError);
+  }, TYPING_RENEW_MS);
+}
+
+async function startTyping(params, signal) {
+  requireTypingParams(params);
+  const record = getTypingRecord(params.account_id, params.user_id);
+  if (record.activities.has(params.activity_id)) return {active: true};
+  record.activities.add(params.activity_id);
+  if (record.activities.size > 1) return {active: true};
+
+  return enqueueTyping(record, async () => {
+    try {
+      await typingEndpoint(record, TypingStatus.TYPING, signal);
+      record.active = true;
+      scheduleTypingRenew(record);
+      return {active: true};
+    } catch (err) {
+      record.active = false;
+      scheduleTypingRetry(record);
+      throw err;
+    }
+  });
+}
+
+async function cancelTypingRecord(record) {
+  clearTypingTimer(record);
+  try {
+    if (record.active || record.ticket) {
+      await typingEndpoint(record, TypingStatus.CANCEL);
+    }
+  } finally {
+    record.active = false;
+    record.ticket = undefined;
+  }
+}
+
+async function stopTyping(params) {
+  requireTypingParams(params);
+  const key = typingKey(params.account_id, params.user_id);
+  const record = typingActivities.get(key);
+  if (!record || !record.activities.delete(params.activity_id)) {
+    return {active: false};
+  }
+  if (hasTypingActivities(record)) return {active: true};
+
+  const operation = enqueueTyping(record, () => cancelTypingRecord(record));
+  try {
+    await operation;
+    return {active: false};
+  } finally {
+    if (!hasTypingActivities(record) && typingActivities.get(key) === record) {
+      typingActivities.delete(key);
+    }
+  }
+}
+
+async function stopAllTyping() {
+  const records = [...typingActivities.values()];
+  for (const record of records) {
+    clearTypingTimer(record);
+    record.activities.clear();
+  }
+  const operations = records.map(record => (
+    enqueueTyping(record, () => cancelTypingRecord(record))
+  ));
+  if (operations.length > 0) {
+    let cleanupTimer;
+    try {
+      await Promise.race([
+        Promise.allSettled(operations),
+        new Promise(resolve => {
+          cleanupTimer = setTimeout(resolve, TYPING_CLEANUP_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      clearTimeout(cleanupTimer);
+    }
+  }
+  typingActivities.clear();
+}
+
+function handleTypingBackgroundError(err) {
+  const failure = normalizedError(err);
+  if (failure.code === 'session_expired') {
+    void expireSession(failure.provider_code);
+  }
 }
 
 async function qrFetch(url, options, signal, timeoutMs = API_TIMEOUT_MS) {
@@ -491,6 +732,29 @@ function cancellableDelay(milliseconds, signal) {
   });
 }
 
+async function expireSession(providerCode) {
+  if (sessionExpiryInProgress) return;
+  if (!state.account) {
+    typingActivities.clear();
+    return;
+  }
+  sessionExpiryInProgress = true;
+  pollAbort?.abort();
+  try {
+    // Try to cancel native typing while the old account/context still exists;
+    // failures are intentionally ignored before the durable generation reset.
+    await stopAllTyping();
+    store.invalidate(state);
+    emit({
+      type: 'event',
+      event: 'session_expired',
+      data: {code: providerCode},
+    });
+  } finally {
+    sessionExpiryInProgress = false;
+  }
+}
+
 async function pollLoop(signal) {
   let retryDelay = 300;
   while (!stopped && state.account && !signal.aborted) {
@@ -582,12 +846,7 @@ async function pollLoop(signal) {
     } catch (err) {
       const failure = normalizedError(err);
       if (failure.code === 'session_expired') {
-        store.invalidate(state);
-        emit({
-          type: 'event',
-          event: 'session_expired',
-          data: {code: failure.provider_code},
-        });
+        await expireSession(failure.provider_code);
         return;
       }
       if (!stopped && !signal.aborted) {
@@ -765,6 +1024,7 @@ async function login(params, signal) {
         login_user_id: status.ilink_user_id ? String(status.ilink_user_id) : undefined,
         cdn_base_url: status.cdn_base_url ? String(status.cdn_base_url) : undefined,
       };
+      sessionExpiryInProgress = false;
       store.save(state);
       emit({
         type: 'event',
@@ -796,7 +1056,16 @@ async function request(message) {
       return {
         bridge_version: BRIDGE_VERSION,
         protocol_version: PROTOCOL_VERSION,
-        capabilities: ['login', 'start', 'send_text', 'send_image', 'ack_inbound', 'stop'],
+        capabilities: [
+          'login',
+          'start',
+          'send_text',
+          'send_image',
+          'typing_start',
+          'typing_stop',
+          'ack_inbound',
+          'stop',
+        ],
       };
     case 'login':
       return login(params, signal);
@@ -818,6 +1087,10 @@ async function request(message) {
       return send('text', params, signal);
     case 'send_image':
       return send('image', params, signal);
+    case 'typing_start':
+      return startTyping(params, signal);
+    case 'typing_stop':
+      return stopTyping(params);
     case 'ack_inbound': { // Ack is valid only while that delivery is pending.
       requireParams(params, ['delivery_id']);
       const accepted = pendingInbound.get(params.delivery_id);
@@ -834,6 +1107,7 @@ async function request(message) {
       for (const [id, controller] of pending) {
         if (id !== message.id) controller.abort();
       }
+      await stopAllTyping();
       emit({type: 'event', event: 'stopped', data: {}});
       return {stopped: true};
     default:
@@ -864,12 +1138,7 @@ async function handleLine(line) {
   } catch (err) {
     const failure = normalizedError(err);
     if (failure.code === 'session_expired') {
-      store.invalidate(state);
-      emit({
-        type: 'event',
-        event: 'session_expired',
-        data: {code: failure.provider_code},
-      });
+      await expireSession(failure.provider_code);
     }
     emit({
       type: 'response',

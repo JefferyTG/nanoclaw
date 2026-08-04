@@ -131,6 +131,8 @@ nanoclaw/
 
 若配置的人设文件不存在或为空，Gateway 会在创建会话 Agent 前调用实例级 `IdentityBootstrapper`。首条消息只触发询问，同一会话下一条文本生成工作区内的人设文件；引导消息不调用模型、不进入会话历史。ContextBuilder 在会话创建时读取 identity、USER、MEMORY 与场景 Agent 摘要并形成稳定快照；新会话或 `/clear` 才显式刷新。Skill 摘要继续是进程启动快照，修改后需重启。多渠道并发由 Bootstrapper 的实例级锁协调，任一渠道完成后其它渠道直接进入正常流程。
 
+微信正常回合在进入 `AgentLoop.run()` 前建立一个不含秘密的本地 activity handle，覆盖模型推理、工具循环和子 Agent；人设引导不启动它。handle 随最终 `OutboundMessage` 交给出站分发，只有微信 `send` 收到 iLink 接受结果后才释放，因此不会先取消 typing 再发送回复。Bridge 按稳定 target 在内存中维护重叠 activity 计数，独占 context token/typing ticket，调用 vendor 对应的 `getconfig` 与 `sendtyping` 并按短周期续期；最后一个 activity 结束、错误、取消、session expired 或 shutdown 都走幂等 best-effort 清理。typing 失败不改变 Agent 或出站回答，微信也不使用 Web stream event。
+
 内置工具注册完成、MCP 连接尽力而为结束后，ToolRegistry 按工具名生成确定性定义并冻结。成功连接的 MCP 集合是启动期 cache boundary；冻结后禁止继续热注册。每个用户回合再取得一次深拷贝快照，确保同一轮多次工具迭代使用完全相同的 Schema。
 
 Linux 后台控制脚本通过 `setsid` 建立独立进程组，并用 PID 文件校验 `/proc` 中的工作目录和命令行，避免陈旧 PID 误杀其它进程。`SIGTERM` 在 `main.py` 中转换为 asyncio 停止事件；Gateway 先取消并等待已登记的在途消息任务，再停止渠道并关闭 MCP 连接。
@@ -171,7 +173,9 @@ Gateway 每条入站消息创建任务；同一会话竞争同一把锁而串行
 配置窗口等待同一用户的后续文字或图片，合并后再作为一个 `InboundMessage` 投递；
 持久批次只在 MessageBus 消费者确认取走该消息后删除，避免内存队列交接窗口静默丢图。
 出站继续消费 Gateway 的 `OutboundMessage.content/images` 和可选 `delivery_future`。allowlist
-为空时 deny-all，只有精确 user ID 或显式 `*` 才放行。
+为空时 deny-all，只有精确 user ID 或显式 `*` 才放行。`OutboundMessage` 的可选
+`outbound_lifecycle` 只在进程内完成最终出站后的清理，不进入 Bus 的持久化、日志或
+provider 请求；它不携带微信 context token 或 typing ticket。
 
 Web 是唯一启用细粒度流事件的渠道：`thinking`、`token`、`tool_call`、`tool_result`、`image`、`subagent_event`、`done` 经 stream queue 回到 WebSocket。子 Agent 的内部事件统一包装在 `subagent_event` 中，避免其 `token/done` 混入父回复或触发 TTS。最终 OutboundMessage 标记 `streamed=True`，防止前端重复显示。
 

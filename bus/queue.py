@@ -10,7 +10,7 @@ CLI 等）把收到的用户消息封装成 :class:`InboundMessage` 投递进
 """
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional
+from typing import Any, TYPE_CHECKING, List, Optional
 
 import asyncio
 
@@ -69,6 +69,11 @@ class OutboundMessage:
     # retries.  Channels may derive deterministic per-chunk IDs from this value;
     # when absent they may generate a fresh identifier for this one send.
     correlation_id: Optional[str] = None
+    # Optional in-process lifecycle handoff.  This is deliberately opaque to
+    # the bus: it is never serialized, logged, or sent to a provider.  A
+    # channel may use it for best-effort state that must remain active until
+    # the final outbound request is accepted (for example Weixin typing).
+    outbound_lifecycle: Any = field(default=None, repr=False, compare=False)
 
 
 @dataclass

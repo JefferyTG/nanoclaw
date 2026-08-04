@@ -139,74 +139,90 @@ class Gateway:
         不同会话的锁互不影响，可并发执行。锁用 ``async with`` 保证异常时释放。
         """
         stream_sink = None
-        # 同一会话串行跑（持锁）；首次人设引导也在锁内完成，避免连续两条消息
-        # 竞态地都被当成“第一条”。不同会话还会由 Bootstrapper 的实例级锁协调。
-        async with lock:
-            # 登记为当前会话的在途回合（网页「停止」取消用）。只有持锁运行的
-            # 这条消息才算「当前回合」；同一会话排队等锁的消息不会被误取消。
-            active_task = asyncio.current_task()
-            self._active_tasks[session_key] = active_task
-            try:
-                if self.identity_bootstrapper is not None:
-                    bootstrap_reply = await self.identity_bootstrapper.handle(
-                        session_key, msg.content
-                    )
-                    if bootstrap_reply is not None:
-                        await self.outbound_safe(bootstrap_reply, msg, None)
-                        return
-
-                # 人设就绪后才惰性创建 Agent，避免把首次引导文本写入会话历史或
-                # 在缺少人设时发起模型请求。
-                async with self._reg_lock:
-                    agent = self._agents.get(session_key)
-                    if agent is None:
-                        agent = self.agent_factory(session_key)
-                        self._agents[session_key] = agent
-
-                # 每轮用户消息在进入 AgentLoop 之前，注入当前时间戳前缀（实例默认时区）。
-                # 时间戳在消息进入时生成一次，整体作为本轮模型输入并原样持久化进会话
-                # 历史（追加式、固定不变）；System Prompt 保持会话级稳定快照，不影响
-                # Prompt Cache 前缀命中。图片消息的默认文本（如「请分析这张图片。」）
-                # 已由渠道写入 msg.content，同样会被前缀。
-                content = f"{_timestamp_prefix(self.timezone)} {msg.content}"
-
-                # 仅网页渠道挂载流式事件接收方：把 Agent 的逐步事件实时推给网页端。
-                stream_sink = self._make_stream_sink(msg) if msg.channel == "web" else None
+        outbound_lifecycle = None
+        try:
+            # 同一会话串行跑（持锁）；首次人设引导也在锁内完成，避免连续两条消息
+            # 竞态地都被当成“第一条”。不同会话还会由 Bootstrapper 的实例级锁协调。
+            async with lock:
+                # 登记为当前会话的在途回合（网页「停止」取消用）。只有持锁运行的
+                # 这条消息才算「当前回合」；同一会话排队等锁的消息不会被误取消。
+                active_task = asyncio.current_task()
+                self._active_tasks[session_key] = active_task
                 try:
-                    # 把随消息附带的图片引用一并交给 Agent；纯文本消息 images 为 None
-                    reply = await agent.run(
-                        content, images=msg.images, stream_sink=stream_sink
-                    )
-                except asyncio.CancelledError:
-                    # 用户「停止」：agent.run 已向 stream_sink 补发 done；这里让
-                    # CancelledError 继续向上传播，保证任务真正取消、锁被释放。
-                    raise
-                except Exception as exc:
-                    reply = f"⚠️ 处理消息时出错：{exc}"
-                    if stream_sink is not None:
-                        try:
-                            await stream_sink({"type": "done", "content": reply})
-                        except Exception:
-                            pass
-            finally:
-                # 回合结束（正常/错误/被取消）都解除在途登记
-                if self._active_tasks.get(session_key) is active_task:
-                    self._active_tasks.pop(session_key, None)
+                    if self.identity_bootstrapper is not None:
+                        bootstrap_reply = await self.identity_bootstrapper.handle(
+                            session_key, msg.content
+                        )
+                        if bootstrap_reply is not None:
+                            await self.outbound_safe(bootstrap_reply, msg, None)
+                            return
 
-        reply_images = []
-        image_store = getattr(agent, "image_store", None)
-        if image_store is not None:
-            for image_id in getattr(agent, "last_generated_image_ids", []):
-                try:
-                    ref = image_store.resolve(session_key, image_id)
-                except Exception:  # noqa: BLE001 - 图片回包失败不能影响文字回复
-                    ref = None
-                if ref is not None:
-                    reply_images.append(ref)
+                    # 人设就绪后才惰性创建 Agent，避免把首次引导文本写入会话历史或
+                    # 在缺少人设时发起模型请求。
+                    async with self._reg_lock:
+                        agent = self._agents.get(session_key)
+                        if agent is None:
+                            agent = self.agent_factory(session_key)
+                            self._agents[session_key] = agent
 
-        await self.outbound_safe(
-            reply, msg, stream_sink, images=reply_images or None
-        )
+                    # 每轮用户消息在进入 AgentLoop 之前，注入当前时间戳前缀（实例默认时区）。
+                    # 时间戳在消息进入时生成一次，整体作为本轮模型输入并原样持久化进会话
+                    # 历史（追加式、固定不变）；System Prompt 保持会话级稳定快照，不影响
+                    # Prompt Cache 前缀命中。图片消息的默认文本（如「请分析这张图片。」）
+                    # 已由渠道写入 msg.content，同样会被前缀。
+                    content = f"{_timestamp_prefix(self.timezone)} {msg.content}"
+
+                    # 只有实际进入 AgentLoop 的回合才开启可选渠道生命周期；人设引导
+                    # 和其它渠道保持原有行为。句柄只包含本地 activity 标识，不含凭据。
+                    outbound_lifecycle = self._begin_outbound_lifecycle(msg)
+
+                    # 仅网页渠道挂载流式事件接收方：把 Agent 的逐步事件实时推给网页端。
+                    stream_sink = self._make_stream_sink(msg) if msg.channel == "web" else None
+                    try:
+                        # 把随消息附带的图片引用一并交给 Agent；纯文本消息 images 为 None
+                        reply = await agent.run(
+                            content, images=msg.images, stream_sink=stream_sink
+                        )
+                    except asyncio.CancelledError:
+                        # 用户「停止」：agent.run 已向 stream_sink 补发 done；这里让
+                        # CancelledError 继续向上传播，保证任务真正取消、锁被释放。
+                        raise
+                    except Exception as exc:
+                        reply = f"⚠️ 处理消息时出错：{exc}"
+                        if stream_sink is not None:
+                            try:
+                                await stream_sink({"type": "done", "content": reply})
+                            except Exception:
+                                pass
+                finally:
+                    # 回合结束（正常/错误/被取消）都解除在途登记
+                    if self._active_tasks.get(session_key) is active_task:
+                        self._active_tasks.pop(session_key, None)
+
+            reply_images = []
+            image_store = getattr(agent, "image_store", None)
+            if image_store is not None:
+                for image_id in getattr(agent, "last_generated_image_ids", []):
+                    try:
+                        ref = image_store.resolve(session_key, image_id)
+                    except Exception:  # noqa: BLE001 - 图片回包失败不能影响文字回复
+                        ref = None
+                    if ref is not None:
+                        reply_images.append(ref)
+
+            # The lifecycle is handed off only after the final reply is queued.
+            # If this publish fails, the outer finally releases it immediately.
+            published = await self.outbound_safe(
+                reply,
+                msg,
+                stream_sink,
+                images=reply_images or None,
+                outbound_lifecycle=outbound_lifecycle,
+            )
+            if published:
+                outbound_lifecycle = None
+        finally:
+            self._finish_outbound_lifecycle(outbound_lifecycle)
 
     def _cancel_session(self, session_key: str) -> None:
         """取消指定会话当前正在执行的回合（网页「停止」按钮）。
@@ -219,9 +235,43 @@ class Gateway:
         if task is not None and not task.done():
             task.cancel()
 
+    def _begin_outbound_lifecycle(self, msg: InboundMessage):
+        """Start an optional channel activity without making it mandatory.
+
+        The hook is intentionally duck-typed so the existing CLI, Web and
+        Feishu channels do not acquire any new behavior or dependency.  A
+        lifecycle start is best-effort and must never prevent the Agent turn.
+        """
+        channel = self._channel_map.get(msg.channel)
+        begin = getattr(channel, "begin_activity", None)
+        if not callable(begin):
+            return None
+        try:
+            return begin(msg.chat_id)
+        except Exception:  # noqa: BLE001 - auxiliary channel state is optional
+            return None
+
+    @staticmethod
+    def _finish_outbound_lifecycle(lifecycle) -> None:
+        """Release an optional in-process lifecycle handle at most once."""
+        if lifecycle is None:
+            return
+        close = getattr(lifecycle, "close", None)
+        if not callable(close):
+            return
+        try:
+            close()
+        except Exception:  # noqa: BLE001 - cleanup must not affect delivery
+            pass
+
     async def outbound_safe(
-        self, reply: str, msg: InboundMessage, stream_sink, images=None
-    ) -> None:
+        self,
+        reply: str,
+        msg: InboundMessage,
+        stream_sink,
+        images=None,
+        outbound_lifecycle=None,
+    ) -> bool:
         """把回复安全地回投出站队列（锁外执行，避免持锁期间阻塞分发）。"""
         try:
             await self.bus.publish_outbound(OutboundMessage(
@@ -231,9 +281,12 @@ class Gateway:
                 reply_to=None,
                 streamed=(stream_sink is not None),
                 images=images,
+                outbound_lifecycle=outbound_lifecycle,
             ))
+            return True
         except Exception as exc:  # noqa: BLE001
             print(f"⚠️ 出站投递失败：{exc}")
+            return False
 
     def _make_stream_sink(self, msg: InboundMessage):
         """为一条入站消息构造流式事件 sink（发布到总线流的 stream_queue）。"""
@@ -263,43 +316,46 @@ class Gateway:
         """出站分发循环：取回复 → 按渠道名找到 Channel → 下发。"""
         while True:
             msg = await self.bus.consume_outbound()
-            channel = self._channel_map.get(msg.channel)
-            if channel is None:
-                # 找不到对应渠道就告警并丢弃，不阻塞分发循环
-                print(f"⚠️ 出站消息找不到渠道 '{msg.channel}'，已丢弃")
+            try:
+                channel = self._channel_map.get(msg.channel)
+                if channel is None:
+                    # 找不到对应渠道就告警并丢弃，不阻塞分发循环
+                    print(f"⚠️ 出站消息找不到渠道 '{msg.channel}'，已丢弃")
+                    if msg.delivery_future is not None:
+                        self._complete_delivery(
+                            msg,
+                            _delivery_result(
+                                success=False,
+                                code="channel_not_found",
+                                message=f"channel not found: {msg.channel}",
+                            ),
+                        )
+                    continue
+                try:
+                    result = await channel.send(msg)
+                except asyncio.CancelledError:
+                    if msg.delivery_future is not None:
+                        self._complete_delivery(
+                            msg, _delivery_result(success=False, message="dispatch cancelled")
+                        )
+                    raise
+                except Exception as exc:  # noqa: BLE001 - one failure must not kill routing
+                    print(f"⚠️ 出站消息发送失败（{msg.channel}）：{exc}")
+                    if msg.delivery_future is not None:
+                        self._complete_delivery(
+                            msg, _delivery_result(success=False, message=str(exc))
+                        )
+                    continue
                 if msg.delivery_future is not None:
                     self._complete_delivery(
                         msg,
-                        _delivery_result(
-                            success=False,
-                            code="channel_not_found",
-                            message=f"channel not found: {msg.channel}",
+                        result
+                        or _delivery_result(
+                            success=False, message="channel returned no delivery result"
                         ),
                     )
-                continue
-            try:
-                result = await channel.send(msg)
-            except asyncio.CancelledError:
-                if msg.delivery_future is not None:
-                    self._complete_delivery(
-                        msg, _delivery_result(success=False, message="dispatch cancelled")
-                    )
-                raise
-            except Exception as exc:  # noqa: BLE001 - one failure must not kill routing
-                print(f"⚠️ 出站消息发送失败（{msg.channel}）：{exc}")
-                if msg.delivery_future is not None:
-                    self._complete_delivery(
-                        msg, _delivery_result(success=False, message=str(exc))
-                    )
-                continue
-            if msg.delivery_future is not None:
-                self._complete_delivery(
-                    msg,
-                    result
-                    or _delivery_result(
-                        success=False, message="channel returned no delivery result"
-                    ),
-                )
+            finally:
+                self._finish_outbound_lifecycle(msg.outbound_lifecycle)
 
     @staticmethod
     def _complete_delivery(
