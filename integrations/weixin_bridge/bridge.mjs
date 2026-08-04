@@ -620,10 +620,21 @@ async function send(kind, params, signal) {
 }
 
 function extractText(message) {
-  return (message.item_list || [])
-    .filter(item => item?.type === MessageItemType.TEXT && item.text_item?.text != null)
-    .map(item => String(item.text_item.text))
-    .join('\n');
+  const parts = [];
+  for (const item of message.item_list || []) {
+    if (item?.type !== MessageItemType.TEXT || item.text_item?.text == null) continue;
+    parts.push(String(item.text_item.text));
+  }
+  // VOICE items: Tencent STT transcript arrives in voice_item.text. Append
+  // non-empty transcripts after the TEXT parts in stable item order. No local
+  // ASR / silk decoding; a voice item without a transcript is ignored.
+  for (const item of message.item_list || []) {
+    if (item?.type !== MessageItemType.VOICE) continue;
+    const transcript = item.voice_item?.text;
+    if (typeof transcript !== 'string' || transcript.trim().length === 0) continue;
+    parts.push(transcript.trim());
+  }
+  return parts.join('\n');
 }
 
 async function inboundImages(message, signal) {

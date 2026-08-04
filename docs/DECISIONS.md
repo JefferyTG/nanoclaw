@@ -58,6 +58,7 @@
 | 微信出站图片 AES 密钥采用腾讯线格式 | 有效 | `getuploadurl.aeskey` 使用 32 位十六进制；消息 `media.aes_key` 是该 ASCII 十六进制字符串的 Base64，不是原始 16 字节密钥的 Base64，否则微信端无法解密并显示“图片已过期或已被清理” |
 | 微信发送回执同时检查 HTTP 和 JSON | 有效 | 要求 HTTP 成功和有效 JSON；腾讯成功响应可省略 `ret/errcode`，任一存在且非零或非数值都失败，correlation/client ID 在重试间稳定 |
 | 微信 `-14` 切换凭据代次 | 有效 | 清除 account/cursor/context/去重后重新扫码；旧 context 不跨认证代次复用，避免稳定的主动发送失败 |
+| 微信语音直接用腾讯 STT（`voice_item.text`），不落地本地 ASR | 有效 | 腾讯已提供服务端转写，零成本零延迟；实测语音为 silk 编码，本地 ASR 需额外解码器。TEXT 项在前、VOICE 转写追加在后换行合并；腾讯 text 为空时保持忽略，不做本地 fallback |
 | 渠道感知走会话级快照（System Prompt）而非每轮前缀注入 | 有效 | 渠道在会话内恒定，每轮注入是冗余的；快照零每轮 token、System Prompt 前缀稳定（Prompt Cache 友好）。渠道+用户已天然编码在 session_key（`channel:sender_id`）中，`make_agent_factory` 解析后注入 ContextBuilder，与 identity/USER/MEMORY 同构；时间戳因每轮变化仍走每轮前缀注入 |
 
 这些约定来自 `.workbuddy/memory/MEMORY.md` 和 2026-07-22 至 2026-07-26 的开发日志；原日志被 Git 忽略，因此本表是跨会话的正式摘录。
