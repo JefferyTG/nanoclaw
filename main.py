@@ -538,12 +538,19 @@ def make_agent_factory(shared: dict, registry: dict) -> callable:
     def factory(session_key: str) -> AgentLoop:
         cfg = shared["config"]
         provider = OpenAICompatProvider(cfg.api_key, cfg.base_url, cfg.model)
+        # session_key 由 Gateway 构造为 f"{channel}:{sender_id}"（渠道+用户）。
+        # 只用 split(":", 1) 切第一刀，防止 sender_id 本身含冒号（如微信
+        # target 可逆编码）导致裂解；解析结果注入 ContextBuilder 作为
+        # 会话级「当前渠道」快照（渠道在会话内恒定，System Prompt 稳定）。
+        channel, sender_id = session_key.split(":", 1)
         context = ContextBuilder(
             cfg.workspace,
             cfg.identity_file,
             skills_summary=shared["skills_summary"],
             agents_summary=shared["profile_loader"].build_summary(),
             agents_summary_provider=shared["profile_loader"].build_summary,
+            channel=channel,
+            sender_id=sender_id,
         )
         agent = AgentLoop(
             provider,

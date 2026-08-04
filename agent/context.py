@@ -28,12 +28,18 @@ class ContextBuilder:
         skills_summary: str = "",
         agents_summary: str = "",
         agents_summary_provider: Optional[Callable[[], str]] = None,
+        channel: str = "",
+        sender_id: str = "",
     ) -> None:
         self.workspace = os.path.abspath(workspace)
         self.identity_file = identity_file
         self.skills_summary = skills_summary
         self.agents_summary = agents_summary
         self.agents_summary_provider = agents_summary_provider
+        # 会话级渠道快照：渠道名与用户标识在会话内恒定（来自 session_key 解析），
+        # 与 identity/USER/MEMORY 等同构，刷新快照时一并纳入但内容不变。
+        self.channel = channel
+        self.sender_id = sender_id
         self.memory_path = os.path.join(self.workspace, "workspace", "memory", "MEMORY.md")
         self.user_path = os.path.join(self.workspace, "workspace", "memory", "USER.md")
         self._snapshot: dict[str, str] = {}
@@ -66,6 +72,19 @@ class ContextBuilder:
         except Exception:  # noqa: BLE001 - a bad profile must not block chat
             return self.agents_summary
 
+    def _channel_section(self) -> str:
+        """会话级渠道快照：本会话所在渠道与用户标识（会话内恒定）。
+
+        渠道名取内部名（feishu/weixin/web/cli）；未配置渠道信息（如共享
+        上下文构建器）时返回空串，不注入「当前渠道」section。
+        """
+        if not self.channel and not self.sender_id:
+            return ""
+        return (
+            f"本会话所在渠道：{self.channel}；用户标识：{self.sender_id}。"
+            "渠道名取内部名（feishu/weixin/web/cli），可据此做渠道专属行为。"
+        )
+
     def refresh_snapshot(self) -> None:
         """Reload slow-changing prompt inputs at an explicit session boundary.
 
@@ -80,6 +99,7 @@ class ContextBuilder:
             "memory": self._load_memory(),
             "skills": self.skills_summary,
             "agents": self._load_agents_summary(),
+            "channel": self._channel_section(),
         }
 
     # A descriptive alias for integrations that expose a user-visible action.
@@ -139,6 +159,8 @@ class ContextBuilder:
             "【人设】\n" + snapshot["identity"],
             f"【工作区】\n{self.workspace}",
         ]
+        if snapshot["channel"]:
+            sections.append("## 当前渠道\n" + snapshot["channel"])
         if snapshot["skills"]:
             sections.append("## 可用技能\n" + snapshot["skills"])
         if snapshot["user"]:
