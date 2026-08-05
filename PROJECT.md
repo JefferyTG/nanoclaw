@@ -26,7 +26,7 @@
 | ReAct 工具循环 | ✅ | `max_iterations`、`turn_timeout_sec` 墙钟、重复工具防爆、180s 工具兜底 / Shell 60s |
 | 内置工具 | ✅ | 26 个（含 AskImage 条件注册）+ MCP 扩展（`{server}__{tool}`） |
 | 场景 Agent | ✅ | Profile 驱动：独立 System Prompt、白名单、私有 Skill/受控工具 |
-| 记忆体系 | ✅ | USER/MEMORY/HISTORY/daily、SQLite LIKE 检索、约 192k 超预算压缩 |
+| 记忆体系 | ✅ | USER/MEMORY/HISTORY/daily、SQLite LIKE 检索、约 192k 超预算压缩、跨会话记忆同步（全局/会话 revision + `<memory_patch>` 补丁注入与持久化） |
 | 主动提醒 | ✅ | SQLite + RRULE、显式绑定单目标、静态/动态 agent 任务、lease/回执、重启恢复 |
 | 生图 / 视觉 | ✅ | `generate_image`（文生图/图生图/多源，全配置化）、`ask_image`（双路径） |
 | 视频生成 | ✅ | 异步任务式，多服务商适配 |
@@ -109,8 +109,8 @@ Web 附加：AgentLoop 流事件 → Bus.stream → WebChannel → WebSocket（t
 
 事实冲突时优先级：**当前代码与配置契约 > 当前 Git 状态 > docs/ 已确认文档 > 旧方案草稿**。
 
-## 当前 Git 状态（2026-08-04）
+## 当前 Git 状态（2026-08-05）
 
-- 分支 `main` 与 `origin/main` 一致（HEAD = `0cd50de`，微信原生 typing）。
-- 未提交：11 个已删除文件（过期开发计划/废弃文档）+ `kb-testset/` 测试资产未跟踪。
-- 存在 7 个 codex 外部 worktree → 多会话并行开发时严格遵守 AGENTS.md 文件所有权规则。
+- 分支 `main` 与 `origin/main` 一致（HEAD = `c7fc581`，TASK-004 跨会话记忆同步）。
+- 仅 `kb-testset/` 未跟踪（个人知识库测试资产，归属另行处理，不混入本仓库提交）。
+- 存在 codex 外部 worktree → 多会话并行开发时严格遵守 AGENTS.md 文件所有权规则。
