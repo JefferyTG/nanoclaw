@@ -624,9 +624,13 @@ def format_context_usage(usage: dict) -> str:
             f"（缓存命中 {cache_ratio * 100:.0f}%）"
             if cache_ratio is not None else ""
         )
-        lines.append(f"· 上次请求 input_tokens：{int(input_tokens):,}{hit}")
+        calls = last.get("calls")
+        calls_part = f"，调用 {calls} 次" if isinstance(calls, int) else ""
+        lines.append(
+            f"· 上一回合 input_tokens：{int(input_tokens):,}{hit}{calls_part}"
+        )
     else:
-        lines.append("· 上次请求 input_tokens：暂无真实数据")
+        lines.append("· 上一回合 input_tokens：暂无真实数据")
     sys_part = _fmt_compact(system_tokens) if system_tokens is not None else "未知"
     his_part = _fmt_compact(history_tokens) if history_tokens is not None else "未知"
     lines.append(f"· 估算：System ~{sys_part} + 历史 ~{his_part}")

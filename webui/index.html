@@ -705,6 +705,13 @@
       renderCtxBar();
       return;
     }
+    if (t === 'usage_turn') {
+      // 回合级汇总：整轮调用次数/累计输入/命中率，回合结束时一次性推送。
+      // 与 usage 一样按会话保存并刷新进度条（覆盖单次事件，展示整轮概览）。
+      if (currentKey) usageByKey[currentKey] = ev;
+      renderCtxBar();
+      return;
+    }
     if (t === 'subagent_event') {
       if (!cur) { cur = newTurn(); updateSendBtn(); }
       onSubagentEvent(cur, ev);
@@ -1202,12 +1209,31 @@
   function renderCtxBar() {
     var u = currentKey ? usageByKey[currentKey] : null;
     if (!u) { ctxbar.classList.add('ctx-hidden'); return; }
-    var ratio = (typeof u.ratio === 'number' && isFinite(u.ratio)) ? u.ratio : null;
+    // 占用语义优先「最近一次调用」（last_ratio），其次单次/回合 ratio，无则 0。
+    var ratio = (typeof u.last_ratio === 'number' && isFinite(u.last_ratio)) ? u.last_ratio
+              : (typeof u.ratio === 'number' && isFinite(u.ratio)) ? u.ratio : null;
     var parts = [];
-    if (typeof u.input_tokens === 'number') {
+    if (typeof u.turn === 'number') {
+      // 回合级汇总：更直观的一整轮概览（累计输入 / 加权命中率 / 调用次数）
+      if (typeof u.input_tokens === 'number') {
+        parts.push('回合输入 ' + fmtTokens(u.input_tokens));
+        if (typeof u.cache_ratio === 'number' && isFinite(u.cache_ratio)) {
+          parts.push('缓存命中 ' + (u.cache_ratio * 100).toFixed(1) + '%');
+        }
+        if (typeof u.uncached === 'number') {
+          parts.push('未命中 ' + fmtTokens(u.uncached));
+        }
+      } else if (typeof u.estimate === 'number') {
+        parts.push('估算 ' + fmtTokens(u.estimate));
+      }
+      if (typeof u.calls === 'number') parts.push('调用×' + u.calls);
+    } else if (typeof u.input_tokens === 'number') {
       parts.push('上次 input ' + fmtTokens(u.input_tokens));
       if (typeof u.cache_ratio === 'number' && isFinite(u.cache_ratio)) {
         parts.push('缓存命中 ' + (u.cache_ratio * 100).toFixed(0) + '%');
+        if (typeof u.uncached === 'number') {
+          parts.push('未命中 ' + fmtTokens(u.uncached));
+        }
       }
     } else if (typeof u.estimate === 'number') {
       parts.push('估算 ' + fmtTokens(u.estimate));

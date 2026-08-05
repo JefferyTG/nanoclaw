@@ -37,7 +37,12 @@ from typing import List, Optional
 from providers.base import LLMProvider
 from agent.tools.registry import ToolRegistry
 from agent.context import ContextBuilder
-from agent.cache_observability import PromptCacheObserver, stable_text_hash
+from agent.cache_observability import (
+    CacheCallMetric,
+    CacheTurnMetric,
+    PromptCacheObserver,
+    stable_text_hash,
+)
 from agent.history import canonicalize_history
 from session.manager import SessionManager
 from agent.memory import MemoryConsolidation
@@ -101,6 +106,9 @@ class AgentLoop:
         self.cache_observer = cache_observer or PromptCacheObserver()
         self._active_cache_turn = None
         self.last_cache_metrics = None
+        # 回合内最后一次模型调用（CacheCallMetric），供 usage_turn 事件的
+        # last_usage 使用：进度条「占用」沿用最近一次调用而非回合累计。
+        self._last_call_metric: Optional[CacheCallMetric] = None
         # The return value is deliberately user-facing text, so callers such as
         # SpawnSubagentTool need a separate structured lifecycle outcome rather
         # than guessing timeout/error state from localized message strings.
@@ -308,9 +316,32 @@ class AgentLoop:
                     pass
             raise
         finally:
+            # 回合收尾：无论正常 / 错误 / 取消，都要把缓存观测收敛成回合汇总。
+            # 推送 usage_turn 事件前先把 _active_cache_turn 置空（清理先行），
+            # 之后即使推送抛异常也不影响回合语义；失败只记日志，绝不吞
+            # CancelledError（原取消已由 except 分支 re-raise 继续上抛）。
             if self._active_cache_turn is not None:
-                self.last_cache_metrics = self._active_cache_turn.finish()
+                turn = self._active_cache_turn
                 self._active_cache_turn = None
+                metric = None
+                try:
+                    metric = turn.finish()
+                except Exception:  # noqa: BLE001 - 观测收尾失败不影响回合语义
+                    logger.exception(
+                        "回合缓存指标收尾失败，session_key=%s", self.session_key
+                    )
+                self.last_cache_metrics = metric
+                if stream_sink is not None and metric is not None:
+                    try:
+                        await stream_sink(self._build_turn_event(metric))
+                    except asyncio.CancelledError:
+                        # 取消场景：不吞取消；让原取消/新取消继续向上传播
+                        raise
+                    except Exception:  # noqa: BLE001 - 汇总推送失败不影响回合
+                        logger.exception(
+                            "推送 usage_turn 事件失败，session_key=%s",
+                            self.session_key,
+                        )
 
     def get_context_usage(self) -> dict:
         """当前会话上下文占用概览（估算 + 上次真实 usage）。
@@ -356,6 +387,7 @@ class AgentLoop:
                 "uncached": last.uncached_input_tokens,
                 "cache_ratio": last.cache_ratio,
                 "availability": last.availability,
+                "calls": last.calls,
             }
 
         return {
@@ -411,6 +443,47 @@ class AgentLoop:
             event["estimate"] = estimate
             event["ratio"] = (estimate / budget) if budget else None
         return event
+
+    def _build_turn_event(self, metric: CacheTurnMetric) -> dict:
+        """构造 ``{type: "usage_turn", ...}`` 回合汇总事件（Web 进度条整轮概览）。
+
+        字段：
+        - 整轮汇总：turn / calls / input_tokens / cached / uncached /
+          cache_ratio / availability（供应商缺报时 input_tokens / cached 可能为
+          None，前端据此优雅降级）；
+        - 占用语义：进度条「占用」沿用**最近一次调用**的 input/预算
+          （last_usage / last_ratio），而不是回合累计——多轮调用累计可能超过
+          预算，而进度条要反映的是当前上下文实际占用，而非整轮吞吐。
+        """
+        budget = self.memory.token_budget if self.memory is not None else None
+        last_usage = None
+        last_ratio = None
+        last = self._last_call_metric
+        if last is not None and last.input_tokens is not None:
+            last_usage = {
+                "input_tokens": last.input_tokens,
+                "cached": last.cached_input_tokens,
+                "uncached": last.uncached_input_tokens,
+                "cache_ratio": last.cache_ratio,
+                "availability": last.availability,
+            }
+            if budget:
+                last_ratio = last.input_tokens / budget
+        return {
+            "type": "usage_turn",
+            "turn": metric.turn,
+            "calls": metric.calls,
+            "input_tokens": metric.input_tokens,
+            "cached": metric.cached_input_tokens,
+            "uncached": metric.uncached_input_tokens,
+            "cache_ratio": metric.cache_ratio,
+            "availability": metric.availability,
+            "budget": budget,
+            "last_usage": last_usage,
+            "last_ratio": last_ratio,
+            "ratio": last_ratio,  # 占用沿用最近一次调用，而非回合累计
+            "estimate": None,
+        }
 
     def _record_cancelled_turn(self) -> None:
         """网页「停止」取消回合后，把本轮 user 消息与中断占位 assistant 补进历史。
@@ -618,6 +691,8 @@ class AgentLoop:
         self._partial_answer = None
         self._interrupt_record = None
         self._cancel_history_recorded = False
+        # 回合内最后一次模型调用观测，回合结束由 _build_turn_event 读取
+        self._last_call_metric = None
         base_mm = self.base_model_multimodal
 
         # 1. 构建初始 messages（注入跨轮历史 + 当前输入）
@@ -736,10 +811,13 @@ class AgentLoop:
                 self._partial_answer = getattr(response, "content", None) or ""
                 final_content = await self._emit_discrete(response, stream_sink)
 
-            self._active_cache_turn.record(
+            call_metric = self._active_cache_turn.record(
                 getattr(response, "cache_usage", PromptCacheUsage()),
                 tool_iteration=tool_iteration,
             )
+            # 记录回合内最后一次模型调用（供 usage_turn 事件的 last_usage：
+            # 进度条「占用」沿用最近一次调用而非累计）。
+            self._last_call_metric = call_metric
 
             # 每次模型响应后推送 usage 事件（Web 进度条 / 缓存命中率实时更新）。
             # 真实 usage 缺失时回退到估算；推送失败只记日志，不影响回合。

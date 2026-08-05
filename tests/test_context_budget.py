@@ -15,9 +15,12 @@ import asyncio
 import contextlib
 import io
 import json
+import re
+import subprocess
 import tempfile
 import unittest
 from copy import deepcopy
+from pathlib import Path
 from unittest.mock import patch
 
 from bus.queue import MessageBus, OutboundMessage
@@ -30,8 +33,9 @@ from main import format_context_usage
 from agent.context import ContextBuilder
 from agent.loop import AgentLoop
 from agent.memory import MemoryConsolidation
+from agent.tools.base import Tool
 from agent.tools.registry import ToolRegistry
-from providers.base import LLMProvider, LLMResponse
+from providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from providers.usage import PromptCacheUsage
 from session.manager import SessionManager
 
@@ -59,8 +63,30 @@ class FormatContextUsageTests(unittest.TestCase):
         self.assertIn("512.0k（524,288 tokens）", text)
         self.assertIn("45,230", text)
         self.assertIn("缓存命中 82%", text)
+        self.assertIn("上一回合 input_tokens", text)
         self.assertIn("System ~2.1k + 历史 ~40.0k", text)
         self.assertIn("8.2%", text)
+
+    def test_formats_turn_text_with_calls(self):
+        usage = {
+            "budget": 524_288,
+            "system_tokens": 2_000,
+            "history_tokens": 1_000,
+            "estimate_total": 3_000,
+            "ratio": 3_000 / 524_288,
+            "last_usage": {
+                "input_tokens": 45_230,
+                "cached": 37_000,
+                "uncached": 8_230,
+                "cache_ratio": 37_000 / 45_230,
+                "availability": "available",
+                "calls": 3,
+            },
+        }
+        text = format_context_usage(usage)
+        self.assertIn("上一回合 input_tokens：45,230", text)
+        self.assertIn("调用 3 次", text)
+        self.assertIn("缓存命中 82%", text)
 
     def test_formats_without_real_usage_gracefully(self):
         usage = {
@@ -121,6 +147,15 @@ class ContextBudgetConfigTests(unittest.TestCase):
 
 
 # —— 测试替身 ——
+
+class _EchoTool(Tool):
+    name = "echo"
+    description = "echo"
+    parameters = {"type": "object", "properties": {}, "required": []}
+
+    async def execute(self, **kwargs):
+        return "echoed"
+
 
 class _RecordingProvider(LLMProvider):
     def __init__(self, responses):
@@ -214,6 +249,83 @@ class UsageEventTests(unittest.IsolatedAsyncioTestCase):
             # last_cache_metrics 仍在回合结束后生成（观测链不变）
             self.assertIsNotNone(loop.last_cache_metrics)
             self.assertEqual(loop.last_cache_metrics.input_tokens, 100)
+            # 无 sink：不推送任何回合汇总事件，但回合观测照常收敛
+            self.assertEqual(loop.last_cache_metrics.calls, 1)
+
+    async def test_usage_turn_event_pushed_after_turn_with_multiple_calls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = SessionManager(tmp)
+            tools = ToolRegistry()
+            tools.register(_EchoTool())
+            tools.freeze()
+            provider = _RecordingProvider([
+                LLMResponse(
+                    content=None,
+                    tool_calls=[ToolCallRequest(
+                        "call-1", "echo", {}, reasoning_content="r"
+                    )],
+                    finish_reason="tool_calls",
+                    cache_usage=_usage(45_230, 37_000),
+                ),
+                LLMResponse(content="final", cache_usage=_usage(45_500, 37_300)),
+            ])
+            memory = MemoryConsolidation(provider, tmp, token_budget=524_288)
+            events = []
+
+            async def sink(event):
+                events.append(event)
+
+            loop = AgentLoop(
+                provider, tools, ContextBuilder(tmp), sessions,
+                session_key="cli:ctx", memory=memory,
+            )
+            await loop.run("multi-call", stream_sink=sink)
+
+            turn_events = [e for e in events if e.get("type") == "usage_turn"]
+            self.assertEqual(len(turn_events), 1)
+            turn = turn_events[0]
+            self.assertEqual(turn["turn"], 1)
+            self.assertEqual(turn["calls"], 2)  # 整轮模型调用 2 次
+            # 回合累计（两次调用之和）与单次 usage 事件区分
+            self.assertEqual(turn["input_tokens"], 45_230 + 45_500)
+            self.assertEqual(turn["cached"], 37_000 + 37_300)
+            self.assertEqual(turn["uncached"], (45_230 - 37_000) + (45_500 - 37_300))
+            self.assertAlmostEqual(
+                turn["cache_ratio"], (37_000 + 37_300) / (45_230 + 45_500)
+            )
+            self.assertEqual(turn["availability"], "available")
+            self.assertEqual(turn["budget"], 524_288)
+            # 占用语义沿用最近一次调用（45_500），而非回合累计
+            last = turn["last_usage"]
+            self.assertIsNotNone(last)
+            self.assertEqual(last["input_tokens"], 45_500)
+            self.assertAlmostEqual(last["cache_ratio"], 37_300 / 45_500)
+            self.assertAlmostEqual(turn["last_ratio"], 45_500 / 524_288)
+            self.assertAlmostEqual(turn["ratio"], 45_500 / 524_288)
+            # 逐次 usage 事件仍在推送（实时刷新不被破坏）
+            usage_events = [e for e in events if e.get("type") == "usage"]
+            self.assertEqual(len(usage_events), 2)
+            self.assertNotEqual(turn["input_tokens"], usage_events[-1]["input_tokens"])
+
+    async def test_usage_turn_event_single_call_turn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = _RecordingProvider([
+                LLMResponse(content="ok", cache_usage=_usage(100, 50)),
+            ])
+            events = []
+
+            async def sink(event):
+                events.append(event)
+
+            loop = _make_loop(tmp, provider, sink=sink)
+            await loop.run("first", stream_sink=sink)
+
+            turn_events = [e for e in events if e.get("type") == "usage_turn"]
+            self.assertEqual(len(turn_events), 1)
+            turn = turn_events[0]
+            self.assertEqual(turn["calls"], 1)
+            self.assertEqual(turn["input_tokens"], 100)
+            self.assertEqual(turn["last_usage"]["input_tokens"], 100)
 
 
 # —— get_context_usage ——
@@ -246,6 +358,7 @@ class GetContextUsageTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(last["uncached"], 8_230)
             self.assertAlmostEqual(last["cache_ratio"], 37_000 / 45_230)
             self.assertEqual(last["availability"], "available")
+            self.assertEqual(last["calls"], 1)
             self.assertEqual(usage["budget"], 524_288)
             self.assertIsInstance(usage["ratio"], float)
 
@@ -500,6 +613,42 @@ class WeixinBridgeAlignmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"/bind-reminders"', source)
         # 命令判定仍是「文本精确、不带图片」分支，/context 不例外
         self.assertIn('not data.get("images")', source)
+
+
+
+# —— WebUI 内联脚本静态回归（usage_turn 渲染分支 + node --check）——
+
+class WebUiJsSyntaxTests(unittest.TestCase):
+    """静态回归：WebUI 内联脚本仍是合法 JS，且包含回合级汇总渲染分支。"""
+
+    @staticmethod
+    def _script() -> str:
+        page = Path(__file__).resolve().parents[1] / "webui" / "index.html"
+        html = page.read_text(encoding="utf-8")
+        match = re.search(r"<script>\s*(.*?)\s*</script>", html, re.DOTALL)
+        assert match, "inline Web UI script is missing"
+        return match.group(1)
+
+    def test_inline_script_is_valid_javascript(self):
+        script = self._script()
+        with tempfile.NamedTemporaryFile("w", suffix=".js", encoding="utf-8") as handle:
+            handle.write(script)
+            handle.flush()
+            result = subprocess.run(
+                ["node", "--check", handle.name],
+                text=True, capture_output=True, check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_usage_turn_rendering_branch_present(self):
+        script = self._script()
+        self.assertIn("t === 'usage_turn'", script)
+        self.assertIn("u.last_ratio", script)
+        self.assertIn("回合输入", script)
+        self.assertIn("调用×", script)
+        # 逐次 usage 事件处理与实时刷新分支仍在（未被回合汇总替换）
+        self.assertIn("t === 'usage'", script)
+        self.assertIn("renderCtxBar();", script)
 
 
 if __name__ == "__main__":
