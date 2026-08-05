@@ -121,4 +121,4 @@ Web 附加：AgentLoop 流事件 → Bus.stream → WebChannel → WebSocket（t
 
 - 当前里程碑：TASK-001~011 已完成并归档（任务卡见 `docs/tasks/completed/`）；active：TASK-012 会话索引实时性（待开工，任务卡见 `docs/tasks/active/`）。
 - 最新提交、分支、领先/落后、工作区状态：`git log` / `git status`。
-- 稳定约定：`kb-testset/`（个人知识库测试资产）归属另行处理，不混入本仓库提交；存在 codex 外部 worktree → 多会话并行开发时严格遵守 AGENTS.md 文件所有权规则。
+- 稳定约定：`kb-testset/`（个人知识库测试资产）已在 `.gitignore` 中不追踪；存在 codex 外部 worktree → 多会话并行开发时严格遵守 AGENTS.md 文件所有权规则。

@@ -42,3 +42,6 @@ avatar*.png
 lolita_prompt.md
 小红书参考图/
 Camera_*.jpg
+
+# 个人知识库测试资产（独立项目 kb 的评测资产，不纳入本仓库）
+kb-testset/
