@@ -65,6 +65,12 @@ class DummySessionManager(SessionManager):
     def save_messages(self, session_key: str, messages: list) -> None:
         pass
 
+    def get_memory_revision(self, session_key: str):
+        return None
+
+    def set_memory_revision(self, session_key: str, revision) -> None:
+        pass
+
     def clear(self, session_key: str) -> None:
         pass
 

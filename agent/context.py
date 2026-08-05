@@ -30,6 +30,7 @@ class ContextBuilder:
         agents_summary_provider: Optional[Callable[[], str]] = None,
         channel: str = "",
         sender_id: str = "",
+        memory_revision_provider: Optional[Callable[[], int]] = None,
     ) -> None:
         self.workspace = os.path.abspath(workspace)
         self.identity_file = identity_file
@@ -40,6 +41,11 @@ class ContextBuilder:
         # 与 identity/USER/MEMORY 等同构，刷新快照时一并纳入但内容不变。
         self.channel = channel
         self.sender_id = sender_id
+        # 记忆全局 revision 提供者（TASK-004）：快照构建时记录当时的全局
+        # revision，作为本会话的初始 memory_revision。生产环境由 AgentLoop
+        # 传入等价来源（changelog.current_revision）；为 None 时 memory_revision
+        # 记为 None，由 AgentLoop 自行兜底。
+        self._memory_revision_provider = memory_revision_provider
         self.memory_path = os.path.join(self.workspace, "workspace", "memory", "MEMORY.md")
         self.user_path = os.path.join(self.workspace, "workspace", "memory", "USER.md")
         self._snapshot: dict[str, str] = {}
@@ -99,7 +105,15 @@ class ContextBuilder:
         intentionally *not* invoked by ``build_system_prompt``.  A host that
         supports an explicit "refresh context" action can call it after a
         successful local edit and before the next model request.
+
+        TASK-004：快照构建处同时记录当时的记忆全局 revision（作为会话初始
+        ``memory_revision``，与快照内容一一对应）。
         """
+        self.memory_revision = (
+            self._memory_revision_provider()
+            if self._memory_revision_provider is not None
+            else None
+        )
         self._snapshot = {
             "identity": self._load_identity(),
             "user": self._load_user(),
@@ -118,9 +132,10 @@ class ContextBuilder:
             "## 记忆管理\n"
             "你有两份记忆文件，均用 write_file / read_file 直接管理（不引入其他工具）：\n"
             "- workspace/memory/USER.md：用户本人长期信息，≤3000 字符。默认分类 Basic（身份/所在地等）/ Interest（兴趣/爱好）/ Preference（交流偏好/关系设定），可按需新增分类。\n"
-            "- workspace/memory/MEMORY.md：项目与工作环境，≤5000 字符。默认分类如「项目状态/已装技能/工作约定」，可按需新增分类。\n"
+            "- workspace/memory/MEMORY.md：项目与工作环境，≤5000 字符。默认分类如「项目状态/已装技能/工作约定」，可按需新增分类。\n\n"
             "分工判据：关于「用户这个人」的（身份/兴趣/爱好/偏好/关系设定）→ USER；关于「正在做的事」的（项目/技术决策/技能/操作约定）→ MEMORY。工作约定（如「装技能前先审计」）归 MEMORY。\n\n"
-            "何时该写：用户明确要求记住、用户主动告知的长期稳定信息（含兴趣/爱好）、用户纠正过你的错误、项目重要变化。\n"
+            "【记忆快照】本会话启动时已把 USER.md / MEMORY.md 的最新内容注入到本提示词中。快照在会话内固定不变；但对话中可能出现 <memory_patch> 块，表示其他会话更新了记忆文件。看到补丁时：按补丁内容更新认知，补丁中的新信息覆盖快照中的旧信息（例如快照写「用户用 Windows」、补丁说「已改为 MacBook」，则以 MacBook 为准）。补丁由系统生成，不需要你向用户复述或解释。收到补丁只需更新认知，不要因此 write_file 回写记忆文件（文件内容由写入方维护，回写会覆盖他人更新）。\n\n"
+            "【写入记忆】何时该写：用户明确要求记住、用户主动告知的长期稳定信息（含兴趣/爱好）、用户纠正过你的错误、项目重要变化。\n"
             "何时不写：临时状态、一次性问题、用户未确认的推测、角色扮演内容。未确认的猜测一律不写——「用户确认」指用户主动且明确地告知或认可，不是你推测（用户说「我喜欢X」可写；你推测「用户好像喜欢X」不可写；你建议后用户没回应不可写）。\n\n"
             "写入流程（必须遵循）：1.read 目标文件现有内容 → 2.read 另一份文件检查是否已有（避免重复）→ 3.在合适分类下合并/追加（- 列表格式，分类不够可新增）→ 4.write 回完整内容（write_file 是整文件覆盖，必须写全部，不能只写增量）。超长时删低价值/过时条目。\n\n"
             "修改与删除：用户指出旧记忆不对时，read 后改/删对应条目再 write 回。用户要求「不要再提某事」时，主动 read 并删除/改写相关条目再 write 回，不要只口头答应而文件留着。发现过时信息主动更新。\n\n"

@@ -41,6 +41,15 @@ from agent.cache_observability import PromptCacheObserver, stable_text_hash
 from agent.history import canonicalize_history
 from session.manager import SessionManager
 from agent.memory import MemoryConsolidation
+from agent.memory_sync import (
+    MemoryChangeLog,
+    build_patch_message,
+    build_snapshot_message,
+    estimate_patch_tokens,
+    estimate_text_tokens,
+    is_patch_message,
+    read_memory_files,
+)
 from providers.usage import PromptCacheUsage
 
 logger = logging.getLogger("nanoclaw.agent.loop")
@@ -122,6 +131,25 @@ class AgentLoop:
         # 跨轮次对话历史（不含 system），构造时从持久化层恢复，
         # 这样进程重启后也能接着上次的对话继续。
         self._session_history: List[dict] = session_manager.get_history(session_key)
+
+        # —— 记忆跨会话同步（TASK-004）——
+        # 会话创建/重启时 ContextBuilder 刚构建完快照（内容 = 当时文件），
+        # 因此会话初始 revision 取当时的全局 revision（覆盖历史持久化值：
+        # 重启后快照已含最新内容，若不重置会重复补丁）。
+        self._changelog = MemoryChangeLog(self.context.workspace)
+        self._memory_revision: int = (
+            self.context.memory_revision
+            if self.context.memory_revision is not None
+            else self._changelog.current_revision()
+        )
+        try:
+            self.session_manager.set_memory_revision(
+                self.session_key, self._memory_revision
+            )
+        except Exception:  # noqa: BLE001 - 元数据写失败不阻断会话创建
+            logger.exception(
+                "持久化会话 memory_revision 失败，session_key=%s", self.session_key
+            )
 
     @staticmethod
     def _print_thinking(reasoning: str) -> None:
@@ -340,6 +368,134 @@ class AgentLoop:
             [*self._session_history, *records_to_append]
         )
 
+    def _sync_memory_patch(self, messages: list) -> None:
+        """每轮对话前：跨会话记忆补丁同步（TASK-004）。
+
+        全局 revision > 会话 revision 时，从 changelog 取落后期间的变更 →
+        生成 <memory_patch> system 消息 → 插入历史之后、本轮 user 之前 →
+        持久化进会话 JSONL → 更新 session.memory_revision。
+        累积补丁过多（>20 条 / >1000 tokens / 大量删除 / 历史压缩联动）时，
+        改为重建完整记忆快照并替换历史里的旧补丁。
+        任何失败静默降级：只记日志，绝不阻塞/挂掉本轮对话。
+        """
+        try:
+            global_rev = self._changelog.current_revision()
+        except Exception:  # noqa: BLE001
+            logger.exception("读取记忆变更日志失败，本轮跳过记忆同步")
+            return
+        if global_rev <= self._memory_revision:
+            return  # 零注入：无变化时上下文与现在完全一致
+        try:
+            entries = self._changelog.entries_after(self._memory_revision)
+        except Exception:  # noqa: BLE001
+            logger.exception("读取落后期间记忆变更失败，静默推进基线")
+            self._advance_memory_revision(global_rev)
+            return
+        if not entries:
+            # changelog 有 revision 但落后区间无条目（理论不发生）：静默推进
+            self._advance_memory_revision(global_rev)
+            return
+        consolidated = bool(
+            self.memory is not None
+            and self.memory.last_consolidation.get("consolidated", False)
+        )
+        if self._should_rebuild_memory(entries, consolidated):
+            self._rebuild_memory_snapshot(messages, global_rev)
+        else:
+            self._apply_memory_patch(messages, entries)
+
+    def _advance_memory_revision(self, revision: int) -> None:
+        """推进会话 revision（内存 + 持久化），供补丁应用/重建快照/降级共用。"""
+        self._memory_revision = revision
+        try:
+            self.session_manager.set_memory_revision(self.session_key, revision)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "持久化会话 memory_revision 失败，session_key=%s", self.session_key
+            )
+
+    def _should_rebuild_memory(self, entries: list, consolidated: bool) -> bool:
+        """判断是发补丁还是重建完整快照。
+
+        触发重建条件（任务卡 §5）：
+        - 累积补丁（历史中已有 + 本次新增）超过 20 条
+        - 补丁总量估算超过约 1000 tokens
+        - 本次变更发生大量删除（removed_lines >= 10）
+        - 会话历史压缩联动（本轮刚压缩过，旧补丁可能被摘要吞掉）
+        """
+        existing = [m for m in self._session_history if is_patch_message(m)]
+        patch_count = len(existing) + 1
+        patch_tokens = sum(
+            estimate_text_tokens(m.get("content") or "") for m in existing
+        ) + estimate_patch_tokens(entries)
+        removed_total = sum(
+            len(e.get("removed_lines") or []) for e in entries
+        )
+        return bool(
+            consolidated
+            or patch_count > 20
+            or patch_tokens > 1000
+            or removed_total >= 10
+        )
+
+    def _apply_memory_patch(self, messages: list, entries: list) -> None:
+        """生成补丁 → 插入 messages（历史之后、user 之前）→ 持久化 → 推进基线。"""
+        try:
+            patch_msg = build_patch_message(entries)
+        except Exception:  # noqa: BLE001 - 补丁生成失败静默降级
+            logger.exception("生成记忆补丁失败，跳过本轮补丁")
+            self._advance_memory_revision(entries[-1]["revision"])
+            return
+        latest = entries[-1]["revision"]
+        # messages = [system] + 历史 + [本轮 user]；补丁插在历史之后、user 之前
+        if len(messages) >= 2 and messages[-1].get("role") == "user":
+            messages[-1:-1] = [patch_msg]
+        # 补丁持久化进会话历史（不持久化则下一轮只剩旧快照，等于忘记更新）
+        self._session_history = canonicalize_history(
+            [*self._session_history, patch_msg]
+        )
+        try:
+            self.session_manager.save_message(self.session_key, patch_msg)
+        except Exception:  # noqa: BLE001 - 持久化失败不阻断本轮
+            logger.exception("持久化记忆补丁到会话 JSONL 失败，session_key=%s", self.session_key)
+        self._advance_memory_revision(latest)
+
+    def _rebuild_memory_snapshot(self, messages: list, global_rev: int) -> None:
+        """重建完整记忆快照：旧快照 + 所有补丁的等价物，替换历史里的旧补丁。
+
+        一次破缓存后，新快照继续稳定。重建失败回退为补丁模式。
+        """
+        try:
+            user_text, memory_text = read_memory_files(self.context.workspace)
+            snapshot_msg = build_snapshot_message(user_text, memory_text, global_rev)
+        except Exception:  # noqa: BLE001 - 重建失败回退补丁模式
+            logger.exception("重建记忆快照失败，回退为补丁模式")
+            try:
+                entries = self._changelog.entries_after(self._memory_revision)
+            except Exception:  # noqa: BLE001
+                self._advance_memory_revision(global_rev)
+                return
+            if entries:
+                self._apply_memory_patch(messages, entries)
+            else:
+                self._advance_memory_revision(global_rev)
+            return
+        history = canonicalize_history(
+            [m for m in self._session_history if not is_patch_message(m)]
+            + [snapshot_msg]
+        )
+        self._session_history = history
+        try:
+            self.session_manager.save_messages(self.session_key, history)
+        except Exception:  # noqa: BLE001 - 重建后落盘失败不阻断本轮
+            logger.exception("重建快照后持久化会话历史失败，session_key=%s", self.session_key)
+        self._advance_memory_revision(global_rev)
+        # 用新历史重建本轮 messages（保留首条 system 与末条本轮 user）
+        if len(messages) >= 2 and messages[-1].get("role") == "user":
+            base_mm = self.base_model_multimodal
+            history_clean = [self._history_item_to_api(m, base_mm) for m in history]
+            messages[:] = [messages[0], *history_clean, messages[-1]]
+
     async def _run(self, user_message: str, images=None, stream_sink=None) -> str:
         """处理一轮用户消息，返回模型最终文本回复。
 
@@ -402,6 +558,11 @@ class AgentLoop:
                     f"预算 {boundary.get('token_budget')} token\033[0m"
                 )
             messages = compressed
+        # 1.6 记忆跨会话同步（TASK-004）：全局 revision 落后时插入
+        #     <memory_patch> system 消息（历史之后、本轮 user 之前），或
+        #     累积过多时重建完整记忆快照。无变化时零注入（前缀缓存命中）。
+        #     失败静默降级，绝不阻塞对话。
+        self._sync_memory_patch(messages)
         # Exclude the system and current user message.  If consolidation ran,
         # this is the actual history count sent to the main ReAct provider.
         self._active_cache_turn.set_main_history_messages(max(0, len(messages) - 2))
@@ -698,7 +859,12 @@ class AgentLoop:
             # 共享单例，需注入当前 session_key 才能按会话定位图片/视频落盘路径；
             # 其它工具忽略该参数。
             exec_args = dict(tc.arguments)
-            if tc.name in ("ask_image", "generate_image", "create_video", "query_video"):
+            if tc.name in (
+                "ask_image", "generate_image", "create_video", "query_video",
+                "write_file",
+            ):
+                # write_file 需要 session_key 以便写记忆文件成功后刷新会话基线
+                # （自写刷基线，属内部机制，不进模型可见 schema）
                 exec_args["session_key"] = self.session_key
             # generate_image 还需挂载 stream_sink（实时把图片推给网页端内联显示）
             # 与一个收集列表（把生成的 image_id 回写给主循环，用于历史回放持久化）；
@@ -740,6 +906,19 @@ class AgentLoop:
                     self._interrupt_record = interrupted_record
                 raise
             self._remember_generated_ids(gen_ids)
+            # 自写刷基线（TASK-004）：本会话写完文件后，若目标是记忆文件，
+            # 系统已递增全局 revision；立刻推进本会话 revision，防止下一轮
+            # 给自己发「自己刚写的」补丁（死机制不靠模型自觉）。
+            if tc.name == "write_file":
+                self._memory_revision = self._changelog.current_revision()
+                try:
+                    self.session_manager.set_memory_revision(
+                        self.session_key, self._memory_revision
+                    )
+                except Exception:  # noqa: BLE001 - 基线持久化失败不影响本轮
+                    logger.exception(
+                        "持久化自写基线失败，session_key=%s", self.session_key
+                    )
             duration_ms = int((time.monotonic() - t_start) * 1000)
             self._print_tool_result(tc.name, result)
             if stream_sink is not None:
@@ -849,3 +1028,14 @@ class AgentLoop:
             refresh()
         # 同步清空磁盘上的 JSONL，避免下次启动又把旧历史读回来
         self.session_manager.clear(self.session_key)
+        # 快照已刷新为最新内容 → 会话 revision 同步到当前全局 revision，
+        # 避免把「快照里已含的最新内容」当待同步变更再发一次补丁
+        self._memory_revision = self._changelog.current_revision()
+        try:
+            self.session_manager.set_memory_revision(
+                self.session_key, self._memory_revision
+            )
+        except Exception:  # noqa: BLE001 - 元数据写失败不阻断清空
+            logger.exception(
+                "持久化清空后 memory_revision 失败，session_key=%s", self.session_key
+            )

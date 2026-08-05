@@ -2,11 +2,16 @@
 
 每个会话对应一个 .jsonl 文件，一行一条消息（JSON 格式）。
 所有数据都落在 workspace/sessions/ 下，不污染项目根目录。
+
+TASK-004：会话元数据（``session.memory_revision``）用同名侧车文件
+``<safe_key>.meta.json`` 持久化，与消息 JSONL 解耦——不改动消息行的读取、
+规范化和 Web 历史回放格式；重启恢复时经 ``get_memory_revision`` 读回。
 """
 
 import json
 import os
 from datetime import datetime
+from typing import Optional
 
 from agent.history import canonicalize_history, canonicalize_history_message
 
@@ -29,6 +34,10 @@ class SessionManager:
         """
         safe_key = session_key.replace(":", "_")
         return os.path.join(self.sessions_dir, safe_key + ".jsonl")
+
+    def _get_meta_path(self, session_key: str) -> str:
+        """会话元数据侧车文件路径（与 JSONL 同名、扩展名 .meta.json）。"""
+        return self._get_session_path(session_key).replace(".jsonl", ".meta.json")
 
     def save_message(self, session_key: str, message: dict) -> None:
         """追加一条消息到对应会话的 JSONL 文件。
@@ -103,10 +112,13 @@ class SessionManager:
         return canonicalize_history(messages)
 
     def clear(self, session_key: str) -> None:
-        """删除某会话的 JSONL 文件（若不存在则静默忽略）。"""
+        """删除某会话的 JSONL 与元数据侧车文件（不存在则静默忽略）。"""
         path = self._get_session_path(session_key)
         if os.path.exists(path):
             os.remove(path)
+        meta = self._get_meta_path(session_key)
+        if os.path.exists(meta):
+            os.remove(meta)
 
     def get_session_messages(self, session_key: str) -> list[dict]:
         """读取某会话的全部原始消息（保留 timestamp，供前端历史回放展示）。
@@ -129,6 +141,29 @@ class SessionManager:
                 except json.JSONDecodeError:
                     continue
         return out
+
+    def get_memory_revision(self, session_key: str) -> Optional[int]:
+        """读取会话元数据中的 ``memory_revision``（TASK-004）。
+
+        不存在或损坏时返回 ``None``。该值由 AgentLoop 在会话创建/重启时
+        写入，重启后据此恢复「会话记忆快照对应的全局 revision」。
+        """
+        path = self._get_meta_path(session_key)
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            return int(meta.get("memory_revision"))
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def set_memory_revision(self, session_key: str, revision: int) -> None:
+        """持久化会话元数据中的 ``memory_revision``（TASK-004）。"""
+        path = self._get_meta_path(session_key)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"memory_revision": int(revision)}, f, ensure_ascii=False)
 
     def list_sessions_detailed(self, prefix: str = None) -> list[dict]:
         """列出会话（含元数据），供网页侧边栏使用。
