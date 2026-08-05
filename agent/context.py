@@ -80,10 +80,17 @@ class ContextBuilder:
         """
         if not self.channel and not self.sender_id:
             return ""
-        return (
+        base = (
             f"本会话所在渠道：{self.channel}；用户标识：{self.sender_id}。"
             "渠道名取内部名（feishu/weixin/web/cli），可据此做渠道专属行为。"
         )
+        if self.channel == "weixin":
+            base += (
+                "微信渠道收到文件（📎 收到文件：…引用）时，只向用户确认收到，"
+                "不主动读取内容（含 read_file / exec 等任何方式）；"
+                "等用户明确说「帮我看看 / 读一下」等指令后再读取。"
+            )
+        return base
 
     def refresh_snapshot(self) -> None:
         """Reload slow-changing prompt inputs at an explicit session boundary.

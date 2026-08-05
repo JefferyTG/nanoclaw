@@ -63,6 +63,7 @@ from agent.search import MemorySearcher
 from agent.tools.search import MemorySearchTool
 from agent.tools.vision import AskImageTool
 from agent.tools.imagegen import GenerateImageTool
+from agent.filestore import FileStore
 from agent.imagestore import ImageStore
 from agent.tools.video import CreateVideoTool, QueryVideoTool
 from agent.videostore import VideoStore
@@ -231,6 +232,7 @@ def build_weixin_channel(
     config,
     bus,
     image_store,
+    file_store=None,
     *,
     bind_callback=None,
     unbind_callback=None,
@@ -271,6 +273,7 @@ def build_weixin_channel(
         state_dir=state_dir,
         allowed_user_ids=allowed,
         image_store=image_store,
+        file_store=file_store,
         bind_callback=bind_callback,
         unbind_callback=unbind_callback,
         suspend_callback=suspend_callback,
@@ -434,6 +437,15 @@ def build_shared() -> dict:
     #      现有 .jsonl 结构零改动；供 ask_image 工具与多模态直传使用。
     image_store = ImageStore(sessions_dir)
 
+    # 7.2.1) 文件存储：按月归档到 <data_root>/files/YYYY-MM/（如
+    #       workspace/files/2026-08/），文件是长期资产，/clear 不删除。
+    #       ref_root 取项目根（config.workspace，与 ReadFileTool 的根一致），
+    #       使 ref.path = workspace/files/YYYY-MM/name，Agent 可直接 read_file。
+    file_store = FileStore(
+        os.path.join(WORKSPACE, "workspace", "files"),
+        ref_root=config.workspace,
+    )
+
     # 7.3) 视频存储：与 sessions 同目录，按会话落盘到 <safe_key>_videos/，
     #      供 create_video / query_video 下载保存生成的视频（文件可能几十 MB）。
     video_store = VideoStore(sessions_dir)
@@ -508,6 +520,7 @@ def build_shared() -> dict:
         "identity_bootstrapper": identity_bootstrapper,
         "session_manager": session_manager,
         "image_store": image_store,
+        "file_store": file_store,
         "video_store": video_store,
         "memory": memory,
         "daily_memory": daily_memory,
@@ -765,6 +778,7 @@ async def amain() -> None:
             cfg,
             bus,
             shared["image_store"],
+            shared["file_store"],
             bind_callback=(
                 reminder_service.bind_weixin if reminder_service is not None else None
             ),

@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
-from bus.queue import InboundMessage, OutboundMessage
+from bus.queue import FileRef, InboundMessage, OutboundMessage
 from channels.base import Channel
 
 logger = logging.getLogger("nanoclaw.weixin")
@@ -31,7 +31,23 @@ logger = logging.getLogger("nanoclaw.weixin")
 _PROTOCOL_VERSION = 1
 _MAX_LINE_BYTES = 1024 * 1024
 _MAX_IMAGE_BYTES = 20 * 1024 * 1024
+_MAX_FILE_BYTES = 50 * 1024 * 1024
 _MAX_PENDING_STATE_BYTES = 8 * 1024 * 1024
+def _human_file_size(num_bytes: int) -> str:
+    """把字节数格式化为人类可读大小，如 1.2MB / 345B / 8KB。"""
+    try:
+        size = float(max(0, int(num_bytes or 0)))
+    except (TypeError, ValueError):
+        size = 0.0
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            break
+        size /= 1024
+    if unit == "B":
+        return f"{int(size)}B"
+    return f"{size:.1f}{unit}" if size < 10 else f"{size:.0f}{unit}"
+
+
 _CHANNEL_ERROR_CODES = frozenset({
     "api_rejected",
     "cancelled",
@@ -77,6 +93,7 @@ class _PendingMessageBatch:
     sequence: int = 0
     texts: list = field(default_factory=list)
     images: list = field(default_factory=list)
+    files: list = field(default_factory=list)
     delivery_ids: set[str] = field(default_factory=set)
     deadline_ms: int = 0
     timer: asyncio.Task | None = None
@@ -164,12 +181,14 @@ class WeixinChannel(Channel):
         state_dir: str | os.PathLike[str] | None = None,
         allowed_user_ids: Sequence[str] | None = None,
         image_store=None,
+        file_store=None,
         request_timeout_sec: float = 30.0,
         login_timeout_sec: float = 480.0,
         inbound_ack_timeout_sec: float = 30.0,
         stop_timeout_sec: float = 10.0,
         max_ipc_line_bytes: int = _MAX_LINE_BYTES,
         max_inbound_image_bytes: int = _MAX_IMAGE_BYTES,
+        max_inbound_file_bytes: int = _MAX_FILE_BYTES,
         max_outbound_image_bytes: int = _MAX_IMAGE_BYTES,
         restart_backoff_sec: float = 1.0,
         merge_window_sec: float | None = None,
@@ -187,12 +206,14 @@ class WeixinChannel(Channel):
         self.state_dir = Path(state_dir).resolve() if state_dir else None
         self.allowed_user_ids = frozenset(str(item) for item in (allowed_user_ids or ()))
         self.image_store = image_store
+        self.file_store = file_store
         self.command_timeout_sec = max(0.1, float(request_timeout_sec))
         self.login_timeout_sec = max(0.1, float(login_timeout_sec))
         self.inbound_ack_timeout_sec = max(0.1, float(inbound_ack_timeout_sec))
         self.stop_timeout_sec = max(0.1, float(stop_timeout_sec))
         self.max_ipc_line_bytes = max(1024, int(max_ipc_line_bytes))
         self.max_inbound_image_bytes = max(1, int(max_inbound_image_bytes))
+        self.max_inbound_file_bytes = max(1, int(max_inbound_file_bytes))
         self.max_outbound_image_bytes = max(1, int(max_outbound_image_bytes))
         self.restart_backoff_sec = max(0.0, float(restart_backoff_sec))
         try:
@@ -602,6 +623,9 @@ class WeixinChannel(Channel):
                 env["NANOCLAW_WEIXIN_MAX_OUTBOUND_IMAGE_BYTES"] = str(
                     self.max_outbound_image_bytes
                 )
+                env["NANOCLAW_WEIXIN_MAX_INBOUND_FILE_BYTES"] = str(
+                    self.max_inbound_file_bytes
+                )
             self._process = await asyncio.create_subprocess_exec(
                 *self.bridge_command, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE, env=env, limit=self.max_ipc_line_bytes,
@@ -761,8 +785,9 @@ class WeixinChannel(Channel):
             logger.warning("failed to persist Weixin reminder command")
             return
         except Exception as exc:
-            # ImageStore, persistence and Bus failures are recoverable.  Do
-            # not acknowledge: Bridge redelivery is the at-least-once path.
+            # ImageStore/FileStore, persistence and Bus failures are
+            # recoverable.  Do not acknowledge: Bridge redelivery is the
+            # at-least-once path.
             logger.warning("failed to accept Weixin inbound message: %s", exc)
             return
         if accepted:
@@ -797,6 +822,8 @@ class WeixinChannel(Channel):
         if batch is not None and delivery_id in batch.delivery_ids:
             for descriptor in data.get("images") or []:
                 self._discard_duplicate_inbound_image(descriptor)
+            for descriptor in data.get("files") or []:
+                self._discard_duplicate_inbound_file(descriptor)
             return True
         images = []
         for descriptor in data.get("images") or []:
@@ -806,18 +833,27 @@ class WeixinChannel(Channel):
                 raise _UnsupportedInbound(str(exc)) from exc
             if image is not None:
                 images.append(image)
-        if not text and not images:
+        files = []
+        for descriptor in data.get("files") or []:
+            try:
+                file_ref = self._consume_inbound_file(descriptor, session_key)
+            except ValueError as exc:
+                raise _UnsupportedInbound(str(exc)) from exc
+            if file_ref is not None:
+                files.append(file_ref)
+        if not text and not images and not files:
             logger.info("discarded empty or unsupported Weixin inbound message")
             return True
         # 合并关闭：每条消息立即独立投递，不进批次。
         if self.merge_window_sec == 0:
-            content = text or (
-                "请分析这张图片。" if len(images) == 1 else "请分析这些图片。"
-            )
+            content = self._build_content(text, images, files)
             try:
-                await self._publish_inbound(sender_id, target, content, images, data)
+                await self._publish_inbound(
+                    sender_id, target, content, images, data, files=files
+                )
             except Exception:
                 self._delete_image_refs(images)
+                self._delete_file_refs(files)
                 raise
             return True
         # 统一消息合并：文本/图片/图文混合全部进入同一批次。窗口内到达的
@@ -829,12 +865,14 @@ class WeixinChannel(Channel):
             sequence=sequence,
             texts=list(old_batch.texts) if old_batch is not None else [],
             images=list(old_batch.images) if old_batch is not None else [],
+            files=list(old_batch.files) if old_batch is not None else [],
             delivery_ids=set(old_batch.delivery_ids) if old_batch is not None else set(),
             deadline_ms=int((time.time() + self.merge_window_sec) * 1000),
         )
         if text:
             new_batch.texts.append(text)
         new_batch.images.extend(images)
+        new_batch.files.extend(files)
         new_batch.delivery_ids.add(delivery_id)
         self._pending_message_batches[key] = new_batch
         try:
@@ -845,6 +883,7 @@ class WeixinChannel(Channel):
             else:
                 self._pending_message_batches[key] = old_batch
             self._delete_image_refs(images)
+            self._delete_file_refs(files)
             raise
         if old_batch is not None and old_batch.timer is not None:
             old_batch.timer.cancel()
@@ -968,16 +1007,16 @@ class WeixinChannel(Channel):
         if batch is None:
             return
         raw = raw or {}
-        if batch.texts:
-            content = "\n".join(batch.texts)
-        elif batch.images:
-            content = "请分析这张图片。" if len(batch.images) == 1 else "请分析这些图片。"
-        else:
-            content = ""
+        content = self._build_content(
+            "\n".join(batch.texts) if batch.texts else "",
+            batch.images,
+            batch.files,
+        )
         try:
             await self._publish_inbound(
                 self._session_sender_id(batch.target, batch.sequence),
                 batch.target, content, batch.images, raw,
+                files=batch.files,
             )
         except Exception:
             # 发布失败：保留批次（含其文本与图片引用），等待重投/重试。
@@ -991,12 +1030,21 @@ class WeixinChannel(Channel):
         if batch.timer is not None and batch.timer is not asyncio.current_task():
             batch.timer.cancel()
 
-    async def _publish_inbound(self, sender_id: str, target: str, text: str, images: list, raw: dict[str, Any]) -> None:
+    async def _publish_inbound(
+        self,
+        sender_id: str,
+        target: str,
+        text: str,
+        images: list,
+        raw: dict[str, Any],
+        files: list | None = None,
+    ) -> None:
         acceptance = asyncio.get_running_loop().create_future()
         await self.bus.publish_inbound(InboundMessage(
             self.name, sender_id, target, text,
             raw={"message_id": raw.get("message_id"), "delivery_id": raw.get("delivery_id")},
             images=images or None,
+            files=files or None,
             acceptance_future=acceptance,
         ))
         await acceptance
@@ -1064,6 +1112,16 @@ class WeixinChannel(Channel):
                     "deadline_ms": batch.deadline_ms,
                     "texts": batch.texts,
                     "images": [{"id": image.id, "mime": image.mime} for image in batch.images],
+                    "files": [
+                        {
+                            "id": ref.id,
+                            "path": ref.path,
+                            "name": ref.name,
+                            "size": ref.size,
+                            "mime": ref.mime,
+                        }
+                        for ref in batch.files
+                    ],
                 }
                 for batch in self._pending_message_batches.values()
             ],
@@ -1155,6 +1213,11 @@ class WeixinChannel(Channel):
                 if text_items is None:
                     text_items = []  # 旧格式（仅图片批次）无 texts 字段，视为空文本
                 image_items = item.get("images")
+                # Legacy batches persisted before TASK-003 have no "files"
+                # field; treat the missing key as an empty list.
+                file_items = item.get("files")
+                if not isinstance(file_items, list):
+                    file_items = []
                 delivery_items = item.get("delivery_ids")
                 deadline = item.get("deadline_ms")
                 if (
@@ -1184,7 +1247,37 @@ class WeixinChannel(Channel):
                         image = self.image_store.resolve(session_key, image_data["id"])
                         if image is not None:
                             images.append(image)
-                if not images and not text_items:
+                files = []
+                for file_data in file_items or []:
+                    if not isinstance(file_data, dict):
+                        continue
+                    file_id = file_data.get("id")
+                    file_path = file_data.get("path")
+                    file_name = file_data.get("name")
+                    file_size = file_data.get("size")
+                    if (
+                        not isinstance(file_id, str)
+                        or not 0 < len(file_id) <= 128
+                        or not isinstance(file_path, str)
+                        or not file_path
+                        or not isinstance(file_name, str)
+                        or not file_name
+                        or isinstance(file_size, bool)
+                        or not isinstance(file_size, (int, float))
+                        or file_size <= 0
+                    ):
+                        continue
+                    mime = file_data.get("mime")
+                    files.append(
+                        FileRef(
+                            id=file_id,
+                            path=file_path,
+                            name=file_name,
+                            size=int(file_size),
+                            mime=mime if isinstance(mime, str) and mime else None,
+                        )
+                    )
+                if not images and not files and not text_items:
                     continue
                 key = (account_id, user_id)
                 if key in loaded:
@@ -1192,6 +1285,7 @@ class WeixinChannel(Channel):
                 batch = _PendingMessageBatch(
                     account_id, user_id, target, session_key,
                     sequence=sequence, texts=list(text_items), images=images,
+                    files=files,
                     delivery_ids=set(delivery_items), deadline_ms=int(deadline),
                 )
                 loaded[key] = batch
@@ -1230,6 +1324,26 @@ class WeixinChannel(Channel):
         except (OSError, ValueError):
             return
 
+    def _discard_duplicate_inbound_file(self, descriptor: Any) -> None:
+        """Remove a redelivered Bridge temp file without copying it again."""
+        if not isinstance(descriptor, dict) or self.state_dir is None:
+            return
+        path_text = descriptor.get("file_path")
+        if not isinstance(path_text, str):
+            return
+        try:
+            path = Path(path_text)
+            if path.is_symlink():
+                return
+            state_root = self.state_dir.resolve(strict=True)
+            inbound_root = (self.state_dir / "inbound").resolve(strict=True)
+            inbound_root.relative_to(state_root)
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(inbound_root)
+            resolved.unlink()
+        except (OSError, ValueError):
+            return
+
     @staticmethod
     def _delete_image_refs(images: list) -> None:
         for image in images:
@@ -1237,6 +1351,17 @@ class WeixinChannel(Channel):
                 os.unlink(image.path)
             except FileNotFoundError:
                 pass
+
+    def _delete_file_refs(self, files: list) -> None:
+        """投递失败回滚：删除已归档文件，避免重投时落成 -1 副本。"""
+        store = self.file_store
+        if store is None:
+            return
+        for ref in files:
+            try:
+                store.delete(ref)
+            except Exception:  # noqa: BLE001 - best-effort rollback
+                logger.warning("failed to roll back saved Weixin file")
 
     async def _ack_inbound(self, delivery_id: str) -> None:
         """Best-effort acknowledgement for an already validated delivery id."""
@@ -1283,6 +1408,91 @@ class WeixinChannel(Channel):
             if len(data) > self.max_inbound_image_bytes:
                 raise ValueError("invalid image file")
             return self.image_store.save(session_key, data, _IMAGE_MIMES[mime], mime)
+        finally:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _file_reference_text(self, ref) -> str:
+        """把一份 FileRef 拼成入站 content 中的文件引用文本（不读文件内容）。"""
+        return f"📎 收到文件：{ref.path}（{_human_file_size(ref.size)}）"
+
+    def _build_content(self, text: str, images: list, files: list) -> str:
+        """按文本/图片/文件组装入站 content。
+
+        文本在前；文件引用随后（每份一行，路径为相对 workspace 的相对路径）。
+        纯文件消息（无文本）的 content 就是文件引用文本，能直接进 Agent。
+        """
+        parts = []
+        if text:
+            parts.append(text)
+        file_lines = [self._file_reference_text(ref) for ref in files]
+        if file_lines:
+            parts.append("\n".join(file_lines))
+        if parts:
+            return "\n".join(parts)
+        if images:
+            return "请分析这张图片。" if len(images) == 1 else "请分析这些图片。"
+        return ""
+
+    def _consume_inbound_file(self, descriptor: Any, session_key: str):
+        """把 Bridge 临时文件搬进 FileStore，返回 FileRef；读失败/超限丢弃。
+
+        与图片不同：大小超限或读取失败只丢弃该文件并返回 ``None``，不影响同
+        批文本/图片继续投递。结构或安全校验失败（路径越界/符号链接）仍抛
+        ``ValueError``，由调用方按不可支持消息整体丢弃（fail-closed）。
+        """
+        if self.file_store is None or not isinstance(descriptor, dict):
+            raise ValueError("file storage unavailable")
+        path_text = descriptor.get("file_path")
+        file_name = descriptor.get("file_name")
+        if not isinstance(path_text, str) or self.state_dir is None:
+            raise ValueError("invalid file descriptor")
+        if not isinstance(file_name, str) or not file_name:
+            file_name = ""
+        original_path = Path(path_text)
+        if original_path.is_symlink():
+            raise ValueError("invalid file path")
+        state_root = self.state_dir.resolve(strict=True)
+        inbound_directory = self.state_dir / "inbound"
+        if inbound_directory.is_symlink() or not inbound_directory.is_dir():
+            raise ValueError("invalid bridge inbound directory")
+        inbound_root = inbound_directory.resolve(strict=True)
+        try:
+            inbound_root.relative_to(state_root)
+        except ValueError as exc:
+            raise ValueError("invalid bridge inbound directory") from exc
+        path = original_path.resolve(strict=True)
+        try:
+            path.relative_to(inbound_root)
+        except ValueError as exc:
+            raise ValueError("file path outside bridge inbound directory") from exc
+        descriptor_fd = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        info = os.fstat(descriptor_fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_size <= 0
+            or info.st_size > self.max_inbound_file_bytes
+        ):
+            os.close(descriptor_fd)
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            return None
+        try:
+            with os.fdopen(descriptor_fd, "rb") as input_file:
+                try:
+                    data = input_file.read(self.max_inbound_file_bytes + 1)
+                except OSError:
+                    return None
+            if len(data) > self.max_inbound_file_bytes:
+                return None
+            return self.file_store.save(data, file_name)
         finally:
             try:
                 path.unlink()

@@ -56,6 +56,21 @@ class WeixinCompositionTests(unittest.TestCase):
             Path(os.path.realpath(os.path.join(tmp, "workspace/weixin"))),
         )
 
+    def test_file_store_flows_through_build_weixin_channel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = NanoClawConfig(workspace=tmp)
+            cfg.weixin = {
+                **cfg.weixin,
+                "enabled": True,
+                "bridge_command": ["node", "bridge.mjs"],
+                "allowed_user_ids": ["user-1"],
+            }
+            file_store = object()
+            channel = build_weixin_channel(
+                cfg, MessageBus(), None, file_store=file_store
+            )
+            self.assertIs(channel.file_store, file_store)
+
     def test_invalid_command_and_allowlist_are_rejected(self):
         cfg = NanoClawConfig()
         cfg.weixin = {**cfg.weixin, "enabled": True, "bridge_command": "node bridge"}

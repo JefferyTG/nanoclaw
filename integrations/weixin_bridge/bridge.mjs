@@ -49,6 +49,10 @@ const MAX_INBOUND_IMAGE_BYTES = positiveInt(
   process.env.NANOCLAW_WEIXIN_MAX_INBOUND_IMAGE_BYTES,
   20 * 1024 * 1024,
 );
+const MAX_INBOUND_FILE_BYTES = positiveInt(
+  process.env.NANOCLAW_WEIXIN_MAX_INBOUND_FILE_BYTES,
+  50 * 1024 * 1024,
+);
 const MAX_OUTBOUND_IMAGE_BYTES = positiveInt(
   process.env.NANOCLAW_WEIXIN_MAX_OUTBOUND_IMAGE_BYTES,
   20 * 1024 * 1024,
@@ -681,6 +685,51 @@ async function inboundImages(message, signal) {
   return images;
 }
 
+async function inboundFiles(message, signal) {
+  const files = [];
+  for (const item of message.item_list || []) {
+    // MessageItemType.FILE == 4.  The vendor FILE branch requires both the
+    // encrypted CDN reference and the base64 AES key.
+    if (item?.type !== MessageItemType.FILE) continue;
+    const fileItem = item?.file_item;
+    if (!fileItem?.media?.encrypt_query_param || !fileItem.media.aes_key) continue;
+    const fileName = typeof fileItem.file_name === 'string' ? fileItem.file_name : '';
+    try {
+      const data = await withTimeout(
+        deadlineSignal => downloadCdn(
+          state.account.cdn_base_url || DEFAULT_CDN_BASE_URL,
+          fileItem.media.encrypt_query_param,
+          fileItem.media.aes_key,
+          deadlineSignal,
+          aesEcbPaddedSize(MAX_INBOUND_FILE_BYTES),
+        ),
+        API_TIMEOUT_MS,
+        signal,
+      );
+      if (data.length <= 0 || data.length > MAX_INBOUND_FILE_BYTES) {
+        emit({
+          type: 'event',
+          event: 'channel_error',
+          data: error('media_invalid', 'inbound file size is invalid', false),
+        });
+        continue;
+      }
+      const directory = controlledSubdirectory('inbound');
+      const filePath = path.join(directory, `${crypto.randomUUID()}.file`);
+      fs.writeFileSync(filePath, data, {mode: 0o600, flag: 'wx'});
+      // The original name is metadata only; Python's FileStore decides the
+      // final sanitized on-disk name under workspace/files/YYYY-MM/.
+      files.push({file_path: filePath, file_name: fileName, size: data.length});
+    } catch (err) {
+      // One bad file must not stall the batch: report and skip it.  Ack and
+      // other items in the same message stay unaffected.
+      const failure = normalizedError(err);
+      emit({type: 'event', event: 'channel_error', data: failure});
+    }
+  }
+  return files;
+}
+
 function controlledSubdirectory(name) {
   const stateRoot = fs.realpathSync(stateDir);
   const directory = path.join(stateRoot, name);
@@ -828,6 +877,7 @@ async function pollLoop(signal) {
           );
         }
         const images = await inboundImages(message, signal);
+        const files = await inboundFiles(message, signal);
         const id = deliveryId(accountId, messageId);
         batch.keys.push(key);
         pendingInbound.set(id, {key, batch});
@@ -841,6 +891,7 @@ async function pollLoop(signal) {
             message_id: messageId,
             text: extractText(message),
             images,
+            files,
           },
         });
       }

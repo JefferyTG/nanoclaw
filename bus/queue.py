@@ -32,6 +32,22 @@ class ImageRef:
 
 
 @dataclass
+class FileRef:
+    """一份已落盘文件的轻量引用，用于在消息总线上传递文件而不内联字节。
+
+    文件字节由 ``FileStore`` 按月归档到 ``workspace/files/YYYY-MM/``，总线只
+    搬运引用（id / 相对路径 / 消毒后的文件名 / 字节大小），真正读取内容由
+    Agent 的 ``read_file`` 工具按需进行，不占模型 token。
+    """
+
+    id: str                       # 全局唯一文件标识（uuid4 hex）
+    path: str                     # 相对 ref_root（生产为项目根）的路径：workspace/files/YYYY-MM/name
+    name: str                     # 消毒后的磁盘文件名（含扩展名）
+    size: int                     # 文件字节数
+    mime: Optional[str] = None    # MIME 类型（可空；文件不强制解析）
+
+
+@dataclass
 class InboundMessage:
     """入站消息：某渠道上用户发来的原始消息。"""
 
@@ -41,6 +57,7 @@ class InboundMessage:
     content: str                  # 消息正文
     raw: Optional[dict] = None    # 原始消息（各渠道 SDK 的原始结构），调试用
     images: Optional[List[ImageRef]] = None  # 随消息附带的图片引用（无则为 None）
+    files: Optional[List[FileRef]] = None   # 随消息附带的文件引用（无则为 None）
     # Optional handoff acknowledgement for a durable channel inbox.  The bus
     # resolves it only after a consumer has removed this message from the
     # in-memory queue, so the producer can retain its recovery record until

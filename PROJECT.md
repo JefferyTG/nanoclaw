@@ -19,6 +19,7 @@
 | 渠道感知 | ✅ | Agent 经 System Prompt 会话级快照感知渠道（feishu/weixin/web/cli）与用户标识（sender_id），会话内恒定，可做渠道专属行为 |
 | 微信深度集成 | ✅ | 扫码登录、图文收发、断线恢复、原生 typing、`/bind-reminders`、图片等待窗口合并 |
 | 微信语音转写 | ✅ | 语音经腾讯 STT 转写（`voice_item.text`）进入 Agent，不落地本地 ASR |
+| 微信文件接收 | ✅ | 文件按月归档 `workspace/files/YYYY-MM/`（消毒名+重名加后缀+50MB 上限）；发模型只带「文件名+路径+大小」引用、不读内容不花 token；乖宝说「帮我看看」时 Agent 用 `read_file` 按需读取 |
 | 网页端 | ✅ | 流式思考/逐字输出、会话侧边栏、历史接回/删除、断线重连、「⏹ 停止」回合取消 |
 | 语音输入 ASR | ✅ | OpenAI-compatible，FFmpeg 归一化，仅 Web（`asr_model` 配置启用） |
 | 语音朗读 TTS | ✅ | edge-tts 分句流水线，可取消，默认关（`tts_model` 配置启用） |

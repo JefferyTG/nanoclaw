@@ -59,6 +59,8 @@
 | 微信发送回执同时检查 HTTP 和 JSON | 有效 | 要求 HTTP 成功和有效 JSON；腾讯成功响应可省略 `ret/errcode`，任一存在且非零或非数值都失败，correlation/client ID 在重试间稳定 |
 | 微信 `-14` 切换凭据代次 | 有效 | 清除 account/cursor/context/去重后重新扫码；旧 context 不跨认证代次复用，避免稳定的主动发送失败 |
 | 微信语音直接用腾讯 STT（`voice_item.text`），不落地本地 ASR | 有效 | 腾讯已提供服务端转写，零成本零延迟；实测语音为 silk 编码，本地 ASR 需额外解码器。TEXT 项在前、VOICE 转写追加在后换行合并；腾讯 text 为空时保持忽略，不做本地 fallback |
+| 微信文件按月归档+引用式传递，不按会话分散 | 有效 | 文件是长期资产（非一次性查看），统一按月目录 `workspace/files/YYYY-MM/` 便于用户查找；发模型只带「文件名+路径+大小」引用（不读内容、不花 token），乖宝说「帮我看看」时 Agent 用 `read_file` 按需读取。文件名消毒+重名加后缀+50MB 上限；`/clear` 不删文件 |
+| 微信收到文件 Agent 不主动读内容（行为约束走渠道快照） | 有效 | 代码层只保证「引用式传递」，但模型可能拿到引用后自行 read_file/exec 读取，违背「乖宝说帮我看看再读」的设计。约束入 `agent/context.py::_channel_section`：微信渠道收到 📎 文件引用时只确认收到，不主动读取内容（含 read_file / exec 等任何方式），等用户明确指令后再读。TASK-003 验收实机发现后补充（2026-08-05） |
 | 渠道感知走会话级快照（System Prompt）而非每轮前缀注入 | 有效 | 渠道在会话内恒定，每轮注入是冗余的；快照零每轮 token、System Prompt 前缀稳定（Prompt Cache 友好）。渠道+用户已天然编码在 session_key（`channel:sender_id`）中，`make_agent_factory` 解析后注入 ContextBuilder，与 identity/USER/MEMORY 同构；时间戳因每轮变化仍走每轮前缀注入 |
 
 这些约定来自 `.workbuddy/memory/MEMORY.md` 和 2026-07-22 至 2026-07-26 的开发日志；原日志被 Git 忽略，因此本表是跨会话的正式摘录。
@@ -75,6 +77,8 @@
 | 07-29 | 主动提醒、RRULE 调度、飞书绑定与可靠回执 | 持久状态机与副作用分离；Agent 输出必须先落库再发送 |
 | 07-29 | 微信私聊 V1、Node Bridge、扫码/图片/状态恢复 | 跨进程协议先定契约；cursor 必须在消费确认后推进；fake 服务不能与错误实现共同自洽 |
 | 07-30 | Prompt Cache 稳定前缀、时间工具、usage 观测 | 动态字段不能放在历史前；缓存缺失字段不能当作 0 命中；工具/图片缓存能力属于供应商边界 |
+| 08-05 | TASK-003 实机验收补充：微信端 Agent 收到文件引用后自行 read_file/exec 读取，违背按需读取设计；行为约束补入渠道快照（`agent/context.py::_channel_section` 微信分支） | 代码层只能保证引用式传递，管不住模型行为；行为规则应放 System Prompt 渠道专属 section |
+| 08-04 | 微信文件接收（TASK-003）：Bridge FILE 入站下载 → FileStore 按月归档 → content 只带引用 | 文件名不可信需消毒防穿越；文件大小需设上限防撑爆磁盘；命令消息保持纯文本判断不变；批量持久化需兼容旧批次缺 `files` 字段 |
 
 ## 4. 已替代或已核销的旧记录
 
