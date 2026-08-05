@@ -58,7 +58,7 @@ from agent.context import ContextBuilder
 from agent.identity import IdentityBootstrapper
 from agent.loop import AgentLoop
 from session.manager import SessionManager
-from agent.memory import MemoryConsolidation
+from agent.memory import ContextCompactor
 from agent.daily import DailyMemory, summarize_messages_to_daily
 from agent.search import MemorySearcher
 from agent.tools.search import MemorySearchTool
@@ -502,17 +502,12 @@ def build_shared() -> dict:
     )
 
     # 8) 每日记忆：按天把重要事件追加到 workspace/memory/daily/YYYY-MM-DD.md
-    #    供 /clear 与压缩前两个触发点写入；不暴露为工具。
+    #    现仅由 /clear 触发写入（TASK-006 起压缩不再写 daily）；不暴露为工具。
     daily_memory = DailyMemory(os.path.join(WORKSPACE, "workspace", "memory"))
 
-    # 9) 会话压缩器（上下文超预算时把旧消息压成摘要，落到 workspace/memory/HISTORY.md）
-    #    token_budget 由 config.json 的 context_budget_tokens 动态配置（默认 512k），
-    #    与 sessions 同级的 workspace/memory 目录。旧配置缺字段时回退默认值。
-    #    压缩前先把旧消息里的重要事件落 daily，避免关键事实随压缩丢失。
-    memory = MemoryConsolidation(
-        provider, os.path.join(WORKSPACE, "workspace"),
-        token_budget=config.context_budget_tokens, daily_memory=daily_memory,
-    )
+    # 会话压缩器不再是共享单例（TASK-006）：改为在 make_agent_factory() 的
+    # factory(session_key) 内为每个会话创建独立 ContextCompactor，随 AgentLoop
+    # 一并注入；压缩结果显式返回，无跨会话共享可变状态。
 
     return {
         "config": config,
@@ -526,7 +521,6 @@ def build_shared() -> dict:
         "image_store": image_store,
         "file_store": file_store,
         "video_store": video_store,
-        "memory": memory,
         "daily_memory": daily_memory,
         "searcher": searcher,
         "skills_summary": skills_summary,
@@ -569,6 +563,14 @@ def make_agent_factory(shared: dict, registry: dict) -> callable:
             channel=channel,
             sender_id=sender_id,
         )
+        # 每会话独立压缩器（TASK-006）：压缩状态/结果属会话私有，绝不跨会话共享；
+        # 允许共享 config / tools / session_manager，但 AgentLoop、compactor、
+        # token 估算状态与本轮压缩结果都必须是本会话自己的。
+        compactor = ContextCompactor(
+            provider,
+            os.path.join(cfg.workspace, "workspace"),
+            token_budget=cfg.context_budget_tokens,
+        )
         agent = AgentLoop(
             provider,
             shared["tools"],
@@ -577,7 +579,7 @@ def make_agent_factory(shared: dict, registry: dict) -> callable:
             session_key=session_key,
             model=cfg.model,
             max_iterations=cfg.max_iterations,
-            memory=shared["memory"],
+            compactor=compactor,
             turn_timeout=cfg.turn_timeout_sec,
             image_store=shared["image_store"],
             base_model_multimodal=cfg.base_model_multimodal,

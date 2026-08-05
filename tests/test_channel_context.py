@@ -42,12 +42,13 @@ def _make_shared(workspace: str) -> dict:
             max_iterations=4,
             turn_timeout_sec=10,
             base_model_multimodal=False,
+            # TASK-006：factory 每会话创建 ContextCompactor，需读取该预算字段
+            context_budget_tokens=524288,
         ),
         "skills_summary": "",
         "profile_loader": SimpleNamespace(build_summary=lambda: ""),
         "tools": ToolRegistry(),
         "session_manager": SessionManager(os.path.join(workspace, "sessions")),
-        "memory": None,
         "image_store": None,
     }
 

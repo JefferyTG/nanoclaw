@@ -278,9 +278,9 @@ NanoClaw 按“只追加历史”的精确前缀组织请求：相邻回合继�
 
 当前墙钟不写入 System Prompt。只有问题涉及现在、今天/明天、星期、时间差、提醒或定时任务时，模型才应调用 `get_current_time`；工具使用实例 `timezone`，也接受经过校验的可选 IANA 时区。普通问题不应为了查时间调用 `exec` 或时间工具。
 
-每次模型调用与每个用户回合都会输出一行 `[prompt-cache]` JSON，只包含 token 计数、`system_hash`、`tools_hash`、历史消息数、`phase` 和工具迭代序号，不记录 prompt、用户文本、记忆、工具参数或密钥。压缩触发的 daily/历史摘要调用也计入同一用户回合。回合命中率按 `sum(cached_input_tokens) / sum(input_tokens)` 计算，不平均各调用百分比。若供应商未返回 cached tokens，字段为 `null` 且 `availability` 为 `partial/unavailable`，不会把缺失值伪报成 0 命中。流式请求会请求 usage；不支持 `stream_options.include_usage` 的兼容服务会降级继续流式返回，但 usage 明确不可用。
+每次模型调用与每个用户回合都会输出一行 `[prompt-cache]` JSON，只包含 token 计数、`system_hash`、`tools_hash`、历史消息数、`phase` 和工具迭代序号，不记录 prompt、用户文本、记忆、工具参数或密钥。压缩触发的历史摘要调用也计入同一用户回合（TASK-006 起压缩不再写 daily）。回合命中率按 `sum(cached_input_tokens) / sum(input_tokens)` 计算，不平均各调用百分比。若供应商未返回 cached tokens，字段为 `null` 且 `availability` 为 `partial/unavailable`，不会把缺失值伪报成 0 命中。流式请求会请求 usage；不支持 `stream_options.include_usage` 的兼容服务会降级继续流式返回，但 usage 明确不可用。
 
-冷启动、System/工具快照刷新、图片文件缺失或变化，以及历史超过预算后被摘要替换，都会形成合理的缓存断点。多模态历史在图片仍存在时按同一字节重建，避免把 Base64 写进 JSONL；它仍会随主请求再次发送，且缓存行为取决于供应商。文本摘要请求只接收图片省略占位，不重复发送 Base64。约 192k 预算触发的 MemoryConsolidation 会保留 System 与至少最后 6 条消息，并把边界向前扩展到完整工具交换，再用摘要替换中间旧历史；摘要失败时保留原历史。这是可观测但不可避免的前缀“断崖”，不能为追求缓存而牺牲上下文正确性。
+冷启动、System/工具快照刷新、图片文件缺失或变化，以及历史超过预算后被摘要替换，都会形成合理的缓存断点。多模态历史在图片仍存在时按同一字节重建，避免把 Base64 写进 JSONL；它仍会随主请求再次发送，且缓存行为取决于供应商。文本摘要请求只接收图片省略占位，不重复发送 Base64。约 192k 预算触发的 ContextCompactor 会保留 System 与至少最后 6 条消息，并把边界向前扩展到完整工具交换，再用摘要替换中间旧历史；摘要失败时保留原历史。这是可观测但不可避免的前缀“断崖”，不能为追求缓存而牺牲上下文正确性。
 
 ---
 

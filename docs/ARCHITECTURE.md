@@ -70,7 +70,7 @@ flowchart LR
 - `main.py` 是唯一 composition root，手工创建并注入共享对象。
 - Channel 不直接调用 Agent；Web 入站可在投递 Bus 前调用独立 ASR 服务把音频归一为文本。
 - Gateway 依赖 Bus、Channel 抽象和 AgentLoop，负责按 `session_key` 调度。
-- AgentLoop 依赖 Provider 抽象、ToolRegistry、ContextBuilder、SessionManager 和 MemoryConsolidation。
+- AgentLoop 依赖 Provider 抽象、ToolRegistry、ContextBuilder、SessionManager 和每会话独立的 ContextCompactor（TASK-006 起不再共享压缩器实例）。
 - 具体工具才依赖 `httpx`、`ddgs`、MCP 等外部能力。
 - ReminderScheduler 只依赖异步仓储协议、Agent runner 和 Bus delivery 回调；SQLite 是任务事实源。
 
@@ -87,7 +87,7 @@ nanoclaw/
 │   ├── context.py          # System Prompt 与 messages 构建
 │   ├── identity.py         # 缺失人设时的跨渠道首次引导与原子落盘
 │   ├── memory.py           # 超预算历史压缩与 HISTORY.md
-│   ├── daily.py            # /clear 或压缩前的 best-effort 每日摘要
+│   ├── daily.py            # /clear 的 best-effort 每日摘要（压缩不再写 daily，TASK-006）
 │   ├── search.py           # SQLite + LIKE 记忆/会话检索
 │   ├── imagestore.py       # 按会话保存、解析和删除图片
 │   ├── skills.py           # 扫描与解析 SKILL.md
@@ -122,7 +122,7 @@ nanoclaw/
 ### 5.1 启动与装配
 
 1. `main.main()` 进入 `asyncio.run(amain())`。
-2. `build_shared()` 加载配置，创建基础 Provider、SkillsLoader、ToolRegistry、ContextBuilder、SessionManager、ImageStore、MemorySearcher、DailyMemory、MemoryConsolidation，以及启用时的 ReminderRepository/ReminderService。
+2. `build_shared()` 加载配置，创建基础 Provider、SkillsLoader、ToolRegistry、ContextBuilder、SessionManager、ImageStore、MemorySearcher、DailyMemory，以及启用时的 ReminderRepository/ReminderService；每会话的 ContextCompactor 由 make_agent_factory 内按 session 创建（TASK-006）。
 3. 启动时重建记忆/会话 SQLite 索引。
 4. MCPClientManager 按配置拉起 stdio Server，并把远端工具包装进同一个 ToolRegistry。
 5. 根据终端、飞书凭证、`weixin.enabled` 和 `web_port` 启用 Channel。微信启用时
@@ -183,14 +183,14 @@ Web 是唯一启用细粒度流事件的渠道：`thinking`、`token`、`tool_ca
 
 1. ContextBuilder 使用会话级快照构建不含墙钟的稳定 System Prompt；当前时间仅在相关任务中通过 `get_current_time` 查询。
 2. 加入会话历史和当前 user；图片按基础模型是否多模态选择直传或工具路径。
-3. 估算消息、多模态 content 与工具 Schema；超过约 192k 预算时，旧消息被总结为一条 system 摘要，并记录稳定 head/tail 压缩边界。
+3. 估算消息、多模态 content 与工具 Schema；超过 `context_budget_tokens` 预算（默认 512k）时，ContextCompactor 把旧消息总结为一条 system 摘要，并记录稳定 head/tail 压缩边界（预算内原样返回、摘要失败保留原历史）。
 4. Provider 返回最终回答或 tool calls。
 5. ToolRegistry 统一按名调用工具并把异常转成字符串。普通工具默认使用 180 秒兜底超时，Shell 另有 60 秒内部超时；`spawn_subagent` 由子 Agent 自身的回合上限管理，生图使用独立的单请求超时和整次任务预算。
 6. 工具结果加入 messages 后继续模型循环，直到最终回答、单轮超时、最大迭代数或熔断。
 
 跨轮历史使用单一 canonical API 形式：`assistant(tool_calls) → tool` 顺序自愈，孤立 tool 丢弃，缺失结果用固定占位补齐；assistant 顶层 `reasoning_content`（若供应商要求工具循环重放）会在同进程、JSONL 与重启恢复中一致保留，但绝不进入单个 `tool_calls` 元素。这样最后一次工具请求能够成为下一用户回合的精确消息前缀。
 
-每次 Provider 调用都会归一 OpenAI-compatible usage，并输出隐私安全的调用指标；压缩期间的 daily/历史摘要调用也带独立 `phase` 纳入同一回合。回合聚合只在所有调用都报告 cached tokens 时计算精确 `sum(cached)/sum(input)`。System/工具只记录短 SHA-256 hash，不记录其内容。流式路径请求 `include_usage`，不支持时降级并标为 unavailable。
+每次 Provider 调用都会归一 OpenAI-compatible usage，并输出隐私安全的调用指标；压缩期间的历史摘要调用也带独立 `phase` 纳入同一回合（TASK-006 起压缩不再调 daily）。回合聚合只在所有调用都报告 cached tokens 时计算精确 `sum(cached)/sum(input)`。System/工具只记录短 SHA-256 hash，不记录其内容。流式路径请求 `include_usage`，不支持时降级并标为 unavailable。
 
 内置能力包括文件读写/列目录、Shell、Web 搜索/抓取、技能枚举/加载、记忆检索、视觉理解、生图和临时子 Agent。MCP 工具使用 `{server}__{tool}` 命名。
 

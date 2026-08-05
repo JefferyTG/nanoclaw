@@ -1,14 +1,15 @@
 """每日记忆（Daily Memory）。
 
 把当天发生的重要事件追加到 ``memory/daily/YYYY-MM-DD.md``，按 ``## 分类`` 组织，
-append-only。**不暴露为工具**——仅在程序内部两个时机调用：
+append-only。**不暴露为工具**——仅在程序内部一个时机调用：
 
-1. ``/clear`` 清空会话前：总结当前会话重要事件，写入 daily；
-2. ``MemoryConsolidation`` 压缩前：把即将被压成摘要的旧消息里的重要事件落 daily。
+1. ``/clear`` 清空会话前：总结当前会话重要事件，写入 daily。
 
-设计原则（大道至简）：daily 是「事件留痕」，与 ``MemoryConsolidation`` 的「token
-压缩」职责不同——前者按天保存关键事实供日后检索，后者只是为腾 token 预算把
-旧消息压短。二者在压缩触发点协作，但不互相替代。
+（TASK-006 起压缩不再写 daily：压缩与长期记忆彻底解耦，压缩只生成当前会话
+摘要并写 HISTORY.md；daily 触发点只剩 ``/clear``。）
+
+设计原则（大道至简）：daily 是「事件留痕」（按天保存关键事实供日后检索），
+与 ``ContextCompactor`` 的「token 压缩」职责不同，二者不再协作。
 """
 
 import os
@@ -79,7 +80,7 @@ class DailyMemory:
 def _messages_to_text(messages: List[dict]) -> str:
     """把消息列表拼成可读文本，供摘要模型消费。
 
-    与 ``MemoryConsolidation._messages_to_text`` 同构：处理普通文本、纯工具调用、
+    与 ``ContextCompactor._messages_to_text`` 同构：处理普通文本、纯工具调用、
     工具返回结果三类内容，缺失字段降级为空串不抛异常。
     """
     parts: List[str] = []

@@ -32,7 +32,7 @@ from config import NanoClawConfig, load_config
 from main import format_context_usage
 from agent.context import ContextBuilder
 from agent.loop import AgentLoop
-from agent.memory import MemoryConsolidation
+from agent.memory import ContextCompactor
 from agent.tools.base import Tool
 from agent.tools.registry import ToolRegistry
 from providers.base import LLMProvider, LLMResponse, ToolCallRequest
@@ -140,10 +140,10 @@ class ContextBudgetConfigTests(unittest.TestCase):
         cfg = load_config("/nonexistent/nano/config.json")
         self.assertEqual(cfg.context_budget_tokens, 524288)
 
-    def test_budget_flows_into_memory_consolidation(self):
-        # MemoryConsolidation 构造器按 token_budget 生效（main.py 装配的等价路径）
-        memory = MemoryConsolidation(None, "/tmp", token_budget=524_288)  # type: ignore[arg-type]
-        self.assertEqual(memory.token_budget, 524_288)
+    def test_budget_flows_into_context_compactor(self):
+        # ContextCompactor 构造器按 token_budget 生效（main.py factory 装配的等价路径）
+        compactor = ContextCompactor(None, "/tmp", token_budget=524_288)  # type: ignore[arg-type]
+        self.assertEqual(compactor.token_budget, 524_288)
 
 
 # —— 测试替身 ——
@@ -185,10 +185,10 @@ def _make_loop(tmp, provider, *, budget=524_288, sink=None):
     sessions = SessionManager(tmp)
     tools = ToolRegistry()
     tools.freeze()
-    memory = MemoryConsolidation(provider, tmp, token_budget=budget)
+    compactor = ContextCompactor(provider, tmp, token_budget=budget)
     return AgentLoop(
         provider, tools, ContextBuilder(tmp), sessions,
-        session_key="cli:ctx", memory=memory,
+        session_key="cli:ctx", compactor=compactor,
     )
 
 
@@ -269,7 +269,7 @@ class UsageEventTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 LLMResponse(content="final", cache_usage=_usage(45_500, 37_300)),
             ])
-            memory = MemoryConsolidation(provider, tmp, token_budget=524_288)
+            compactor = ContextCompactor(provider, tmp, token_budget=524_288)
             events = []
 
             async def sink(event):
@@ -277,7 +277,7 @@ class UsageEventTests(unittest.IsolatedAsyncioTestCase):
 
             loop = AgentLoop(
                 provider, tools, ContextBuilder(tmp), sessions,
-                session_key="cli:ctx", memory=memory,
+                session_key="cli:ctx", compactor=compactor,
             )
             await loop.run("multi-call", stream_sink=sink)
 
@@ -370,7 +370,7 @@ class GetContextUsageTests(unittest.IsolatedAsyncioTestCase):
             provider = _RecordingProvider([])
             loop = AgentLoop(
                 provider, tools, ContextBuilder(tmp), sessions,
-                session_key="cli:ctx", memory=None,
+                session_key="cli:ctx", compactor=None,
             )
             usage = loop.get_context_usage()
             self.assertIsNone(usage["budget"])

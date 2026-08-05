@@ -6,7 +6,7 @@ from agent.cache_observability import PromptCacheObserver
 from agent.context import ContextBuilder
 from agent.imagestore import ImageStore
 from agent.loop import AgentLoop
-from agent.memory import MemoryConsolidation
+from agent.memory import ContextCompactor
 from agent.tools.base import Tool
 from agent.tools.registry import ToolRegistry
 from providers.base import LLMProvider, LLMResponse, ToolCallRequest
@@ -182,7 +182,7 @@ class PromptCacheLoopTests(unittest.IsolatedAsyncioTestCase):
                 ContextBuilder(tmp),
                 sessions,
                 session_key=key,
-                memory=MemoryConsolidation(provider, tmp, token_budget=20),
+                compactor=ContextCompactor(provider, tmp, token_budget=20),
                 cache_observer=observer,
             )
 

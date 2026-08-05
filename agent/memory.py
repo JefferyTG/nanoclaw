@@ -1,4 +1,4 @@
-"""会话记忆压缩（Memory Consolidation）。
+"""会话上下文压缩（Context Compaction）。
 
 当一轮对话的上下文消息接近模型上下文窗口上限时，把中间的「旧消息」压成一条
 摘要，从而在不丢失关键信息的前提下腾出 token 预算。
@@ -13,17 +13,23 @@
 数据落点：
     - 压缩后的摘要消息保留在内存 messages 中，供后续轮次使用；
     - 同一份摘要同步写入 HISTORY.md（带时间戳），作为可审计的长期记忆轨迹。
+
+职责边界（TASK-006 解耦）：
+    - 本模块只负责「当前会话上下文压缩」，与长期记忆管理（daily / USER /
+      MEMORY）彻底解耦：压缩不再写 daily，也不触碰任何长期记忆副作用；
+    - 压缩结果通过 ``CompactionResult`` 显式返回，调用方按返回值落盘与决策，
+      不依赖本模块的共享可变状态（无 ``last_estimate`` / ``last_consolidation``）。
 """
 
 import os
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Optional
 
 from providers.base import LLMProvider
 from providers.usage import PromptCacheUsage
 from agent.cache_observability import stable_text_hash
-from agent.daily import DailyMemory, summarize_messages_to_daily
 
 
 # 粗略 token 估算用：匹配 CJK 表意文字及中文常用标点/全角符号
@@ -49,25 +55,38 @@ _SUMMARY_INSTRUCTION = (
 )
 
 
-class MemoryConsolidation:
-    """按 token 预算对会话历史做增量压缩。"""
+@dataclass
+class CompactionResult:
+    """一次压缩尝试的结构化结果（显式返回，替代共享可变状态）。
+
+    字段说明：
+        messages: 压缩后应继续使用的消息列表；未压缩时与原列表为同一对象。
+        compacted: 是否真正发生了压缩。
+        estimated_tokens: 压缩前的估算 token 数。
+        token_budget: 本次压缩使用的 token 预算。
+        summarized_messages: 被压成摘要的旧消息条数（未压缩/摘要失败为 0）。
+        preserved_tail_messages: 保留的尾部消息条数（未压缩/摘要失败为 0）。
+    """
+    messages: List[dict]
+    compacted: bool
+    estimated_tokens: int
+    token_budget: int
+    summarized_messages: int = 0
+    preserved_tail_messages: int = 0
+
+
+class ContextCompactor:
+    """按 token 预算对会话历史做增量压缩（每会话独立实例，无跨会话共享状态）。"""
 
     def __init__(
         self,
         provider: LLMProvider,
         workspace: str,
         token_budget: int = 192_000,
-        daily_memory: Optional[DailyMemory] = None,
     ):
         self.provider = provider
         self.workspace = workspace
         self.token_budget = token_budget
-        # 每日记忆：压缩前把旧消息里的重要事件落 daily，避免关键事实随压缩丢失
-        self.daily_memory = daily_memory
-        # Read-only metadata for cache/operations observability.  It contains
-        # counts only, never prompt text, tool arguments, or image bytes.
-        self.last_estimate: dict = {}
-        self.last_consolidation: dict = {"consolidated": False}
 
     @staticmethod
     def _estimate_value(value) -> int:
@@ -86,10 +105,10 @@ class MemoryConsolidation:
         if isinstance(value, (int, float, bool)):
             return _count_text(str(value))
         if isinstance(value, list):
-            return 2 + sum(MemoryConsolidation._estimate_value(item) for item in value)
+            return 2 + sum(ContextCompactor._estimate_value(item) for item in value)
         if isinstance(value, dict):
             return 2 + sum(
-                _count_text(str(key)) + MemoryConsolidation._estimate_value(item)
+                _count_text(str(key)) + ContextCompactor._estimate_value(item)
                 for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
             )
         return _count_text(str(value))
@@ -112,51 +131,45 @@ class MemoryConsolidation:
                 total += _count_text(fn.get("name", ""))
                 total += _count_text(fn.get("arguments", "") or "")
         tool_tokens = self._estimate_value(tools) if tools else 0
-        self.last_estimate = {
-            "message_count": len(messages),
-            "tool_count": len(tools or []),
-            "message_tokens": total,
-            "tool_schema_tokens": tool_tokens,
-            "total_tokens": total + tool_tokens,
-        }
         total += tool_tokens
         return total
 
-    async def maybe_consolidate(
+    async def maybe_compact(
         self,
         messages: List[dict],
         tools: Optional[List[dict]] = None,
         cache_turn=None,
-    ) -> List[dict]:
+    ) -> CompactionResult:
         """若 messages 超出 token 预算，则把中间旧消息压缩成一条摘要。
 
         结构：保留 ``messages[0]``（system 提示）与末尾 6 条，中间的旧消息
         经 ``_summarize`` 压缩为单条 system 摘要消息；摘要同时追加写入
-        ``HISTORY.md``。预算内或无可压缩内容时，原样返回。
+        ``HISTORY.md``。预算内或无可压缩内容时，原样返回（``compacted=False``，
+        ``messages`` 与入参同一对象）。摘要失败时保留原历史，避免上下文丢失。
         """
         # 空列表直接返回，避免后续切片越界
-        self.last_consolidation = {"consolidated": False, "reason": "empty"}
         if not messages:
-            return messages
+            return CompactionResult(
+                messages=messages, compacted=False,
+                estimated_tokens=0, token_budget=self.token_budget,
+            )
 
         # 预算内：不压缩，原样返回
         estimated_tokens = self.estimate_tokens(messages, tools)
         if estimated_tokens <= self.token_budget:
-            self.last_consolidation = {
-                "consolidated": False, "reason": "within_budget",
-                "estimated_tokens": estimated_tokens, "token_budget": self.token_budget,
-            }
-            return messages
+            return CompactionResult(
+                messages=messages, compacted=False,
+                estimated_tokens=estimated_tokens, token_budget=self.token_budget,
+            )
 
         # 安全护栏：可压缩的中间部分至少需要 1 条，否则没必要压缩，
         # 也避免切片把首条 system 重复算进 tail 导致消息重复。
-        # （正常情况下，能超 192k 预算的对话长度必然远大于 7，这里只是兜底。）
+        # （正常情况下，能超预算的对话长度必然远大于 7，这里只是兜底。）
         if len(messages) <= 7:
-            self.last_consolidation = {
-                "consolidated": False, "reason": "no_stable_boundary",
-                "estimated_tokens": estimated_tokens, "token_budget": self.token_budget,
-            }
-            return messages
+            return CompactionResult(
+                messages=messages, compacted=False,
+                estimated_tokens=estimated_tokens, token_budget=self.token_budget,
+            )
 
         system_msg = messages[0]          # 第一条（system 提示），原样保留
         tail_start = max(1, len(messages) - 6)
@@ -167,30 +180,19 @@ class MemoryConsolidation:
         tail = messages[tail_start:]
         old_messages = messages[1:tail_start]
         if not old_messages:
-            self.last_consolidation = {
-                "consolidated": False, "reason": "no_stable_boundary",
-                "estimated_tokens": estimated_tokens, "token_budget": self.token_budget,
-            }
-            return messages
-
-        # 压缩前：把旧消息里的重要事件落 daily，避免关键事实随压缩丢失。
-        # daily 是 nice-to-have，失败不影响压缩主流程。
-        if self.daily_memory is not None:
-            await summarize_messages_to_daily(
-                self.provider, self.daily_memory, old_messages,
-                category="压缩前保存", cache_turn=cache_turn,
+            return CompactionResult(
+                messages=messages, compacted=False,
+                estimated_tokens=estimated_tokens, token_budget=self.token_budget,
             )
 
         summary = await self._summarize(old_messages, cache_turn=cache_turn)
         if not summary:
             # Context correctness wins over token pressure.  A failed summary
             # must not replace the only copy of the old conversation.
-            self.last_consolidation = {
-                "consolidated": False, "reason": "summary_failed",
-                "estimated_tokens": estimated_tokens, "token_budget": self.token_budget,
-                "candidate_messages": len(old_messages),
-            }
-            return messages
+            return CompactionResult(
+                messages=messages, compacted=False,
+                estimated_tokens=estimated_tokens, token_budget=self.token_budget,
+            )
 
         summary_msg = {
             "role": "system",
@@ -200,16 +202,14 @@ class MemoryConsolidation:
         # 摘要落盘（保留审计轨迹）
         self._save_to_history(summary, len(old_messages))
 
-        self.last_consolidation = {
-            "consolidated": True,
-            "estimated_tokens": estimated_tokens,
-            "token_budget": self.token_budget,
-            "preserved_head_messages": 1,
-            "preserved_tail_messages": len(tail),
-            "summarized_messages": len(old_messages),
-        }
-
-        return [system_msg, summary_msg] + tail
+        return CompactionResult(
+            messages=[system_msg, summary_msg] + tail,
+            compacted=True,
+            estimated_tokens=estimated_tokens,
+            token_budget=self.token_budget,
+            summarized_messages=len(old_messages),
+            preserved_tail_messages=len(tail),
+        )
 
     async def _summarize(self, messages: List[dict], cache_turn=None) -> Optional[str]:
         """把旧消息拼接成文本，调用模型生成 3-5 句话摘要。
@@ -278,7 +278,7 @@ class MemoryConsolidation:
         parts: List[str] = []
         for m in messages:
             role = m.get("role", "unknown")
-            content = MemoryConsolidation._summary_content(m.get("content"))
+            content = ContextCompactor._summary_content(m.get("content"))
 
             # 工具调用：简述调用的工具与参数（content 可能为空）
             for tc in m.get("tool_calls") or []:

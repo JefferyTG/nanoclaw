@@ -45,7 +45,7 @@ from agent.cache_observability import (
 )
 from agent.history import canonicalize_history
 from session.manager import SessionManager
-from agent.memory import MemoryConsolidation
+from agent.memory import CompactionResult, ContextCompactor
 from agent.memory_sync import (
     MemoryChangeLog,
     build_patch_message,
@@ -75,7 +75,7 @@ class AgentLoop:
         session_key: str = "cli:direct",
         model: Optional[str] = None,
         max_iterations: int = 32,
-        memory: Optional[MemoryConsolidation] = None,
+        compactor: Optional[ContextCompactor] = None,
         turn_timeout: int = 600,
         image_store=None,
         base_model_multimodal: bool = False,
@@ -93,8 +93,9 @@ class AgentLoop:
         # 整轮超时（秒）：任何一轮对话的墙钟耗时超过此值即强制终止并回传提示，
         # 防止「工具卡死 / 模型反复重试同一失败工具」导致回合永不结束、卡住会话。
         self.turn_timeout = turn_timeout
-        # 会话压缩器：为 None 时不启用压缩（保持向后兼容）
-        self.memory = memory
+        # 会话压缩器：为 None 时不启用压缩（保持向后兼容）；
+        # 每会话独立实例（TASK-006），压缩结果显式返回，无共享可变状态。
+        self.compactor = compactor
         # 图片存储：基础模型为多模态、需要把历史图片还原成多模态 content 时用
         self.image_store = image_store
         # 基础模型是否自带视觉：true→图片直传；false→抽走图片、用 ask_image 工具
@@ -109,6 +110,10 @@ class AgentLoop:
         # 回合内最后一次模型调用（CacheCallMetric），供 usage_turn 事件的
         # last_usage 使用：进度条「占用」沿用最近一次调用而非回合累计。
         self._last_call_metric: Optional[CacheCallMetric] = None
+        # 本轮压缩结果（TASK-006）：maybe_compact 的显式返回值暂存于此，
+        # 供 _sync_memory_patch 判断「历史压缩联动重建快照」；回合结束即过期，
+        # 属会话私有状态，不跨会话共享。
+        self._last_compaction: Optional[CompactionResult] = None
         # The return value is deliberately user-facing text, so callers such as
         # SpawnSubagentTool need a separate structured lifecycle outcome rather
         # than guessing timeout/error state from localized message strings.
@@ -348,14 +353,14 @@ class AgentLoop:
 
         供各渠道 ``/context`` 命令与 Web 进度条查询，不经过模型：
             - system_tokens / history_tokens / estimate_total：System 段与
-              会话历史（不含当前输入）的估算 token（复用 MemoryConsolidation
+              会话历史（不含当前输入）的估算 token（复用 ContextCompactor
               的 CJK 启发式，非精确 tokenizer）；
             - last_usage：上次完成回合的真实 usage（``input_tokens`` /
               ``cached`` / ``uncached`` / ``cache_ratio`` / ``availability``），
               尚无真实数据时为 ``None``；
             - budget / ratio：预算与估算占用比（未启用压缩器时均为 ``None``）。
         """
-        budget = self.memory.token_budget if self.memory is not None else None
+        budget = self.compactor.token_budget if self.compactor is not None else None
         system_tokens = None
         history_tokens = None
         try:
@@ -401,15 +406,15 @@ class AgentLoop:
 
     @staticmethod
     def _estimate_tokens_for(messages: list) -> int:
-        """按 MemoryConsolidation 的启发式估算消息 token（不污染其 last_estimate）。"""
+        """按 ContextCompactor 的启发式估算消息 token（不污染其 last_estimate）。"""
         total = 0
         for msg in messages:
             total += 4  # 每条消息的结构开销
-            total += MemoryConsolidation._estimate_value(msg.get("content"))
+            total += ContextCompactor._estimate_value(msg.get("content"))
             for tc in msg.get("tool_calls") or []:
                 fn = tc.get("function", {}) or {}
-                total += MemoryConsolidation._estimate_value(fn.get("name", ""))
-                total += MemoryConsolidation._estimate_value(
+                total += ContextCompactor._estimate_value(fn.get("name", ""))
+                total += ContextCompactor._estimate_value(
                     fn.get("arguments", "") or ""
                 )
         return total
@@ -425,7 +430,7 @@ class AgentLoop:
 
     def _build_usage_event(self, usage, messages, tools) -> Optional[dict]:
         """构造 ``{type: "usage", ...}`` 事件；真实 usage 缺失时回退估算。"""
-        budget = self.memory.token_budget if self.memory is not None else None
+        budget = self.compactor.token_budget if self.compactor is not None else None
         event: dict = {"type": "usage", "budget": budget}
         if usage is not None and usage.input_tokens is not None:
             event.update({
@@ -439,7 +444,7 @@ class AgentLoop:
         else:
             estimate = self._estimate_tokens_for(messages)
             if tools:
-                estimate += MemoryConsolidation._estimate_value(tools)
+                estimate += ContextCompactor._estimate_value(tools)
             event["estimate"] = estimate
             event["ratio"] = (estimate / budget) if budget else None
         return event
@@ -455,7 +460,7 @@ class AgentLoop:
           （last_usage / last_ratio），而不是回合累计——多轮调用累计可能超过
           预算，而进度条要反映的是当前上下文实际占用，而非整轮吞吐。
         """
-        budget = self.memory.token_budget if self.memory is not None else None
+        budget = self.compactor.token_budget if self.compactor is not None else None
         last_usage = None
         last_ratio = None
         last = self._last_call_metric
@@ -568,9 +573,9 @@ class AgentLoop:
             # changelog 有 revision 但落后区间无条目（理论不发生）：静默推进
             self._advance_memory_revision(global_rev)
             return
+        last_compaction = self._last_compaction
         consolidated = bool(
-            self.memory is not None
-            and self.memory.last_consolidation.get("consolidated", False)
+            last_compaction is not None and last_compaction.compacted
         )
         if self._should_rebuild_memory(entries, consolidated):
             self._rebuild_memory_snapshot(messages, global_rev)
@@ -693,6 +698,8 @@ class AgentLoop:
         self._cancel_history_recorded = False
         # 回合内最后一次模型调用观测，回合结束由 _build_turn_event 读取
         self._last_call_metric = None
+        # 本轮压缩结果置空（每回合私有状态，防止上一轮残留影响本轮判断）
+        self._last_compaction = None
         base_mm = self.base_model_multimodal
 
         # 1. 构建初始 messages（注入跨轮历史 + 当前输入）
@@ -716,23 +723,25 @@ class AgentLoop:
             history_messages=len(history_clean),
         )
         # 1.5 会话压缩：当估算 token 超预算时，把中间旧消息压成一条摘要。
-        #     MemoryConsolidation 仅在 messages 超出 token_budget 才触发压缩，
-        #     预算内原样返回；memory 为 None 表示未启用（保持向后兼容）。
-        if self.memory is not None:
-            compressed = await self.memory.maybe_consolidate(
+        #     ContextCompactor 仅在 messages 超出 token_budget 才触发压缩，
+        #     预算内原样返回；compactor 为 None 表示未启用（保持向后兼容）。
+        #     压缩结果通过 CompactionResult 显式返回，落盘判断用 result.compacted，
+        #     不再读取共享可变字段（TASK-006）。
+        if self.compactor is not None:
+            compaction = await self.compactor.maybe_compact(
                 messages, tools=tool_definitions, cache_turn=self._active_cache_turn
             )
-            if self.memory.last_consolidation.get("consolidated", False):
-                new_history = canonicalize_history(compressed[1:-1])
+            self._last_compaction = compaction
+            if compaction.compacted:
+                new_history = canonicalize_history(compaction.messages[1:-1])
                 self._session_history = new_history
                 self.session_manager.save_messages(self.session_key, new_history)
-                boundary = self.memory.last_consolidation
                 print(
                     f"\033[2;35m🗜️  会话历史已压缩：{len(messages)} 条 → "
-                    f"{len(compressed)} 条；估算 {boundary.get('estimated_tokens')} / "
-                    f"预算 {boundary.get('token_budget')} token\033[0m"
+                    f"{len(compaction.messages)} 条；估算 {compaction.estimated_tokens} / "
+                    f"预算 {compaction.token_budget} token\033[0m"
                 )
-            messages = compressed
+            messages = compaction.messages
         # 1.6 记忆跨会话同步（TASK-004）：全局 revision 落后时插入
         #     <memory_patch> system 消息（历史之后、本轮 user 之前），或
         #     累积过多时重建完整记忆快照。无变化时零注入（前缀缓存命中）。

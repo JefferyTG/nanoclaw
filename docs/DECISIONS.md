@@ -28,7 +28,8 @@
 | 跨轮与重启使用 canonical API 历史 | 有效 | 工具顺序自愈；顶层 reasoning 在当前工具循环、落盘和恢复中一致，确保只追加时维持精确前缀 |
 | 缓存观测只记录结构元数据 | 有效 | 调用/回合记录 token、hash、消息数和迭代；不记录 prompt/记忆/参数/密钥，回合比率按 token 总和加权 |
 | SQLite LIKE 代替 FTS5 | 有效 | 中文短词在 unicode61/trigram 下不可靠；当前个人数据量足够小 |
-| Daily Memory 是 best-effort 内部机制 | 有效 | `/clear` 和压缩不能被摘要失败阻塞 |
+| Daily Memory 是 best-effort 内部机制 | 有效 | `/clear` 不能被摘要失败阻塞；TASK-006 起压缩不再写 daily（见「压缩不再写 daily」决策行） |
+| 压缩不再写 daily（TASK-006 决策） | 有效 | 压缩与长期记忆彻底解耦：`ContextCompactor` 只生成当前会话摘要并写 HISTORY.md（审计轨迹），不再调用 `summarize_messages_to_daily`；daily 触发点只剩 `/clear`。代价：在「每日整理/做梦机制」落地前，压缩丢的事件不再留痕 daily（乖宝确认）。压缩结果经 `CompactionResult` 显式返回，压缩器每会话独立实例（2026-08-05） |
 | Skill 与人设解耦 | 有效 | Skill 写行为机制，具体口吻由 identity 决定 |
 | 视觉双路径 | 有效 | 基础模型多模态则直传；否则用 `ask_image` 调独立视觉模型 |
 | 生图服务完全配置化 | 有效 | 不在代码绑定特定服务商/模型；一个工具覆盖文生图、图生图、多源图 |
@@ -69,7 +70,7 @@
 | 记忆同步一刀切只同步 USER.md/MEMORY.md | 有效 | 不做「重要性」判断；daily/ 永不注入（需要时走 memory_search），规则简单、系统可执行 |
 | 记忆补丁角色用 system 而非 developer | 有效 | DeepSeek 不支持 developer 角色（已核实）；OpenAI 兼容 API 允许多条 system 消息（压缩摘要已有先例） | 渠道在会话内恒定，每轮注入是冗余的；快照零每轮 token、System Prompt 前缀稳定（Prompt Cache 友好）。渠道+用户已天然编码在 session_key（`channel:sender_id`）中，`make_agent_factory` 解析后注入 ContextBuilder，与 identity/USER/MEMORY 同构；时间戳因每轮变化仍走每轮前缀注入 |
 
-| 上下文预算动态配置 + 占用显示（TASK-005） | 有效 | `config.json` 的 `context_budget_tokens`（默认 524288=512k）作为 MemoryConsolidation 压缩阈值，替换硬编码 192k；旧配置缺字段回退默认值（向后兼容）。AgentLoop 每次模型响应后经 stream_sink 推 `{type:"usage",...}`（input/cached/uncached/budget/ratio/cache_ratio，无真实 usage 时回退估算）；新增公开方法 `get_context_usage()` 供 web/feishu/weixin/cli 的 `/context` 命令直接回复占用文本（不经模型）。Web 输入框上方渲染进度条 + 缓存命中率，随会话切换各自显示；无数据优雅降级。预算属启动期配置，改后需重启（2026-08-05） |
+| 上下文预算动态配置 + 占用显示（TASK-005） | 有效 | `config.json` 的 `context_budget_tokens`（默认 524288=512k）作为 ContextCompactor 压缩阈值，替换硬编码 192k；旧配置缺字段回退默认值（向后兼容）。AgentLoop 每次模型响应后经 stream_sink 推 `{type:"usage",...}`（input/cached/uncached/budget/ratio/cache_ratio，无真实 usage 时回退估算）；新增公开方法 `get_context_usage()` 供 web/feishu/weixin/cli 的 `/context` 命令直接回复占用文本（不经模型）。Web 输入框上方渲染进度条 + 缓存命中率，随会话切换各自显示；无数据优雅降级。预算属启动期配置，改后需重启（2026-08-05） |
 
 这些约定来自 `.workbuddy/memory/MEMORY.md` 和 2026-07-22 至 2026-07-26 的开发日志；原日志被 Git 忽略，因此本表是跨会话的正式摘录。
 
@@ -87,12 +88,13 @@
 | 07-30 | Prompt Cache 稳定前缀、时间工具、usage 观测 | 动态字段不能放在历史前；缓存缺失字段不能当作 0 命中；工具/图片缓存能力属于供应商边界 |
 | 08-05 | TASK-004 记忆跨会话同步：全局/会话 revision + changelog.jsonl + <memory_patch> 补丁注入与持久化 + 自写刷基线 + 快照重建 | 每轮必须保证的事要系统机制化，不能靠模型自觉（时间戳先例同理）；补丁插在历史之后、user 之前，破缓存量=补丁大小 |
 | 08-05 | TASK-003 实机验收补充：微信端 Agent 收到文件引用后自行 read_file/exec 读取，违背按需读取设计；行为约束补入渠道快照（`agent/context.py::_channel_section` 微信分支） | 代码层只能保证引用式传递，管不住模型行为；行为规则应放 System Prompt 渠道专属 section |
+| 08-05 | TASK-006 压缩器解耦：`MemoryConsolidation` 改名 `ContextCompactor`；压缩器改为每会话独立实例（无共享 `last_consolidation`/`last_estimate`）；`maybe_compact` 返回 `CompactionResult`；压缩不再写 daily（触发点只剩 `/clear`） | 共享可变状态是跨会话 Bug 之源，改显式返回值；「当前会话需要看多少上下文」与「系统以后该记住什么」彻底分离 |
 | 08-04 | 微信文件接收（TASK-003）：Bridge FILE 入站下载 → FileStore 按月归档 → content 只带引用 | 文件名不可信需消毒防穿越；文件大小需设上限防撑爆磁盘；命令消息保持纯文本判断不变；批量持久化需兼容旧批次缺 `files` 字段 |
 
 ## 4. 已替代或已核销的旧记录
 
 - “暂不支持多会话”已被 CLI、飞书和 Web 的多会话实现替代。
-- MemoryConsolidation “尚未接入 AgentLoop”和 token 估算 TODO 均已完成。
+- MemoryConsolidation（TASK-006 起改名 `ContextCompactor`）“尚未接入 AgentLoop”和 token 估算 TODO 均已完成。
 - Web 旧页显示 JSON、断线不重连、`web:web:` 双前缀、流式挂起无超时等问题已有对应修复，不能仅凭旧日志当作当前 Bug。
 - 历史日志对统一工具超时互相冲突；当前普通工具由 `ToolRegistry.execute()` 使用 180 秒兜底，Shell 另有 60 秒超时。子 Agent 由自身回合上限管理，生图由单请求超时和整次任务预算管理，避免普通工具上限提前截断长任务和重试。
 - 历史日志称最后提交无法 push；当前 Git 实测 `HEAD` 与 `origin/main` 均为 `0daefc4`，领先/落后为 `0/0`，此项已核销。
@@ -145,7 +147,7 @@
 | NC-LICENSE-001 | 微信社区基础缺少独立 LICENSE | 上游 `package.json` 声明 MIT，但仓库没有 LICENSE 文件；当前已固定来源/NOTICE，正式分发前仍需维护者或法律复核 |
 | NC-WEIXIN-001 | 微信真实端点未验收 | 自动化使用 fake iLink HTTP/CDN/clock/process；真实扫码、长轮询、图片和主动发送需用户授权后受控手工验收 |
 | NC-WEIXIN-002 | 微信主动发送需要历史 context token | 对端至少入站交互一次后才可发送；Bridge 按 account/user 持久化，V1 不绕过服务端这项协议约束 |
-| NC-CACHE-001 | 工具 Schema 与图片缓存存在供应商差异 | 本地只保证请求表示稳定并记录 hash；供应商可能不缓存工具或图片。图片缺失/变化与 MemoryConsolidation 摘要替换都会形成前缀断点 |
+| NC-CACHE-001 | 工具 Schema 与图片缓存存在供应商差异 | 本地只保证请求表示稳定并记录 hash；供应商可能不缓存工具或图片。图片缺失/变化与 ContextCompactor 摘要替换都会形成前缀断点 |
 
 ## 6. 运行和产品边界
 

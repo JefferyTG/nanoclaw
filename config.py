@@ -68,7 +68,7 @@ _CONFIG_FIELDS = (
     "web_host",
     "web_port",
     "turn_timeout_sec",
-    # 上下文 token 预算：MemoryConsolidation 的压缩阈值（启动期配置，改后需重启）。
+    # 上下文 token 预算：ContextCompactor 的压缩阈值（启动期配置，改后需重启）。
     "context_budget_tokens",
     "mcp_servers",
     # 多模态（视觉）模型：基础模型无视觉能力时，由 ask_image 工具把图片转交它理解
@@ -129,7 +129,7 @@ class NanoClawConfig:
     web_host: str = "0.0.0.0"        # 网页渠道监听地址（0.0.0.0 同局域网可达）
     web_port: int = 0                # 网页渠道端口；0 表示不启用网页渠道
     turn_timeout_sec: int = 600      # 单轮对话墙钟超时（秒）；超时强制终止，防卡死
-    context_budget_tokens: int = 524288  # 上下文 token 预算（MemoryConsolidation 压缩阈值；默认 512k）
+    context_budget_tokens: int = 524288  # 上下文 token 预算（ContextCompactor 压缩阈值；默认 512k）
     mcp_servers: dict = field(default_factory=dict)  # MCP Server 配置：{server_name: {command, args, env?, cwd?}}
     # 多模态（视觉）模型配置：基础模型为纯文本时，图片由 ask_image 工具转交该模型理解。
     # 三者皆空视为未配置；api_key 也可走环境变量 MULTIMODAL_API_KEY 覆盖。
