@@ -11,6 +11,7 @@
 交互命令（在 CLI 渠道内输入）：
     /exit   退出
     /clear  清空当前会话历史
+    /context  查看当前会话上下文占用
     /tools  查看已注册工具
 """
 
@@ -237,6 +238,7 @@ def build_weixin_channel(
     bind_callback=None,
     unbind_callback=None,
     suspend_callback=None,
+    context_callback=None,
 ):
     """Build the optional Weixin process adapter from startup-only settings."""
 
@@ -277,6 +279,7 @@ def build_weixin_channel(
         bind_callback=bind_callback,
         unbind_callback=unbind_callback,
         suspend_callback=suspend_callback,
+        context_callback=context_callback,
         # 默认值与 config.py / WeixinChannel 构造器一致（8.0 / 10），且不在组合根
         # 强转：非法值（如 "abc"）由构造器的 try/except 兜底，而不是在此抛 ValueError。
         image_merge_window_sec=settings.get("image_merge_window_sec", 8.0),
@@ -503,11 +506,12 @@ def build_shared() -> dict:
     daily_memory = DailyMemory(os.path.join(WORKSPACE, "workspace", "memory"))
 
     # 9) 会话压缩器（上下文超预算时把旧消息压成摘要，落到 workspace/memory/HISTORY.md）
-    #    token_budget 按 192k 估算 token 计；与 sessions 同级的 workspace/memory 目录。
+    #    token_budget 由 config.json 的 context_budget_tokens 动态配置（默认 512k），
+    #    与 sessions 同级的 workspace/memory 目录。旧配置缺字段时回退默认值。
     #    压缩前先把旧消息里的重要事件落 daily，避免关键事实随压缩丢失。
     memory = MemoryConsolidation(
         provider, os.path.join(WORKSPACE, "workspace"),
-        token_budget=192_000, daily_memory=daily_memory,
+        token_budget=config.context_budget_tokens, daily_memory=daily_memory,
     )
 
     return {
@@ -582,6 +586,53 @@ def make_agent_factory(shared: dict, registry: dict) -> callable:
         return agent
 
     return factory
+
+
+def _fmt_compact(value) -> str:
+    """把 token 数压缩成易读文本（>=1024 用二进制 k 单位，512k=524288）。
+
+    与任务卡示例一致：预算 524288 tokens 显示为 ``512k``。
+    """
+    if value is None:
+        return "0"
+    value = float(value)
+    if value >= 1024:
+        return f"{value / 1024:.1f}k"
+    return str(int(value))
+
+
+def format_context_usage(usage: dict) -> str:
+    """把 ``AgentLoop.get_context_usage()`` 结果格式化为用户可读文本。
+
+    /context 命令直接回复；Web 进度条另有前端渲染，不依赖本文本。
+    """
+    budget = usage.get("budget")
+    system_tokens = usage.get("system_tokens")
+    history_tokens = usage.get("history_tokens")
+    ratio = usage.get("ratio")
+    last = usage.get("last_usage") or {}
+    input_tokens = last.get("input_tokens")
+    cache_ratio = last.get("cache_ratio")
+
+    lines = ["当前会话上下文占用："]
+    if budget is not None:
+        lines.append(f"· 预算 {_fmt_compact(budget)}（{int(budget):,} tokens）")
+    else:
+        lines.append("· 预算：未启用上下文压缩")
+    if input_tokens is not None:
+        hit = (
+            f"（缓存命中 {cache_ratio * 100:.0f}%）"
+            if cache_ratio is not None else ""
+        )
+        lines.append(f"· 上次请求 input_tokens：{int(input_tokens):,}{hit}")
+    else:
+        lines.append("· 上次请求 input_tokens：暂无真实数据")
+    sys_part = _fmt_compact(system_tokens) if system_tokens is not None else "未知"
+    his_part = _fmt_compact(history_tokens) if history_tokens is not None else "未知"
+    lines.append(f"· 估算：System ~{sys_part} + 历史 ~{his_part}")
+    if ratio is not None:
+        lines.append(f"· 占用比：约 {ratio * 100:.1f}%")
+    return "\n".join(lines)
 
 
 async def amain() -> None:
@@ -736,6 +787,23 @@ async def amain() -> None:
 
     cli_channel._clear_callback = clear_callback
 
+    def context_callback(session_key: str) -> str:
+        """/context 命令回调：按完整 session_key 查询当前会话占用并返回文本。
+
+        直接从 ``agents_registry`` 取 AgentLoop 调用 ``get_context_usage()``，
+        不经过模型；Agent 尚未创建（如进程重启后还没聊过）时返回提示。
+        供 CLI/飞书/网页注入，微信经 ``build_weixin_channel`` 走同一回调。
+        """
+        agent = agents_registry.get(session_key)
+        if agent is None:
+            return "当前会话尚未开始对话，暂无占用数据。"
+        try:
+            return format_context_usage(agent.get_context_usage())
+        except Exception as exc:  # noqa: BLE001 - 查询失败只回提示，不扩散
+            return f"⚠️ 查询上下文占用失败：{exc}"
+
+    cli_channel._context_callback = context_callback
+
     # 组装所有启用的渠道。多实例由「不同文件夹 + 不同配置/端口」实现，
     # 本函数只负责按当前配置启用对应渠道。
     channels: list = []
@@ -746,6 +814,7 @@ async def amain() -> None:
     if sys.stdin.isatty():
         cli_channel.tool_names = tools.list_tools()
         cli_channel._clear_callback = clear_callback
+        cli_channel._context_callback = context_callback
         channels.append(cli_channel)
         cli_task_index = len(channels) - 1
 
@@ -766,6 +835,7 @@ async def amain() -> None:
             ),
         )
         feishu_channel._clear_callback = clear_callback  # 复用同一清空回调
+        feishu_channel._context_callback = context_callback  # /context 占用查询
         channels.append(feishu_channel)
         print("（飞书渠道：已启用·常开）")
     else:
@@ -788,6 +858,7 @@ async def amain() -> None:
             suspend_callback=(
                 reminder_service.suspend_weixin if reminder_service is not None else None
             ),
+            context_callback=context_callback,
         )
     except (TypeError, ValueError) as exc:
         print(f"[!] 微信渠道未启用：配置值无效（{exc}）")
@@ -810,6 +881,7 @@ async def amain() -> None:
             tts_service=shared["tts_service"],             # Web 新回复按需朗读；不进入会话历史
         )
         web_channel._clear_callback = clear_callback  # 复用同一清空回调
+        web_channel._context_callback = context_callback  # /context 占用查询
         channels.append(web_channel)
         print(f"（网页渠道：已启用·监听 http://{cfg.web_host}:{cfg.web_port}）")
     else:

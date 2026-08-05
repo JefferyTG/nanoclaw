@@ -75,6 +75,7 @@ class WebChannel(Channel):
         self._sessions: dict = {}         # conn_id -> {"seq": int, "current_key": str}
         self._lock = threading.Lock()     # 保护 _conns / _sessions 的跨线程访问
         self._clear_callback = None       # 清空历史回调（/clear 命令，同 CLI/飞书）
+        self._context_callback = None     # 上下文占用查询回调（/context 命令，同 CLI/飞书）
         self._index_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "webui", "index.html",
@@ -587,7 +588,7 @@ class WebChannel(Channel):
         """解析网页内置命令，返回回复文本；非命令返回 None（交给 Agent）。"""
         parts = text.split()
         cmd = parts[0]
-        if cmd not in ("/new", "/sessions", "/switch", "/clear", "/exit"):
+        if cmd not in ("/new", "/sessions", "/switch", "/clear", "/context", "/exit"):
             return None
         if cmd == "/exit":
             return "网页端常驻运行，无需退出。"
@@ -612,6 +613,12 @@ class WebChannel(Channel):
             if self._clear_callback is not None:
                 self._clear_callback(full_key)
             return f"会话 {full_key} 历史已清空"
+        if cmd == "/context":
+            # context_callback 按「完整 session_key」查找 Agent 查询占用；不经过模型
+            full_key = f"{self.name}:{st['current_key']}"
+            if self._context_callback is not None:
+                return self._context_callback(full_key)
+            return "当前实例未注入上下文占用回调。"
         return None
 
     async def _ws_send(self, ws, text: str) -> None:

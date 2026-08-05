@@ -29,6 +29,7 @@ class CLIChannel(Channel):
         # 以下两个属性由 main.py 在创建后注入，CLIChannel 自身不依赖 Agent
         self.tool_names: list = []          # 工具名列表（/tools 命令打印）
         self._clear_callback = None         # 清空历史回调（/clear 命令调用）
+        self._context_callback = None       # 上下文占用查询回调（/context 命令调用）
 
         # —— 多会话状态 ——
         # 会话以整数序号标识，sender_id="local{n}" -> Gateway 的 session_key
@@ -84,7 +85,8 @@ class CLIChannel(Channel):
     async def start(self) -> None:
         """终端交互循环：读输入、处理命令、投递消息、等待回复。"""
         print("（CLI 渠道已启动｜/exit 退出｜/clear 清当前会话｜/new 新会话"
-              "｜/sessions 列表｜/switch <n> 切换｜/tools 看工具）")
+              "｜/sessions 列表｜/switch <n> 切换｜/tools 看工具"
+              "｜/context 看占用）")
         while True:
             try:
                 line = await self._read_line()
@@ -104,6 +106,16 @@ class CLIChannel(Channel):
                 if self._clear_callback is not None:
                     self._clear_callback(f"cli:local{self._current_session}")
                 print(f"🧹 当前会话 #{self._current_session} 历史已清空")
+                continue
+            if text == "/context":
+                # 直接从回调查询当前会话占用并打印，不经过模型。
+                if self._context_callback is not None:
+                    reply = self._context_callback(
+                        f"cli:local{self._current_session}"
+                    )
+                    print(f"📊 {reply}")
+                else:
+                    print("📊 当前实例未注入上下文占用回调。")
                 continue
             if text == "/tools":
                 if self.tool_names:

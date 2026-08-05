@@ -120,6 +120,7 @@ class FeishuChannel(Channel):
         # _sessions: chat_id -> {"seq": 已建会话数, "current": 当前活动序号}
         self._sessions: dict = {}
         self._clear_callback = None    # 清空历史回调（/clear 命令调用，同 CLI）
+        self._context_callback = None  # 上下文占用查询回调（/context 命令调用，同 CLI）
         # ReminderService owns persistence and authorization; this channel only
         # recognizes deterministic p2p commands and forwards identity fields.
         self._bind_callback = bind_callback
@@ -221,6 +222,7 @@ class FeishuChannel(Channel):
                 "/sessions",
                 "/switch",
                 "/clear",
+                "/context",
                 "/bind-reminders",
                 "/unbind-reminders",
             ):
@@ -553,6 +555,7 @@ class FeishuChannel(Channel):
             "/sessions",
             "/switch",
             "/clear",
+            "/context",
             "/bind-reminders",
             "/unbind-reminders",
         ):
@@ -605,6 +608,12 @@ class FeishuChannel(Channel):
             if self._clear_callback is not None:
                 self._clear_callback(key)
             self._reply(chat_id, f"🧹 当前会话 #{st['current']} 历史已清空")
+        elif cmd == "/context":
+            key = f"{self.name}:{chat_id}:{st['current']}"
+            if self._context_callback is not None:
+                self._reply(chat_id, self._context_callback(key))
+            else:
+                self._reply(chat_id, "当前实例未注入上下文占用回调。")
         return True
 
     def _schedule_binding_callback(

@@ -87,6 +87,16 @@
   #bar #sendBtn.stop { background:#b13d4b; border-color:#e86b78; }
   #bar #sendBtn:disabled { opacity:.6; cursor:default; }
 
+  /* —— 上下文占用进度条（usage 流事件；无数据时隐藏，不报错）—— */
+  #ctxbar { padding:6px 16px 0; }
+  #ctxbar.ctx-hidden { display:none; }
+  .ctx-track { height:6px; border-radius:3px; background:var(--line); overflow:hidden; }
+  .ctx-fill { height:100%; width:0; border-radius:3px; background:var(--accent); transition:width .3s ease; }
+  .ctx-fill.warn { background:#d98c00; }
+  .ctx-fill.danger { background:#b13d4b; }
+  .ctx-meta { font-size:11px; color:var(--muted); margin-top:3px; white-space:nowrap;
+              overflow:hidden; text-overflow:ellipsis; }
+
   /* —— 待发送图片预览条（粘贴/选择后、发送前）—— */
   #attach { display:none; gap:8px; padding:8px 16px 0; flex-wrap:wrap; }
   #attach.show { display:flex; }
@@ -187,6 +197,10 @@
 </div>
 
     <div id="attach"></div>
+    <div id="ctxbar" class="ctx-hidden">
+      <div class="ctx-track"><div class="ctx-fill" id="ctxFill"></div></div>
+      <div class="ctx-meta" id="ctxMeta"></div>
+    </div>
     <div id="bar">
       <button id="attachBtn" title="上传图片（也可直接粘贴）">🖼</button>
       <input id="fileInput" type="file" accept="image/*" multiple style="display:none" />
@@ -680,10 +694,17 @@
     if (ev.type === 'session_changed') {
       stopTtsForTransition();
       currentKey = ev.key;
+      renderCtxBar();
       loadSessions();
       return;
     }
     var t = ev.type;
+    if (t === 'usage') {
+      // usage 是观测事件，不产生聊天回合；按当前会话保存并刷新进度条。
+      if (currentKey) usageByKey[currentKey] = ev;
+      renderCtxBar();
+      return;
+    }
     if (t === 'subagent_event') {
       if (!cur) { cur = newTurn(); updateSendBtn(); }
       onSubagentEvent(cur, ev);
@@ -1168,6 +1189,39 @@
   var newBtn = document.getElementById('newBtn');
   var currentKey = null;   // 当前激活的会话标识（后端 current_key）
 
+  // —— 上下文占用进度条（usage 流事件）：按会话各自保存，无数据时隐藏降级 ——
+  var ctxbar = document.getElementById('ctxbar');
+  var ctxFill = document.getElementById('ctxFill');
+  var ctxMeta = document.getElementById('ctxMeta');
+  var usageByKey = {};   // currentKey -> 最近一次 usage 事件
+
+  function fmtTokens(n) {
+    if (typeof n !== 'number' || !isFinite(n)) return '?';
+    return Number(n).toLocaleString('en-US');
+  }
+  function renderCtxBar() {
+    var u = currentKey ? usageByKey[currentKey] : null;
+    if (!u) { ctxbar.classList.add('ctx-hidden'); return; }
+    var ratio = (typeof u.ratio === 'number' && isFinite(u.ratio)) ? u.ratio : null;
+    var parts = [];
+    if (typeof u.input_tokens === 'number') {
+      parts.push('上次 input ' + fmtTokens(u.input_tokens));
+      if (typeof u.cache_ratio === 'number' && isFinite(u.cache_ratio)) {
+        parts.push('缓存命中 ' + (u.cache_ratio * 100).toFixed(0) + '%');
+      }
+    } else if (typeof u.estimate === 'number') {
+      parts.push('估算 ' + fmtTokens(u.estimate));
+    }
+    if (typeof u.budget === 'number') parts.push('预算 ' + fmtTokens(u.budget));
+    if (ratio != null) parts.push('占用 ' + (ratio * 100).toFixed(1) + '%');
+    ctxFill.style.width =
+      (ratio != null ? Math.min(100, Math.max(0, ratio * 100)) : 0).toFixed(1) + '%';
+    ctxFill.classList.toggle('warn', ratio != null && ratio >= 0.6 && ratio < 0.85);
+    ctxFill.classList.toggle('danger', ratio != null && ratio >= 0.85);
+    ctxMeta.textContent = parts.length ? parts.join(' · ') : '上下文占用';
+    ctxbar.classList.remove('ctx-hidden');
+  }
+
   function relTime(iso) {
     if (!iso) return '';
     var t = new Date(iso);
@@ -1222,6 +1276,7 @@
     ws.send(JSON.stringify({ ctl: true, type: 'open', key: key }));
     fetch('/api/session?key=' + encodeURIComponent(key)).then(function (r) { return r.json(); }).then(function (d) {
       currentKey = key;
+      renderCtxBar();
       chat.innerHTML = '';
       nearBottom = true;   // 历史回放从底部开始跟随
       cur = null;
@@ -1243,6 +1298,7 @@
     cur = null;
     updateSendBtn();
     currentKey = null;
+    renderCtxBar();
   }
 
   // 删除会话：同时删本地 JSONL 文件；若正打开则自动新建一个
@@ -1253,6 +1309,7 @@
     fetch('/api/session?key=' + encodeURIComponent(key), { method: 'DELETE' })
       .then(function (r) { return r.json(); }).then(function (d) {
         if (d && d.ok) {
+          delete usageByKey[key];
           if (key === currentKey) { currentKey = null; newSession(); }
           loadSessions();
         } else { alert('删除失败：' + ((d && d.error) || '')); }

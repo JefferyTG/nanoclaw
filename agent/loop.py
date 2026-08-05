@@ -312,6 +312,106 @@ class AgentLoop:
                 self.last_cache_metrics = self._active_cache_turn.finish()
                 self._active_cache_turn = None
 
+    def get_context_usage(self) -> dict:
+        """当前会话上下文占用概览（估算 + 上次真实 usage）。
+
+        供各渠道 ``/context`` 命令与 Web 进度条查询，不经过模型：
+            - system_tokens / history_tokens / estimate_total：System 段与
+              会话历史（不含当前输入）的估算 token（复用 MemoryConsolidation
+              的 CJK 启发式，非精确 tokenizer）；
+            - last_usage：上次完成回合的真实 usage（``input_tokens`` /
+              ``cached`` / ``uncached`` / ``cache_ratio`` / ``availability``），
+              尚无真实数据时为 ``None``；
+            - budget / ratio：预算与估算占用比（未启用压缩器时均为 ``None``）。
+        """
+        budget = self.memory.token_budget if self.memory is not None else None
+        system_tokens = None
+        history_tokens = None
+        try:
+            system_prompt = self.context.build_system_prompt()
+            system_tokens = self._estimate_tokens_for(
+                [{"role": "system", "content": system_prompt}]
+            )
+            history_clean = [
+                self._history_item_to_api(m, self.base_model_multimodal)
+                for m in self._session_history
+            ]
+            history_tokens = self._estimate_tokens_for(history_clean)
+        except Exception:  # noqa: BLE001 - 估算失败只降级为 None，不阻断查询
+            logger.exception("上下文占用估算失败，session_key=%s", self.session_key)
+
+        estimate_total = (
+            (system_tokens or 0) + (history_tokens or 0)
+            if system_tokens is not None or history_tokens is not None
+            else None
+        )
+        ratio = (estimate_total / budget) if (budget and estimate_total) else None
+
+        last = self.last_cache_metrics
+        last_usage = None
+        if last is not None:
+            last_usage = {
+                "input_tokens": last.input_tokens,
+                "cached": last.cached_input_tokens,
+                "uncached": last.uncached_input_tokens,
+                "cache_ratio": last.cache_ratio,
+                "availability": last.availability,
+            }
+
+        return {
+            "budget": budget,
+            "system_tokens": system_tokens,
+            "history_tokens": history_tokens,
+            "estimate_total": estimate_total,
+            "ratio": ratio,
+            "last_usage": last_usage,
+        }
+
+    @staticmethod
+    def _estimate_tokens_for(messages: list) -> int:
+        """按 MemoryConsolidation 的启发式估算消息 token（不污染其 last_estimate）。"""
+        total = 0
+        for msg in messages:
+            total += 4  # 每条消息的结构开销
+            total += MemoryConsolidation._estimate_value(msg.get("content"))
+            for tc in msg.get("tool_calls") or []:
+                fn = tc.get("function", {}) or {}
+                total += MemoryConsolidation._estimate_value(fn.get("name", ""))
+                total += MemoryConsolidation._estimate_value(
+                    fn.get("arguments", "") or ""
+                )
+        return total
+
+    async def _emit_usage_event(self, stream_sink, usage, messages, tools) -> None:
+        """每次模型响应后向流式 sink 推送 usage 事件；失败只记日志不影响回合。"""
+        try:
+            event = self._build_usage_event(usage, messages, tools)
+            if event is not None:
+                await stream_sink(event)
+        except Exception:  # noqa: BLE001 - 观测事件失败不能影响对话主流程
+            logger.exception("推送 usage 事件失败，session_key=%s", self.session_key)
+
+    def _build_usage_event(self, usage, messages, tools) -> Optional[dict]:
+        """构造 ``{type: "usage", ...}`` 事件；真实 usage 缺失时回退估算。"""
+        budget = self.memory.token_budget if self.memory is not None else None
+        event: dict = {"type": "usage", "budget": budget}
+        if usage is not None and usage.input_tokens is not None:
+            event.update({
+                "input_tokens": usage.input_tokens,
+                "cached": usage.cached_input_tokens,
+                "uncached": usage.uncached_input_tokens,
+                "cache_ratio": usage.cache_ratio,
+            })
+            event["ratio"] = (usage.input_tokens / budget) if budget else None
+            event["estimate"] = None
+        else:
+            estimate = self._estimate_tokens_for(messages)
+            if tools:
+                estimate += MemoryConsolidation._estimate_value(tools)
+            event["estimate"] = estimate
+            event["ratio"] = (estimate / budget) if budget else None
+        return event
+
     def _record_cancelled_turn(self) -> None:
         """网页「停止」取消回合后，把本轮 user 消息与中断占位 assistant 补进历史。
 
@@ -640,6 +740,16 @@ class AgentLoop:
                 getattr(response, "cache_usage", PromptCacheUsage()),
                 tool_iteration=tool_iteration,
             )
+
+            # 每次模型响应后推送 usage 事件（Web 进度条 / 缓存命中率实时更新）。
+            # 真实 usage 缺失时回退到估算；推送失败只记日志，不影响回合。
+            if stream_sink is not None:
+                await self._emit_usage_event(
+                    stream_sink,
+                    getattr(response, "cache_usage", PromptCacheUsage()),
+                    messages,
+                    tool_definitions,
+                )
 
             # b. 模型侧异常：直接退出返回错误信息。流式与离散路径都要补 done，
             # 否则网页端收不到「收尾」事件会一直停在「思考中」。

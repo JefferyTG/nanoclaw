@@ -69,6 +69,8 @@
 | 记忆同步一刀切只同步 USER.md/MEMORY.md | 有效 | 不做「重要性」判断；daily/ 永不注入（需要时走 memory_search），规则简单、系统可执行 |
 | 记忆补丁角色用 system 而非 developer | 有效 | DeepSeek 不支持 developer 角色（已核实）；OpenAI 兼容 API 允许多条 system 消息（压缩摘要已有先例） | 渠道在会话内恒定，每轮注入是冗余的；快照零每轮 token、System Prompt 前缀稳定（Prompt Cache 友好）。渠道+用户已天然编码在 session_key（`channel:sender_id`）中，`make_agent_factory` 解析后注入 ContextBuilder，与 identity/USER/MEMORY 同构；时间戳因每轮变化仍走每轮前缀注入 |
 
+| 上下文预算动态配置 + 占用显示（TASK-005） | 有效 | `config.json` 的 `context_budget_tokens`（默认 524288=512k）作为 MemoryConsolidation 压缩阈值，替换硬编码 192k；旧配置缺字段回退默认值（向后兼容）。AgentLoop 每次模型响应后经 stream_sink 推 `{type:"usage",...}`（input/cached/uncached/budget/ratio/cache_ratio，无真实 usage 时回退估算）；新增公开方法 `get_context_usage()` 供 web/feishu/weixin/cli 的 `/context` 命令直接回复占用文本（不经模型）。Web 输入框上方渲染进度条 + 缓存命中率，随会话切换各自显示；无数据优雅降级。预算属启动期配置，改后需重启（2026-08-05） |
+
 这些约定来自 `.workbuddy/memory/MEMORY.md` 和 2026-07-22 至 2026-07-26 的开发日志；原日志被 Git 忽略，因此本表是跨会话的正式摘录。
 
 ## 3. 演进时间线

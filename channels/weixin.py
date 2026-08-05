@@ -198,6 +198,7 @@ class WeixinChannel(Channel):
         bind_callback=None,
         unbind_callback=None,
         suspend_callback=None,
+        context_callback=None,
     ) -> None:
         super().__init__(name=name, bus=bus)
         if not bridge_command:
@@ -261,6 +262,9 @@ class WeixinChannel(Channel):
         self._bind_callback = bind_callback
         self._unbind_callback = unbind_callback
         self._suspend_callback = suspend_callback
+        # 上下文占用查询回调（/context 命令）：main.py 注入，返回当前会话占用文本。
+        # 与提醒命令回调同构——本渠道只做命令识别与文本直通，不经过模型。
+        self._context_callback = context_callback
 
     @property
     def image_merge_window_sec(self) -> float:
@@ -811,9 +815,13 @@ class WeixinChannel(Channel):
         # These are deliberately exact, text-only commands.  In particular a
         # command with an image remains an ordinary image turn, so it cannot
         # unexpectedly bind a reminder target or consume a pending batch.
-        if not data.get("images") and text in {"/bind-reminders", "/unbind-reminders", "/new"}:
+        if not data.get("images") and text in {
+            "/bind-reminders", "/unbind-reminders", "/new", "/context"
+        }:
             if text == "/new":
                 await self._handle_new_command(account_id, user_id, target)
+            elif text == "/context":
+                await self._handle_context_command(target, sequence)
             else:
                 await self._handle_reminder_command(target, text)
             return True
@@ -955,6 +963,34 @@ class WeixinChannel(Channel):
             channel=self.name,
             chat_id=target,
             content=f"🆕 已新建会话 #{st['current']}（旧会话已保留）",
+        ))
+
+    async def _handle_context_command(self, target: str, sequence: int) -> None:
+        """/context：查询当前会话上下文占用并直接回复（不经 Agent）。
+
+        sender_id 与普通文本一致（会话 0 无后缀），确保 Gateway 能按完整
+        session_key 从缓存找到对应的 AgentLoop。回调失败只回复通用提示，
+        不泄露内部异常细节。
+        """
+        sender_id = self._session_sender_id(target, sequence)
+        session_key = f"{self.name}:{sender_id}"
+        if self._context_callback is None:
+            outcome = "当前实例未注入上下文占用回调。"
+        else:
+            try:
+                result = self._context_callback(session_key)
+                outcome = await result if inspect.isawaitable(result) else result
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("failed to query Weixin context usage: %s", exc)
+                outcome = "⚠️ 查询上下文占用失败，请稍后重试。"
+            if not isinstance(outcome, str) or not outcome:
+                outcome = "⚠️ 查询上下文占用失败，请稍后重试。"
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=self.name,
+            chat_id=target,
+            content=outcome,
         ))
 
     async def _suspend_reminders(self) -> None:
