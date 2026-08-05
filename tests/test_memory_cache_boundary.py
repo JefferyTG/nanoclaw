@@ -219,9 +219,9 @@ class ContextCompactorTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result.compacted)
             mock_append.assert_not_called()
             mock_summarize.assert_not_called()
-            # 压缩只写 HISTORY.md（审计轨迹），不创建 daily 目录
+            # TASK-011：压缩不再写 HISTORY.md（审计文件移除），也不创建 daily 目录
             history_path = os.path.join(tmp, "memory", "HISTORY.md")
-            self.assertTrue(os.path.exists(history_path))
+            self.assertFalse(os.path.exists(history_path))
             daily_dir = os.path.join(tmp, "memory", "daily")
             self.assertFalse(os.path.exists(daily_dir))
 

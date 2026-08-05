@@ -5,6 +5,7 @@
   "subagent_model": "",
   "workspace": ".",
   "timezone": "Asia/Shanghai",
+  "dream_time": "02:00",
   "max_iterations": 32,
   "identity_file": "identity.md",
   "feishu_app_id": "",

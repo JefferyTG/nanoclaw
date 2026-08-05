@@ -51,6 +51,7 @@ flowchart LR
     STATE["Session / Memory / Image state"]
     MCP["MCP Servers"]
     REM["ReminderScheduler\nSQLite / RRULE / lease"]
+    DREAM["DreamScheduler\n每日做梦整理"]
 
     Channels <--> BUS
     WX <--> WXBR
@@ -63,6 +64,8 @@ flowchart LR
     TOOLS <--> MCP
     TOOLS --> REM
     REM --> BUS
+    DREAM --> STATE
+    DREAM --> BUS
 ```
 
 依赖方向的核心约束：
@@ -73,12 +76,13 @@ flowchart LR
 - AgentLoop 依赖 Provider 抽象、ToolRegistry、ContextBuilder、SessionManager 和每会话独立的 ContextCompactor（TASK-006 起不再共享压缩器实例）。
 - 具体工具才依赖 `httpx`、`ddgs`、MCP 等外部能力。
 - ReminderScheduler 只依赖异步仓储协议、Agent runner 和 Bus delivery 回调；SQLite 是任务事实源。
+- DreamScheduler 是独立 asyncio 后台 task，直接消费 SessionManager/DailyMemory/Provider，与 ReminderScheduler 并存互不影响。
 
 ## 4. 目录和模块职责
 
 ```text
 nanoclaw/
-├── main.py                 # 装配入口、共享对象、渠道和生命周期
+├── main.py                 # 装配入口、共享对象、渠道和生命周期；DreamScheduler/DreamState 装配与启动补做
 ├── gateway.py              # 入站调度、会话锁、出站/流事件路由
 ├── config.py               # 默认值 → config.json → 环境变量
 ├── config.example.json     # 可提交的配置模板
@@ -86,8 +90,8 @@ nanoclaw/
 │   ├── loop.py             # 核心 ReAct、工具循环、流式事件、持久化
 │   ├── context.py          # System Prompt 与 messages 构建
 │   ├── identity.py         # 缺失人设时的跨渠道首次引导与原子落盘
-│   ├── memory.py           # 超预算历史压缩与 HISTORY.md
-│   ├── daily.py            # /clear 的 best-effort 每日摘要（压缩不再写 daily，TASK-006）
+│   ├── memory.py           # 超预算历史压缩（TASK-011 起压缩摘要不再写 HISTORY.md）
+│   ├── daily.py            # 每日记忆：/clear 摘要 append + 每日做梦整理（固定分类/去重/合并更新，TASK-011）
 │   ├── search.py           # SQLite + LIKE 记忆/会话检索
 │   ├── imagestore.py       # 按会话保存、解析和删除图片
 │   ├── skills.py           # 扫描与解析 SKILL.md
@@ -127,7 +131,7 @@ nanoclaw/
 4. MCPClientManager 按配置拉起 stdio Server，并把远端工具包装进同一个 ToolRegistry。
 5. 根据终端、飞书凭证、`weixin.enabled` 和 `web_port` 启用 Channel。微信启用时
    额外启动一个 Node Bridge；Python 只传状态/受控图片目录，不接触登录秘密。
-6. 启动渠道任务、Gateway 的入站/出站/流事件消费循环，以及单一 ReminderScheduler；关闭时先停止调度器，再停止出站分发和渠道。
+6. 启动渠道任务、Gateway 的入站/出站/流事件消费循环、单一 ReminderScheduler 与 DreamScheduler（每日做梦整理）；启动时若昨日未做整理（`dream_state.json` 的 `last_dream_date` 早于昨天）会异步补做前一天。关闭时先停止调度器，再停止出站分发和渠道。
 
 若配置的人设文件不存在或为空，Gateway 会在创建会话 Agent 前调用实例级 `IdentityBootstrapper`。首条消息只触发询问，同一会话下一条文本生成工作区内的人设文件；引导消息不调用模型、不进入会话历史。ContextBuilder 在会话创建时读取 identity、USER、MEMORY 与场景 Agent 摘要并形成稳定快照；新会话或 `/clear` 才显式刷新。Skill 摘要继续是进程启动快照，修改后需重启。多渠道并发由 Bootstrapper 的实例级锁协调，任一渠道完成后其它渠道直接进入正常流程。
 
@@ -139,7 +143,7 @@ Linux 后台控制脚本通过 `setsid` 建立独立进程组，并用 PID 文�
 
 ASR 在启动期按 `asr_model` 配置装配并只注入 WebChannel。浏览器把完整录音上传到独立 HTTP 端点，WebChannel 在主事件循环调用共享转写服务；成功且非空的文本再通过原有 WebSocket 文本入口进入 MessageBus。音频字节、临时路径和 Provider 原始响应均不进入 Bus 或会话持久化。
 
-TTS 同样在启动期按 `tts_model` 装配并只注入 WebChannel，但不进入 MessageBus。网页仅在用户主动开启朗读后，从实时 Agent `token/done` 事件按标点和长度切分新回复，经独立 HTTP 端点合成短 MP3；当前片段播放时预合成下一片段。关闭朗读、发送新消息、切换会话或断线会取消请求并清空播放状态，历史回放不会触发 TTS。
+TTS 同样在启动期按 `tts_model` 配置装配并只注入 WebChannel，但不进入 MessageBus。网页仅在用户主动开启朗读后，从实时 Agent `token/done` 事件按标点和长度切分新回复，经独立 HTTP 端点合成短 MP3；当前片段播放时预合成下一片段。关闭朗读、发送新消息、切换会话或断线会取消请求并清空播放状态，历史回放不会触发 TTS。
 
 飞书图片沿用同一套渠道无关协议。入站 `image` 事件先建立按 chat、会话序号和发送者隔离的待处理批次，再用消息 ID 与 `image_key` 调飞书鉴权资源接口下载；校验通过后保存到共享 `ImageStore`。批次默认等待 10 秒接收后续文字，连续图片会重置计时；文字到达或计时结束后，整批图片作为一条 `InboundMessage.images` 进入既有视觉链路。下载期间即使用户切换会话，图片仍归属事件到达时的会话序号。出站时 `AgentLoop` 汇总本轮（含子 Agent）生成的图片 ID，Gateway 在原会话中解析为 `ImageRef` 并放入 `OutboundMessage.images`；飞书 Channel 上传图片取得 `image_key` 后发送 `image` 消息。Web 上传本身就是单条图文消息，不使用飞书的等待合并机制；Web 的图片展示继续使用流事件，不重复消费最终出站图片。
 
@@ -219,7 +223,8 @@ workspace/
 ├── memory/
 │   ├── USER.md
 │   ├── MEMORY.md
-│   ├── HISTORY.md
+│   ├── HISTORY.md          # TASK-011 起不再写入（旧文件保留）
+│   ├── dream_state.json    # 每日做梦整理状态（last_dream_date，TASK-011）
 │   ├── followups.jsonl
 │   ├── daily/YYYY-MM-DD.md
 │   └── index.db
@@ -234,13 +239,30 @@ workspace/
 - 图片只落原始字节和轻量引用，不把 base64 写进 JSONL。
 - 多模态历史在文件仍存在时按原字节重建，因此进程重启前后 API 形态一致；文件删除/变化是显式内容边界，且供应商是否缓存图片未知。
 - 子 Agent 图片沿用父会话 key；父 `assistant(tool_calls)` 记录保存有界的 `subagent_runs` 回放摘要和 `generated_images`。这些 UI 元数据在恢复模型上下文前会被剥离。
-- USER 偏长期个人信息，MEMORY 偏项目/工作事实，HISTORY 保存压缩轨迹，daily 保存 best-effort 事件摘要。
+- USER 偏长期个人信息，MEMORY 偏项目/工作事实；HISTORY 曾保存压缩轨迹（TASK-011 起不再写入，旧文件保留）；daily 保存 best-effort 事件摘要——`/clear` 追加写入 + 每日做梦整理（固定分类、去重、合并更新）。
 - MemorySearcher 启动时重建全部索引；每次搜索只刷新记忆文件部分，会话索引在当前进程内不会实时更新。
 - Weixin 状态目录为 `0700`，状态文件原子替换。context token 按 account/user
   持久化；一批入站先保存 context、发事件并等待 Python ack，整批完成后才提交
   去重 ID 和 cursor。崩溃语义为 at-least-once：允许重复，不允许先推进 cursor
   导致静默丢消息。`-14` 表示凭据代次失效，会同时清除当前 account、cursor、
   context 和去重状态；重新扫码后必须由对端再次交互，不能复用旧代次 token。
+
+#### 每日做梦整理（TASK-011）
+
+`DreamScheduler` 在 `main.py` 中独立装配为一个 asyncio 后台 task：到
+`dream_time`（默认 02:00，可注入时钟）触发一次整理，整理**当天**各会话发生
+的事件；晚启动则立即补跑当天一次。启动时 `DreamState` 检查
+`workspace/memory/dream_state.json` 的 `last_dream_date`：若早于昨天（或无记录），
+异步补做**前一天**（只补最近 1 天、超期不回溯；状态单调前进，模型失败不更新
+状态以便重启重试）。
+
+数据源是 `collect_messages_for_date` 枚举各会话 JSONL 取该日消息（过滤
+`<memory_patch>`/`<memory_snapshot>` 内部消息）+ 该日 daily 已有内容；经
+`dream_consolidate` 调模型按固定分类（`## 用户变化 / ## 项目进展 / ## 会话总结`）
+提取后由 `DailyMemory.write_dream` 合并写回：固定分类标题只出现一次、新事实按
+「规范化行内容哈希」与文件内已有内容跨分类去重、非固定分类历史内容原样保留。
+整理异步执行、失败静默，不阻塞聊天或启动；与 ReminderScheduler 独立 task
+互不影响。
 
 ### 5.5 主动提醒与定时 Agent
 
@@ -302,6 +324,7 @@ at-least-once：若进程在渠道接受后、SQLite 成功提交前崩溃，重
 - `timezone` 是实例默认 IANA 时区；`get_current_time` 在启动时校验，修改后需重启。
 - `asr_model` 和 `tts_model` 都是启动期服务配置；页面的 TTS 喇叭开关只是当前标签页内存状态，刷新后默认关闭。
 - `reminders` 的数据库路径、超时、lease、校时与尝试上限都是启动期配置；Web 保存后需重启。
+- `dream_time` 是每日做梦整理时刻，属启动期配置；Web 保存后需重启。
 - `weixin` 的 Bridge 命令、state dir、allowlist、IPC/登录/图片上限均为启动期配置；
   状态秘密不属于 `config.json`，加载/保存都会过滤 Bridge 独占字段。
 

@@ -29,7 +29,9 @@
 | 缓存观测只记录结构元数据 | 有效 | 调用/回合记录 token、hash、消息数和迭代；不记录 prompt/记忆/参数/密钥，回合比率按 token 总和加权 |
 | SQLite LIKE 代替 FTS5 | 有效 | 中文短词在 unicode61/trigram 下不可靠；当前个人数据量足够小 |
 | Daily Memory 是 best-effort 内部机制 | 有效 | `/clear` 不能被摘要失败阻塞；TASK-006 起压缩不再写 daily（见「压缩不再写 daily」决策行） |
-| 压缩不再写 daily（TASK-006 决策） | 有效 | 压缩与长期记忆彻底解耦：`ContextCompactor` 只生成当前会话摘要并写 HISTORY.md（审计轨迹），不再调用 `summarize_messages_to_daily`；daily 触发点只剩 `/clear`。代价：在「每日整理/做梦机制」落地前，压缩丢的事件不再留痕 daily（乖宝确认）。压缩结果经 `CompactionResult` 显式返回，压缩器每会话独立实例（2026-08-05） |
+| 压缩不再写 daily（TASK-006 决策） | 有效 | 压缩与长期记忆彻底解耦：`ContextCompactor` 只生成当前会话摘要并写 HISTORY.md（审计轨迹），不再调用 `summarize_messages_to_daily`；daily 触发点只剩 `/clear`。代价：在「每日整理/做梦机制」落地前，压缩丢的事件不再留痕 daily（乖宝确认）。压缩结果经 `CompactionResult` 显式返回，压缩器每会话独立实例（2026-08-05）。TASK-011 起压缩摘要也不再写 HISTORY.md（见「HISTORY.md 移除」决策行），daily 触发点变为 `/clear` + 每日做梦整理 |
+| HISTORY.md 移除（TASK-011 决策） | 有效 | 压缩审计文件用处不大（乖宝 2026-08-05 拍板）：`ContextCompactor._save_to_history` 删除，压缩摘要仍以 system 消息进上下文，但不再落 `workspace/memory/HISTORY.md`；历史遗留旧文件保留不清理（清理与否乖宝再定）。代价：压缩审计轨迹能力消失，如后续需要可改为可配置开关 |
+| 每日做梦整理（TASK-011 决策） | 有效 | 每天 `dream_time`（默认 02:00）定时把当天各会话关键消息经模型按固定分类（`## 用户变化 / ## 项目进展 / ## 会话总结`，可配置）整理，合并更新写入当天 daily：写入前行哈希去重（模型语义去重 + 行哈希兜底）、固定分类标题不再无限堆叠；定时时刻实例未启动则下次启动补做前一天（`workspace/memory/dream_state.json` 记 `last_dream_date`，只补最近 1 天、超期不回溯）；整理异步执行、失败静默，不阻塞聊天/启动；独立 asyncio task 与 ReminderScheduler 并存互不影响；`dream_time` 属启动期配置，缺省回退默认值（与 `context_budget_tokens` 同款容错） |
 | 压缩→无条件重建完整快照（TASK-007 决策） | 有效 | 压缩发生 = 前缀缓存已破，`_sync_memory_patch` 不再因「revision 已最新（本会话自写已刷基线）」或「无落后 entries」提前 return，无条件执行 `_rebuild_memory_snapshot`：读磁盘最新 USER.md/MEMORY.md 生成 <memory_snapshot> 替换历史里旧补丁，模型上下文始终有完整记忆。**与 GPT 方案 §4.5「压缩不参与快照重建判断」相反**：压缩后补丁消息可能已被摘要吞掉，靠 entries 判断会漏（模型只剩摘要残影）；塞一条完整快照是破缓存后的免费增量。重建读磁盘不依赖 entries，revision 不落后也安全（`_advance_memory_revision` 幂等）。未压缩时行为不变（零注入/补丁/快照按原阈值）。`_should_rebuild_memory` 中 `consolidated` 提升为决定性条件（2026-08-05，TASK-007，待乖宝验收） |
 | Skill 与人设解耦 | 有效 | Skill 写行为机制，具体口吻由 identity 决定 |
 | 视觉双路径 | 有效 | 基础模型多模态则直传；否则用 `ask_image` 调独立视觉模型 |
@@ -92,6 +94,7 @@
 | 08-05 | TASK-006 压缩器解耦：`MemoryConsolidation` 改名 `ContextCompactor`；压缩器改为每会话独立实例（无共享 `last_consolidation`/`last_estimate`）；`maybe_compact` 返回 `CompactionResult`；压缩不再写 daily（触发点只剩 `/clear`） | 共享可变状态是跨会话 Bug 之源，改显式返回值；「当前会话需要看多少上下文」与「系统以后该记住什么」彻底分离 |
 | 08-05 | TASK-007 压缩触发→无条件重建记忆快照：`_sync_memory_patch` 将 `consolidated` 判断提前到 early-return 之前，压缩过即重建（修「本会话自写记忆 + 压缩后完整记忆只剩摘要残影」洞）；`_should_rebuild_memory` 的 `consolidated` 提升为决定性条件（与 GPT 方案 §4.5 相反） | 压缩=缓存已破=塞完整快照最划算；重建读磁盘不依赖 entries，revision 已最新也安全；未压缩路径逐字不变，前缀缓存命中不受影响 |
 | 08-05 | TASK-010 会话中断回合上下文丢失修复（Agent「失忆」bug）：`_persist` 改为「落盘即同步内存」——每写一条磁盘就按磁盘顺序增量追加进 `_session_history`，磁盘是唯一事实源；`_record_cancelled_turn` 去重不再手动追加；刻意不做整段 canonicalize（避免工具交换被 close_pending 补占位符导致真实 tool 结果丢失），收尾边界统一 canonicalize 兜底 | 「回合完成时才同步内存」是失忆根因；任意中断路径（超时/error/异常/取消/崩溃）内存都不丢；真进程重启本就从磁盘全量恢复（不受影响）；遗留：压缩 `save_messages` 改写时间戳潜在风险（NC-MEM-002） |
+| 08-05 | TASK-011 每日做梦整理：砍 HISTORY 写入（`_save_to_history` 删除，压缩摘要不再落盘）；`agent/daily.py` 新增 `dream_consolidate`（固定分类 + 行哈希去重 + 合并更新）；`main.py` 新增 DreamScheduler（每日定时）+ DreamState（启动补做前一天）+ `collect_messages_for_date` + `dream_time` 配置 | 定时整理要能注入时钟可单测；补做状态单调前进、模型失败不标记（重启可重试）；整理失败静默符合 daily nice-to-have 原则；与 ReminderScheduler 独立 task 互不影响 |
 | 08-04 | 微信文件接收（TASK-003）：Bridge FILE 入站下载 → FileStore 按月归档 → content 只带引用 | 文件名不可信需消毒防穿越；文件大小需设上限防撑爆磁盘；命令消息保持纯文本判断不变；批量持久化需兼容旧批次缺 `files` 字段 |
 
 ## 4. 已替代或已核销的旧记录

@@ -70,6 +70,9 @@ _CONFIG_FIELDS = (
     "turn_timeout_sec",
     # 上下文 token 预算：ContextCompactor 的压缩阈值（启动期配置，改后需重启）。
     "context_budget_tokens",
+    # 每日做梦整理时刻（HH:MM，实例时区；默认 02:00）。到点把当天各会话事件
+    # 整理进 daily（TASK-011）；缺省不报错、非法值由调度器回退默认。
+    "dream_time",
     "mcp_servers",
     # 多模态（视觉）模型：基础模型无视觉能力时，由 ask_image 工具把图片转交它理解
     "multimodal_model",
@@ -130,6 +133,7 @@ class NanoClawConfig:
     web_port: int = 0                # 网页渠道端口；0 表示不启用网页渠道
     turn_timeout_sec: int = 600      # 单轮对话墙钟超时（秒）；超时强制终止，防卡死
     context_budget_tokens: int = 524288  # 上下文 token 预算（ContextCompactor 压缩阈值；默认 512k）
+    dream_time: str = "02:00"            # 每日做梦整理时刻（HH:MM，实例时区；缺省 02:00，同款容错）
     mcp_servers: dict = field(default_factory=dict)  # MCP Server 配置：{server_name: {command, args, env?, cwd?}}
     # 多模态（视觉）模型配置：基础模型为纯文本时，图片由 ask_image 工具转交该模型理解。
     # 三者皆空视为未配置；api_key 也可走环境变量 MULTIMODAL_API_KEY 覆盖。

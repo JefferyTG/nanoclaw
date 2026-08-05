@@ -16,10 +16,12 @@
 """
 
 import asyncio
+import json
 import os
 import signal
 import sys
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from config import load_config
 from providers.openai_compat import OpenAICompatProvider
@@ -59,7 +61,12 @@ from agent.identity import IdentityBootstrapper
 from agent.loop import AgentLoop
 from session.manager import SessionManager
 from agent.memory import ContextCompactor
-from agent.daily import DailyMemory, summarize_messages_to_daily
+from agent.memory_sync import is_patch_message, is_snapshot_message
+from agent.daily import (
+    DailyMemory,
+    dream_consolidate,
+    summarize_messages_to_daily,
+)
 from agent.search import MemorySearcher
 from agent.tools.search import MemorySearchTool
 from agent.tools.vision import AskImageTool
@@ -329,6 +336,249 @@ async def watch_channel_start_failures(tasks, channels, *, ignore_indices=()):
                     f"channel '{channel_name}' failed to start: {error}"
                 ) from error
     await asyncio.Future()
+
+
+# ===== 每日做梦整理（TASK-011 第二阶段：定时调度 + 启动补做）=====
+# 与 reminders/scheduler.py 的 ReminderScheduler 同理：独立 asyncio 后台
+# task、注入时钟、动态等待；本模块不重构 reminders，二者互不影响。
+DEFAULT_DREAM_TIME = "02:00"
+
+
+def _as_aware(now: datetime) -> datetime:
+    """把时钟返回的时刻规范化为 aware（naive 按 UTC 解释，与 CurrentTimeTool 一致）。"""
+    if now.tzinfo is None:
+        return now.replace(tzinfo=UTC)
+    return now
+
+
+def _parse_dream_time(value) -> tuple:
+    """解析 ``"HH:MM"`` → (hour, minute)；非法值回退默认 02:00（与 config 同款容错）。"""
+    try:
+        hour, minute = str(value).strip().split(":", 1)
+        hour, minute = int(hour), int(minute)
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour, minute
+    except (ValueError, AttributeError):
+        pass
+    return 2, 0
+
+
+def _next_dream_run(now: datetime, dream_time: str, timezone: str) -> datetime:
+    """给定当前时刻，返回下一次做梦时刻（dream_time HH:MM，timezone 时区，严格晚于 now）。"""
+    hour, minute = _parse_dream_time(dream_time)
+    local_now = _as_aware(now).astimezone(ZoneInfo(timezone))
+    candidate = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= local_now:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def _today_date(timezone: str) -> datetime.date:
+    """实例时区下的「今天」日期（与 daily 按本地日期命名一致）。"""
+    return datetime.now(ZoneInfo(timezone)).date()
+
+
+async def _dream_default_wait(event: asyncio.Event, timeout: float) -> None:
+    """默认等待：睡到 timeout（秒）或被事件唤醒（stop/wake）。"""
+    try:
+        await asyncio.wait_for(event.wait(), timeout=timeout)
+    except TimeoutError:
+        pass
+
+
+class DreamScheduler:
+    """每日定时做梦整理调度器（TASK-011）。
+
+    仿照 ReminderScheduler 的「动态等待 + 可注入时钟」循环：独立 asyncio
+    后台 task，每个本地日到 ``dream_time``（HH:MM，实例时区）到点执行一次
+    ``consolidate_today()``（整理当天内容）；进程晚启动（已过到点）则启动后
+    立即补跑当天一次。``consolidate_today`` 内部失败静默（不抛异常），故调度
+    器不会阻塞聊天或启动。
+
+    可测性：注入 ``clock``（``now() -> datetime``）与 ``wait``（event, timeout），
+    测试用假时钟推进 + 假 wait 直接跳到到点时刻，无需真实 sleep。
+    """
+
+    def __init__(
+        self,
+        consolidate_today,
+        *,
+        dream_time: str = DEFAULT_DREAM_TIME,
+        timezone: str = "Asia/Shanghai",
+        clock=None,
+        wait=None,
+    ):
+        self.consolidate_today = consolidate_today
+        self.dream_time = dream_time
+        self.timezone = timezone
+        self.clock = clock or SystemClock()
+        self._wait = wait or _dream_default_wait
+        self._wake_event = asyncio.Event()
+        self._stopped = False
+        self._task = None
+
+    def start(self) -> asyncio.Task:
+        if self._task is None or self._task.done():
+            self._stopped = False
+            self._wake_event.clear()  # 清除上次 stop 遗留的唤醒信号
+            self._task = asyncio.create_task(self.run(), name="dream-scheduler")
+        return self._task
+
+    async def stop(self) -> None:
+        self._stopped = True
+        self._wake_event.set()
+        task = self._task
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def run(self) -> None:
+        """调度主循环：每个本地日到点最多执行一次；晚启动立即补跑当天。
+
+        循环结构仿照 ReminderScheduler：注入时钟 + 可中断的 wait，便于单测
+        用假时钟推进，无需真实 sleep。
+        """
+        last_date = None
+        while not self._stopped:
+            now = _as_aware(self.clock.now())
+            local_today = now.astimezone(ZoneInfo(self.timezone)).date()
+            if last_date != local_today:
+                # 今天还没执行过：到点时刻在今天则睡到到点（已到则 delay=0）；
+                # 到点已过（进程晚启动）则立即补跑今天。
+                next_run = _next_dream_run(now, self.dream_time, self.timezone)
+                if next_run.date() == local_today:
+                    delay = max(0.0, (next_run - now).total_seconds())
+                    self._wake_event.clear()
+                    await self._wait(self._wake_event, delay)
+                    if self._stopped:
+                        return
+                await self._safe_consolidate()
+                last_date = local_today
+            else:
+                # 今天已执行过：睡到下一次（明天）到点
+                next_run = _next_dream_run(now, self.dream_time, self.timezone)
+                delay = max(0.0, (next_run - now).total_seconds())
+                self._wake_event.clear()
+                await self._wait(self._wake_event, delay)
+                if self._stopped:
+                    return
+
+    async def _safe_consolidate(self) -> None:
+        """执行一次整理；任何异常（含整理函数自身未吞的）都不让调度循环退出。"""
+        try:
+            await self.consolidate_today()
+        except Exception:  # noqa: BLE001 - 做梦失败绝不影响调度循环
+            pass
+
+
+class DreamState:
+    """维护做梦状态文件 ``<memory_dir>/dream_state.json``。
+
+    记录 ``{"last_dream_date": "YYYY-MM-DD"}``：最近一次完成做梦整理的日期。
+    - 启动补做：``last_dream_date < 昨天`` → 补整理前一天并更新本文件；
+    - 每日定时到点：整理当天后同步更新（避免下次启动重复补做昨天）。
+    文件读写均为尽力而为：缺失/损坏按「无记录」处理，写失败静默忽略
+    （运行时产物，绝不阻断启动或聊天）。
+    """
+
+    _FILENAME = "dream_state.json"
+
+    def __init__(self, memory_dir: str):
+        self.path = os.path.join(memory_dir, self._FILENAME)
+
+    def read_last_dream_date(self) -> str | None:
+        """读取 last_dream_date；无文件/损坏/非法返回 None。"""
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        value = data.get("last_dream_date")
+        if not isinstance(value, str) or not value.strip():
+            return None
+        return value.strip()
+
+    def write_last_dream_date(self, date_str: str) -> None:
+        """记录 last_dream_date（**只前进不后退**；失败静默，不阻断调用方）。
+
+        单调前进：若已有更晚的整理记录（如定时到点已写今天、启动补做随后写
+        昨天），则跳过写入——避免并发路径把状态从「今天」回退到「昨天」。
+        """
+        try:
+            current = self.read_last_dream_date()
+            if current is not None and current >= date_str:
+                return
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"last_dream_date": date_str}, f, ensure_ascii=False, indent=2
+                )
+        except OSError:
+            pass
+
+
+def should_catch_up(last_dream_date: str | None, today: datetime.date) -> str | None:
+    """启动补做目标：昨天未整理则返回昨天（YYYY-MM-DD），否则返回 None。
+
+    - 无状态文件（首次启动）视为「昨天未整理」，补做一次昨天；
+    - ``last_dream_date < 昨天`` 时只补最近 1 天（昨天），超期不回溯；
+    - ``last_dream_date`` 已覆盖昨天（== 或晚于）则无需补做。
+    """
+    yesterday = today - timedelta(days=1)
+    yesterday_str = yesterday.isoformat()
+    if last_dream_date is None or last_dream_date < yesterday_str:
+        return yesterday_str
+    return None
+
+
+def collect_messages_for_date(session_manager, date_str: str) -> list:
+    """收集指定日期（YYYY-MM-DD）各会话的关键消息，供做梦整理。
+
+    - 枚举所有会话 JSONL，取 ``timestamp`` 命中该日期的消息（保留原始消息，
+      供模型提取事件）；
+    - 过滤掉系统内部的记忆补丁/快照消息（``<memory_patch>/<memory_snapshot>``，
+      非用户事件，避免污染整理输入）；
+    - 单会话读取失败静默跳过（不影响其他会话，也不阻断启动）。
+    """
+    messages: list = []
+    for stem in session_manager.list_sessions():
+        key = stem.replace("_", ":")
+        try:
+            records = session_manager.get_session_messages(key)
+        except Exception:  # noqa: BLE001 - 单会话失败静默跳过
+            continue
+        for msg in records:
+            timestamp = msg.get("timestamp")
+            if not isinstance(timestamp, str) or not timestamp.startswith(date_str):
+                continue
+            if is_patch_message(msg) or is_snapshot_message(msg):
+                continue
+            messages.append(msg)
+    return messages
+
+
+async def run_dream_for_date(
+    provider, daily, session_manager, dream_state, date_str: str
+) -> None:
+    """对指定日期执行一次做梦整理（失败静默，供启动补做与定时调度共用）。
+
+    - 数据源：当天各会话关键消息（``collect_messages_for_date``）+ 当天 daily
+      已有内容（``dream_consolidate`` 内部读取并让模型去重）；
+    - 完成后更新 ``dream_state``（last_dream_date = date_str）；模型调用失败
+      时不更新，保证下次启动补做可重试该日期；
+    - 任何异常静默返回，不阻塞聊天或启动。
+    """
+    try:
+        messages = collect_messages_for_date(session_manager, date_str)
+        done = await dream_consolidate(provider, daily, date_str, messages)
+    except Exception:  # noqa: BLE001 - 做梦失败静默
+        return
+    if done:
+        try:
+            dream_state.write_last_dream_date(date_str)
+        except Exception:  # noqa: BLE001 - 状态写失败不阻断
+            pass
 
 
 def build_shared() -> dict:
@@ -681,6 +931,9 @@ async def amain() -> None:
 
     reminder_scheduler = None
     reminder_scheduler_task = None
+    dream_scheduler = None
+    dream_scheduler_task = None
+    catch_up_task = None
     reminder_service = shared.get("reminder_service")
     reminder_repository = shared.get("reminder_repository")
 
@@ -751,6 +1004,43 @@ async def amain() -> None:
         )
         reminder_service.attach_scheduler(reminder_scheduler)
         reminder_service.attach_cleanup(cleanup_scheduled_task)
+
+    # 每日做梦整理（TASK-011）：启动补做 + 每日定时调度。
+    # - 启动补做：异步后台执行，不阻塞启动；昨天未整理则补整理前一天。
+    # - 定时调度：独立 asyncio 后台 task，每个本地日到 dream_time 整理当天。
+    # 两者失败静默（内部已吞异常），不会阻塞聊天或启动；与 reminders 调度器
+    # 是相互独立的 task，互不影响（优雅关闭见下方 amain 收尾段）。
+    dream_state = DreamState(
+        os.path.join(shared["config"].workspace, "workspace", "memory")
+    )
+
+    async def run_dream(date_str: str) -> None:
+        await run_dream_for_date(
+            shared["provider"],
+            shared["daily_memory"],
+            shared["session_manager"],
+            dream_state,
+            date_str,
+        )
+
+    async def consolidate_today() -> None:
+        await run_dream(_today_date(shared["config"].timezone).isoformat())
+
+    async def catch_up_yesterday() -> None:
+        target = should_catch_up(
+            dream_state.read_last_dream_date(),
+            _today_date(shared["config"].timezone),
+        )
+        if target is not None:
+            await run_dream(target)
+
+    dream_scheduler = DreamScheduler(
+        consolidate_today,
+        dream_time=shared["config"].dream_time,
+        timezone=shared["config"].timezone,
+    )
+    dream_scheduler_task = dream_scheduler.start()
+    catch_up_task = asyncio.create_task(catch_up_yesterday())
 
     def clear_callback(session_key: str) -> None:
         """/clear 命令回调：按完整 session_key 清空对应会话历史。
@@ -938,6 +1228,8 @@ async def amain() -> None:
     watched = {inbound_task, shutdown_waiter, start_failure_task}
     if reminder_scheduler_task is not None:
         watched.add(reminder_scheduler_task)
+    if dream_scheduler_task is not None:
+        watched.add(dream_scheduler_task)
     if cli_task_index is not None:
         watched.add(start_tasks[cli_task_index])
     await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
@@ -957,6 +1249,10 @@ async def amain() -> None:
 
     if reminder_scheduler is not None:
         await reminder_scheduler.stop()
+    if dream_scheduler is not None:
+        await dream_scheduler.stop()
+    if catch_up_task is not None:
+        catch_up_task.cancel()
 
     inbound_task.cancel()     # 结束网关入站/出站循环
     outbound_task.cancel()
@@ -969,6 +1265,8 @@ async def amain() -> None:
         shutdown_waiter,
         start_failure_task,
         *([reminder_scheduler_task] if reminder_scheduler_task is not None else []),
+        *([dream_scheduler_task] if dream_scheduler_task is not None else []),
+        *([catch_up_task] if catch_up_task is not None else []),
         return_exceptions=True,
     )
     for sig in installed_signals:

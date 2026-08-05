@@ -8,7 +8,6 @@
                           │
                           └─ 超出 token_budget 时，经 _summarize 压缩成
                              一条 {"role":"system","content":"[历史摘要]: ..."}
-                             并追加写入 <workspace>/memory/HISTORY.md 留痕。
 
     TASK-009 升级：_summarize 优先走「分块 + 结构化摘要」（map-reduce）——
     旧历史按 ~10k token 分块，每块独立提取 用户事实/项目决策/已完成/进行中/
@@ -18,7 +17,7 @@
 
 数据落点：
     - 压缩后的摘要消息保留在内存 messages 中，供后续轮次使用；
-    - 同一份摘要同步写入 HISTORY.md（带时间戳），作为可审计的长期记忆轨迹。
+    - （TASK-011：压缩摘要不再写 HISTORY.md，压缩审计文件已移除。）
 
 职责边界（TASK-006 解耦）：
     - 本模块只负责「当前会话上下文压缩」，与长期记忆管理（daily / USER /
@@ -28,10 +27,8 @@
 """
 
 import json
-import os
 import re
 from dataclasses import dataclass
-from datetime import datetime
 from typing import List, Optional
 
 from providers.base import LLMProvider
@@ -265,7 +262,7 @@ class ContextCompactor:
 
         结构：保留 ``messages[0]``（system 提示）与末尾 6 条，中间的旧消息
         经 ``_summarize`` 压缩为单条 system 摘要消息（TASK-009：分块 +
-        结构化摘要，异常降级旧式散文）；摘要同时追加写入 ``HISTORY.md``。
+        结构化摘要，异常降级旧式散文）。
         预算内或无可压缩内容时，原样返回（``compacted=False``，
         ``messages`` 与入参同一对象）。摘要失败时保留原历史，避免上下文丢失。
         """
@@ -320,9 +317,6 @@ class ContextCompactor:
             "role": "system",
             "content": f"[历史摘要]: {summary}",
         }
-
-        # 摘要落盘（保留审计轨迹）
-        self._save_to_history(summary, len(old_messages))
 
         return CompactionResult(
             messages=[system_msg, summary_msg] + tail,
@@ -794,23 +788,6 @@ class ContextCompactor:
                 break
             compact[field] = items[:-1]
         return compact
-
-    def _save_to_history(self, summary: str, original_count: int) -> None:
-        """把压缩摘要追加写入 ``<workspace>/memory/HISTORY.md``。"""
-        memory_dir = os.path.join(self.workspace, "memory")
-        os.makedirs(memory_dir, exist_ok=True)
-        path = os.path.join(memory_dir, "HISTORY.md")
-
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        # 末尾多补一个空行，保证多次压缩块之间视觉分隔
-        block = (
-            f"## {now}\n"
-            f"压缩了 {original_count} 条旧消息\n\n"
-            f"{summary}\n\n"
-            f"---\n\n"
-        )
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(block)
 
     @staticmethod
     def _messages_to_text(messages: List[dict]) -> str:

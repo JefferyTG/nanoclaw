@@ -18,6 +18,7 @@ NanoClaw 把「大模型推理」与「消息渠道」解耦：模型在本地�
 - **可插拔 Provider**：基于 OpenAI 兼容接口，硅基流动 / 本地模型均可，支持流式输出。
 - **会话持久化**：对话落盘为 JSONL，重启后可侧边栏查看、接上、删除。
 - **人设可定制**：通过 `identity.md`（不随仓库发布）定义语气与角色；首次缺失时会在聊天渠道中引导用户创建。
+- **每日做梦整理**：每天定时（`dream_time`，默认 02:00）把各会话当天重要事件按固定分类整理进 daily 记忆（去重、合并更新）；定时时刻未启动则下次启动自动补做前一天。
 - **Prompt Cache 友好**：System、canonical 历史与工具 Schema 保持确定性；当前时间按需通过专用工具查询，并输出不含正文的命中观测。
 - **主动提醒**：CLI、Web、飞书或微信都能让 Agent 创建、查询、取消任务；到点向实例唯一显式绑定的飞书或微信私聊发送，支持静态提醒和实时 Agent 任务。
 
@@ -83,6 +84,7 @@ nanoclaw/
 ├── agent/
 │   ├── context.py          # System Prompt 拼接
 │   ├── loop.py             # AgentLoop 推理循环
+│   ├── daily.py            # 每日记忆：/clear 摘要 + 每日做梦整理
 │   ├── skills.py           # 技能摘要构建
 │   └── tools/              # 内置工具 + MCP 接入层（mcp.py）
 ├── bus/                    # 消息总线
@@ -178,6 +180,7 @@ uv run python main.py
 | `asr_model` | 网页语音识别 Provider、模型、地址、超时、大小与 FFmpeg 配置 | 默认关闭 |
 | `tts_model` | 网页自动朗读的 Provider、音色、语速、超时与资源上限 | Edge TTS 后端就绪，页面默认关闭 |
 | `reminders` | 主动提醒开关、独立 SQLite 路径、回执/lease/低频校时与重试上限；均在重启后生效 | 启用，`workspace/reminders.db` |
+| `dream_time` | 每日做梦整理时刻（"HH:MM"）；到点把各会话当天事件按固定分类整理进 daily；实例未启动则下次启动补做前一天；重启后生效 | `"02:00"` |
 | `weixin` | 微信 Bridge 命令、被忽略的状态目录、私聊 allowlist、IPC/登录/图片上限；均在重启后生效 | 关闭，allowlist 为空（deny-all） |
 
 ---
