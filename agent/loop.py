@@ -554,12 +554,28 @@ class AgentLoop:
         持久化进会话 JSONL → 更新 session.memory_revision。
         累积补丁过多（>20 条 / >1000 tokens / 大量删除 / 历史压缩联动）时，
         改为重建完整记忆快照并替换历史里的旧补丁。
+        本轮压缩过（TASK-007）时无条件重建完整快照：压缩已破前缀缓存、历史里
+        旧快照/补丁可能已被摘要吞掉，即使无落后 entries（本会话自写已刷
+        revision）也要用磁盘最新内容重建，避免模型上下文只剩摘要残影。
         任何失败静默降级：只记日志，绝不阻塞/挂掉本轮对话。
         """
         try:
             global_rev = self._changelog.current_revision()
         except Exception:  # noqa: BLE001
             logger.exception("读取记忆变更日志失败，本轮跳过记忆同步")
+            return
+        last_compaction = self._last_compaction
+        consolidated = bool(
+            last_compaction is not None and last_compaction.compacted
+        )
+        if consolidated:
+            # TASK-007：压缩发生即无条件重建完整记忆快照。重建读磁盘最新
+            # USER.md/MEMORY.md，不依赖落后 entries——revision 已最新时同样
+            # 需要重建（否则历史里旧快照/补丁被压成摘要后，模型上下文只剩
+            # 摘要残影，丢失磁盘最新内容）。_advance_memory_revision 幂等，
+            # revision 无变化时无害。重建失败在 _rebuild_memory_snapshot
+            # 内部回退补丁模式 / 静默降级（现有降级路径保留）。
+            self._rebuild_memory_snapshot(messages, global_rev)
             return
         if global_rev <= self._memory_revision:
             return  # 零注入：无变化时上下文与现在完全一致
@@ -573,10 +589,6 @@ class AgentLoop:
             # changelog 有 revision 但落后区间无条目（理论不发生）：静默推进
             self._advance_memory_revision(global_rev)
             return
-        last_compaction = self._last_compaction
-        consolidated = bool(
-            last_compaction is not None and last_compaction.compacted
-        )
         if self._should_rebuild_memory(entries, consolidated):
             self._rebuild_memory_snapshot(messages, global_rev)
         else:
@@ -595,12 +607,17 @@ class AgentLoop:
     def _should_rebuild_memory(self, entries: list, consolidated: bool) -> bool:
         """判断是发补丁还是重建完整快照。
 
-        触发重建条件（任务卡 §5）：
+        触发重建条件（TASK-007 起 consolidated 提升为决定性条件）：
+        - 本轮压缩过（consolidated=True）：无条件重建，不再看
+          entries / patch_count / tokens / removed。压缩已破前缀缓存、
+          历史里旧补丁可能已被摘要吞掉，直接以磁盘最新内容重建完整快照
+          最划算（与 GPT 方案 §4.5「压缩不参与重建判断」相反，见任务卡）；
         - 累积补丁（历史中已有 + 本次新增）超过 20 条
         - 补丁总量估算超过约 1000 tokens
         - 本次变更发生大量删除（removed_lines >= 10）
-        - 会话历史压缩联动（本轮刚压缩过，旧补丁可能被摘要吞掉）
         """
+        if consolidated:
+            return True
         existing = [m for m in self._session_history if is_patch_message(m)]
         patch_count = len(existing) + 1
         patch_tokens = sum(

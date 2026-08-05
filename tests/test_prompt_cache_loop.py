@@ -196,7 +196,10 @@ class PromptCacheLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(metric.input_tokens, 300)
             self.assertEqual(metric.cached_input_tokens, 200)
             self.assertAlmostEqual(metric.cache_ratio, 2 / 3)
-            self.assertEqual(metric.history_messages, 6)
+            # TASK-007：压缩发生后无条件注入一条新快照（含在发往主 ReAct 的
+            # 历史里）→ 压缩回合 history_messages 比纯压缩结果多 1（快照）。
+            # 该快照是压缩已破缓存后补回「磁盘最新记忆」的必要消息，属预期。
+            self.assertEqual(metric.history_messages, 7)
 
 
 if __name__ == "__main__":

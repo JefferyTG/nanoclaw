@@ -17,6 +17,7 @@ import unittest
 from copy import deepcopy
 
 from agent.cache_observability import PromptCacheObserver
+from agent.memory import ContextCompactor
 from agent.context import ContextBuilder
 from agent.loop import AgentLoop
 from agent.memory_sync import (
@@ -331,6 +332,99 @@ class MemorySyncIntegrationTests(unittest.IsolatedAsyncioTestCase):
             patch_count = sum(1 for m in req["messages"] if is_patch_message(m))
             self.assertEqual(patch_count, 1)
             self.assertEqual(sessions.get_memory_revision("cli:restart"), 1)
+
+    async def test_compaction_rebuilds_snapshot_even_when_revision_latest(self):
+        """TASK-007：本会话自写记忆（revision 已刷到最新）→ 强制压缩 →
+        无条件重建完整记忆快照，上下文出现磁盘最新内容而非只剩摘要残影。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = SessionManager(os.path.join(tmp, "workspace", "sessions"))
+            tools = ToolRegistry()
+            tools.register(WriteFileTool(tmp))
+            tools.freeze()
+            provider = _RecordingProvider([
+                # 回合 1 主 ReAct：自写 write_file 工具调用
+                LLMResponse(content=None, tool_calls=[ToolCallRequest(
+                    "call-write", "write_file", {
+                        "file_path": "workspace/memory/USER.md",
+                        "content": "- 用户设备：MacBook\n",
+                    },
+                )]),
+                LLMResponse(content="已记下"),
+                # 回合 2 压缩摘要调用（maybe_compact -> _summarize）
+                LLMResponse(content="旧消息摘要"),
+                # 回合 2 主 ReAct（重建快照应已插入 messages）
+                LLMResponse(content="好的"),
+            ])
+            loop = AgentLoop(
+                provider, tools, ContextBuilder(tmp), sessions,
+                session_key="cli:compact",
+                compactor=ContextCompactor(provider, tmp, token_budget=10),
+                cache_observer=PromptCacheObserver(lambda _: None),
+            )
+            # 预置 2 轮旧历史：自写回合消息数 = 6（≤7，不触发压缩）；
+            # 压缩回合消息数 = 10（>7，满足压缩器「中间部分至少 1 条」护栏）
+            old_turns = []
+            for i in range(2):
+                old_turns.append({"role": "user", "content": f"旧问题{i}"})
+                old_turns.append({"role": "assistant", "content": f"旧回答{i}"})
+            loop._session_history = old_turns
+            sessions.save_messages("cli:compact", old_turns)
+
+            # 回合 1：本会话自写记忆 → 全局 revision 与会话 revision 均刷到 1
+            await loop.run("记住我的设备是 MacBook")
+            self.assertEqual(MemoryChangeLog(tmp).current_revision(), 1)
+            self.assertEqual(loop._memory_revision, 1)
+            self.assertEqual(len(provider.requests), 2)
+
+            # 回合 2：超预算强制压缩 → 即便无落后 entries 也要重建完整快照
+            await loop.run("继续")
+            main_req = provider.requests[-1]
+            # 摘要确实发生了（旧消息被压成 [历史摘要]），证明压缩真实触发
+            self.assertTrue(any(
+                "[历史摘要]" in (m.get("content") or "")
+                for m in main_req["messages"]
+            ))
+            # 完整快照出现且只出现一条，含磁盘最新内容（MacBook）
+            snapshots = [
+                m for m in main_req["messages"]
+                if (m.get("content") or "").startswith("<memory_snapshot")
+            ]
+            self.assertEqual(len(snapshots), 1)
+            self.assertIn("MacBook", snapshots[0]["content"])
+            # 压缩后不靠补丁感知（本会话自写，本就不该有补丁）
+            self.assertFalse(any(is_patch_message(m) for m in main_req["messages"]))
+            # 磁盘会话历史同步重建：快照在列、无补丁
+            records = sessions.get_session_messages("cli:compact")
+            self.assertTrue(any(
+                (r.get("content") or "").startswith("<memory_snapshot")
+                for r in records
+            ))
+            self.assertFalse(any(is_patch_message(r) for r in records))
+            self.assertEqual(loop._memory_revision, 1)
+
+    async def test_should_rebuild_consolidated_is_decisive(self):
+        """TASK-007：consolidated 是决定性条件——压缩过即无条件重建，
+        与 entries 大小无关；未压缩时按原阈值判断补丁 vs 快照。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = SessionManager(os.path.join(tmp, "workspace", "sessions"))
+            tools = ToolRegistry()
+            tools.freeze()
+            loop = AgentLoop(
+                _RecordingProvider([LLMResponse(content="ok")]),
+                tools, ContextBuilder(tmp), sessions, session_key="cli:decide",
+                cache_observer=PromptCacheObserver(lambda _: None),
+            )
+            entry = {
+                "revision": 1,
+                "file": "workspace/memory/USER.md",
+                "added_lines": ["- 用户设备：MacBook"],
+                "removed_lines": [],
+            }
+            # 压缩过：entries 再少也无条件重建（consolidated 先于阈值判断）
+            self.assertTrue(loop._should_rebuild_memory([entry], True))
+            self.assertTrue(loop._should_rebuild_memory([], True))
+            # 未压缩：按原阈值（1 条小补丁 → 补丁模式，不重建）
+            self.assertFalse(loop._should_rebuild_memory([entry], False))
 
 
 class SessionMetaTests(unittest.TestCase):

@@ -30,6 +30,7 @@
 | SQLite LIKE 代替 FTS5 | 有效 | 中文短词在 unicode61/trigram 下不可靠；当前个人数据量足够小 |
 | Daily Memory 是 best-effort 内部机制 | 有效 | `/clear` 不能被摘要失败阻塞；TASK-006 起压缩不再写 daily（见「压缩不再写 daily」决策行） |
 | 压缩不再写 daily（TASK-006 决策） | 有效 | 压缩与长期记忆彻底解耦：`ContextCompactor` 只生成当前会话摘要并写 HISTORY.md（审计轨迹），不再调用 `summarize_messages_to_daily`；daily 触发点只剩 `/clear`。代价：在「每日整理/做梦机制」落地前，压缩丢的事件不再留痕 daily（乖宝确认）。压缩结果经 `CompactionResult` 显式返回，压缩器每会话独立实例（2026-08-05） |
+| 压缩→无条件重建完整快照（TASK-007 决策） | 有效 | 压缩发生 = 前缀缓存已破，`_sync_memory_patch` 不再因「revision 已最新（本会话自写已刷基线）」或「无落后 entries」提前 return，无条件执行 `_rebuild_memory_snapshot`：读磁盘最新 USER.md/MEMORY.md 生成 <memory_snapshot> 替换历史里旧补丁，模型上下文始终有完整记忆。**与 GPT 方案 §4.5「压缩不参与快照重建判断」相反**：压缩后补丁消息可能已被摘要吞掉，靠 entries 判断会漏（模型只剩摘要残影）；塞一条完整快照是破缓存后的免费增量。重建读磁盘不依赖 entries，revision 不落后也安全（`_advance_memory_revision` 幂等）。未压缩时行为不变（零注入/补丁/快照按原阈值）。`_should_rebuild_memory` 中 `consolidated` 提升为决定性条件（2026-08-05，TASK-007，待乖宝验收） |
 | Skill 与人设解耦 | 有效 | Skill 写行为机制，具体口吻由 identity 决定 |
 | 视觉双路径 | 有效 | 基础模型多模态则直传；否则用 `ask_image` 调独立视觉模型 |
 | 生图服务完全配置化 | 有效 | 不在代码绑定特定服务商/模型；一个工具覆盖文生图、图生图、多源图 |
@@ -66,7 +67,7 @@
 | 跨会话记忆同步走「快照+版本补丁」机制 | 有效 | 记忆文件（USER.md/MEMORY.md）被其他会话写后，本会话经 <memory_patch> 补丁感知，不靠模型自觉。全局 revision 存 workspace/memory/changelog.jsonl（每写一次 +1），会话 revision 存 <safe_key>.meta.json 侧车；每轮比对，变了才把补丁（system 角色）插在历史之后、本轮 user 之前并持久化进 JSONL；无变化零注入（不破坏前缀缓存）。补丁是认知更新，模型不得将其回写记忆文件（实测 Agent 收到补丁后误以为要同步文件而覆盖写盘，已加行为约束） |
 | 记忆补丁必须持久化进会话历史 | 有效 | 补丁不落盘则下一轮只剩旧快照，等于忘记更新（早期「用完即弃」方案的关键修正） |
 | Agent 自写记忆即刷基线 | 有效 | write_file 写 USER.md/MEMORY.md 成功后递增全局 revision 并立即更新本会话 memory_revision，下一轮不给自己发自己刚写的补丁（死机制不靠自觉） |
-| 补丁过多时重建完整记忆快照 | 有效 | 累积补丁 >20 条 / 总量 >约1000 tokens / 大量删除 / 历史压缩联动时，用当前文件全文生成 <memory_snapshot> system 消息替换旧补丁们；一次破缓存后继续稳定 |
+| 补丁过多时重建完整记忆快照 | 有效 | 累积补丁 >20 条 / 总量 >约1000 tokens / 大量删除时，用当前文件全文生成 <memory_snapshot> system 消息替换旧补丁们；一次破缓存后继续稳定。压缩触发重建已提升为独立决定性条件（见「压缩→无条件重建完整快照」决策行，TASK-007） |
 | 记忆同步一刀切只同步 USER.md/MEMORY.md | 有效 | 不做「重要性」判断；daily/ 永不注入（需要时走 memory_search），规则简单、系统可执行 |
 | 记忆补丁角色用 system 而非 developer | 有效 | DeepSeek 不支持 developer 角色（已核实）；OpenAI 兼容 API 允许多条 system 消息（压缩摘要已有先例） | 渠道在会话内恒定，每轮注入是冗余的；快照零每轮 token、System Prompt 前缀稳定（Prompt Cache 友好）。渠道+用户已天然编码在 session_key（`channel:sender_id`）中，`make_agent_factory` 解析后注入 ContextBuilder，与 identity/USER/MEMORY 同构；时间戳因每轮变化仍走每轮前缀注入 |
 
@@ -89,6 +90,7 @@
 | 08-05 | TASK-004 记忆跨会话同步：全局/会话 revision + changelog.jsonl + <memory_patch> 补丁注入与持久化 + 自写刷基线 + 快照重建 | 每轮必须保证的事要系统机制化，不能靠模型自觉（时间戳先例同理）；补丁插在历史之后、user 之前，破缓存量=补丁大小 |
 | 08-05 | TASK-003 实机验收补充：微信端 Agent 收到文件引用后自行 read_file/exec 读取，违背按需读取设计；行为约束补入渠道快照（`agent/context.py::_channel_section` 微信分支） | 代码层只能保证引用式传递，管不住模型行为；行为规则应放 System Prompt 渠道专属 section |
 | 08-05 | TASK-006 压缩器解耦：`MemoryConsolidation` 改名 `ContextCompactor`；压缩器改为每会话独立实例（无共享 `last_consolidation`/`last_estimate`）；`maybe_compact` 返回 `CompactionResult`；压缩不再写 daily（触发点只剩 `/clear`） | 共享可变状态是跨会话 Bug 之源，改显式返回值；「当前会话需要看多少上下文」与「系统以后该记住什么」彻底分离 |
+| 08-05 | TASK-007 压缩触发→无条件重建记忆快照：`_sync_memory_patch` 将 `consolidated` 判断提前到 early-return 之前，压缩过即重建（修「本会话自写记忆 + 压缩后完整记忆只剩摘要残影」洞）；`_should_rebuild_memory` 的 `consolidated` 提升为决定性条件（与 GPT 方案 §4.5 相反） | 压缩=缓存已破=塞完整快照最划算；重建读磁盘不依赖 entries，revision 已最新也安全；未压缩路径逐字不变，前缀缓存命中不受影响 |
 | 08-04 | 微信文件接收（TASK-003）：Bridge FILE 入站下载 → FileStore 按月归档 → content 只带引用 | 文件名不可信需消毒防穿越；文件大小需设上限防撑爆磁盘；命令消息保持纯文本判断不变；批量持久化需兼容旧批次缺 `files` 字段 |
 
 ## 4. 已替代或已核销的旧记录
