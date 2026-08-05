@@ -111,8 +111,10 @@ Web 附加：AgentLoop 流事件 → Bus.stream → WebChannel → WebSocket（t
 
 事实冲突时优先级：**当前代码与配置契约 > 当前 Git 状态 > docs/ 已确认文档 > 旧方案草稿**。
 
-## 当前 Git 状态（2026-08-05）
+## Git 状态（指针式）
 
-- 分支 `main` 领先 `origin/main` 9 个提交：`6a93b9c`（TASK-005 上下文预算动态配置 + 占用显示）、`eb9f736`（TASK-005 回合级 usage 汇总补充）、`783cb60`（TASK-005 验收归档）、`3651c1a`（TASK-006 压缩器解耦，含任务卡归档）、`1382d2a`（TASK-006 归档后同步 PROJECT.md）、`136332b`（TASK-007 压缩触发无条件重建记忆快照）、`8cf3e0f`（TASK-007 验收归档）、`bbb766d`（TASK-008 压缩摘要输入降噪）、<本提交>（TASK-008 验收归档：任务卡移入 completed/，PROJECT.md 同步）。
-- 未跟踪：`docs/tasks/active/TASK-009-分块结构化摘要.md`（后续任务卡，待开工时随实现提交）、`kb-testset/`（个人知识库测试资产，归属另行处理，不混入本仓库提交）。
-- 存在 codex 外部 worktree → 多会话并行开发时严格遵守 AGENTS.md 文件所有权规则。
+> **唯一事实源是 git 本身**（`git log` / `git status` / `git diff`）。本段只留指针与稳定约定，**不复制任何瞬时状态**——hash 列表、领先/落后数量、未跟踪清单都会过期，一律不写，需要时直接查 git。
+
+- 当前里程碑：TASK-001~008 已完成并归档（任务卡见 `docs/tasks/completed/`）；TASK-009（分块结构化摘要）进行中（任务卡在 `docs/tasks/active/`）。
+- 最新提交、分支、领先/落后、工作区状态：`git log` / `git status`。
+- 稳定约定：`kb-testset/`（个人知识库测试资产）归属另行处理，不混入本仓库提交；存在 codex 外部 worktree → 多会话并行开发时严格遵守 AGENTS.md 文件所有权规则。
