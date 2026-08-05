@@ -33,7 +33,7 @@
 | 视频生成 | ✅ | 异步任务式，多服务商适配 |
 | 技能系统 | ✅ | SKILL.md 扫描、摘要注入、ListSkills/LoadSkill |
 | Prompt Cache 友好 | ✅ | System 无墙钟、按需时间工具、工具 Schema 冻结、隐私安全观测 |
-| 会话持久化 | ✅ | 一会话一 JSONL、重启接回、图片只存引用 |
+| 会话持久化 | ✅ | 一会话一 JSONL、重启接回、图片只存引用；中断回合落盘即同步内存、任意中断路径不丢上下文（TASK-010） |
 | Linux 后台管理 | ✅ | `bin/nanoclawctl`（setsid 独立进程组） |
 | 微信真实收发 | 🔶 | 需真实端点 + 扫码授权（NC-WEIXIN-001） |
 | 生图/视频/ASR 真实链路 | 🔶 | 本地仅验证到请求构造（NC-TEST-002） |
@@ -115,6 +115,6 @@ Web 附加：AgentLoop 流事件 → Bus.stream → WebChannel → WebSocket（t
 
 > **唯一事实源是 git 本身**（`git log` / `git status` / `git diff`）。本段只留指针与稳定约定，**不复制任何瞬时状态**——hash 列表、领先/落后数量、未跟踪清单都会过期，一律不写，需要时直接查 git。
 
-- 当前里程碑：TASK-001~009 已完成并归档（任务卡见 `docs/tasks/completed/`）；暂无 active 任务。
+- 当前里程碑：TASK-001~010 已完成并归档（任务卡见 `docs/tasks/completed/`）；暂无 active 任务。
 - 最新提交、分支、领先/落后、工作区状态：`git log` / `git status`。
 - 稳定约定：`kb-testset/`（个人知识库测试资产）归属另行处理，不混入本仓库提交；存在 codex 外部 worktree → 多会话并行开发时严格遵守 AGENTS.md 文件所有权规则。

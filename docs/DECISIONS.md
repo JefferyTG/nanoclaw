@@ -91,6 +91,7 @@
 | 08-05 | TASK-003 实机验收补充：微信端 Agent 收到文件引用后自行 read_file/exec 读取，违背按需读取设计；行为约束补入渠道快照（`agent/context.py::_channel_section` 微信分支） | 代码层只能保证引用式传递，管不住模型行为；行为规则应放 System Prompt 渠道专属 section |
 | 08-05 | TASK-006 压缩器解耦：`MemoryConsolidation` 改名 `ContextCompactor`；压缩器改为每会话独立实例（无共享 `last_consolidation`/`last_estimate`）；`maybe_compact` 返回 `CompactionResult`；压缩不再写 daily（触发点只剩 `/clear`） | 共享可变状态是跨会话 Bug 之源，改显式返回值；「当前会话需要看多少上下文」与「系统以后该记住什么」彻底分离 |
 | 08-05 | TASK-007 压缩触发→无条件重建记忆快照：`_sync_memory_patch` 将 `consolidated` 判断提前到 early-return 之前，压缩过即重建（修「本会话自写记忆 + 压缩后完整记忆只剩摘要残影」洞）；`_should_rebuild_memory` 的 `consolidated` 提升为决定性条件（与 GPT 方案 §4.5 相反） | 压缩=缓存已破=塞完整快照最划算；重建读磁盘不依赖 entries，revision 已最新也安全；未压缩路径逐字不变，前缀缓存命中不受影响 |
+| 08-05 | TASK-010 会话中断回合上下文丢失修复（Agent「失忆」bug）：`_persist` 改为「落盘即同步内存」——每写一条磁盘就按磁盘顺序增量追加进 `_session_history`，磁盘是唯一事实源；`_record_cancelled_turn` 去重不再手动追加；刻意不做整段 canonicalize（避免工具交换被 close_pending 补占位符导致真实 tool 结果丢失），收尾边界统一 canonicalize 兜底 | 「回合完成时才同步内存」是失忆根因；任意中断路径（超时/error/异常/取消/崩溃）内存都不丢；真进程重启本就从磁盘全量恢复（不受影响）；遗留：压缩 `save_messages` 改写时间戳潜在风险（NC-MEM-002） |
 | 08-04 | 微信文件接收（TASK-003）：Bridge FILE 入站下载 → FileStore 按月归档 → content 只带引用 | 文件名不可信需消毒防穿越；文件大小需设上限防撑爆磁盘；命令消息保持纯文本判断不变；批量持久化需兼容旧批次缺 `files` 字段 |
 
 ## 4. 已替代或已核销的旧记录
@@ -146,6 +147,7 @@
 | NC-DOC-001 | README 与实现有少量漂移 | README 称 MCP 多 Server 并行连接，当前实现为顺序 await；配置热更新描述也需更精确 |
 | NC-SEC-002 | WebFetch 可访问内网地址 | 只限制 http/https 且跟随重定向；不可信输入下应评估 SSRF 防护 |
 | NC-CLEAN-001 | `agent/skills/` 历史副本 | 当前运行入口使用根 `skills/`；确认无外部依赖后可移除重复副本 |
+| NC-MEM-002 | 压缩 `save_messages` 覆盖写回会改写会话文件时间戳 | 压缩发生在 `_run` 开头（loop.py:753-755），`save_messages` 整段写回磁盘，原始消息时间戳被改写（内容不受影响）。TASK-010 已保证内存=磁盘一致、中断回合不丢，此风险仅剩时间戳真实性层面；暂不处理，如未来依赖时间戳审计需改为保留原始值 |
 | NC-LICENSE-001 | 微信社区基础缺少独立 LICENSE | 上游 `package.json` 声明 MIT，但仓库没有 LICENSE 文件；当前已固定来源/NOTICE，正式分发前仍需维护者或法律复核 |
 | NC-WEIXIN-001 | 微信真实端点未验收 | 自动化使用 fake iLink HTTP/CDN/clock/process；真实扫码、长轮询、图片和主动发送需用户授权后受控手工验收 |
 | NC-WEIXIN-002 | 微信主动发送需要历史 context token | 对端至少入站交互一次后才可发送；Bridge 按 account/user 持久化，V1 不绕过服务端这项协议约束 |

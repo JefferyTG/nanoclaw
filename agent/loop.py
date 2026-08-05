@@ -43,7 +43,7 @@ from agent.cache_observability import (
     PromptCacheObserver,
     stable_text_hash,
 )
-from agent.history import canonicalize_history
+from agent.history import canonicalize_history, canonicalize_history_message
 from session.manager import SessionManager
 from agent.memory import CompactionResult, ContextCompactor
 from agent.memory_sync import (
@@ -500,15 +500,15 @@ class AgentLoop:
 
             [上一条 user, 中断占位 assistant（含已生成的部分回答）]
 
-        以与 ``canonicalize_history`` 兼容的格式补进 ``_session_history`` 并写盘
-        （user_record 若已由 ``_run`` 写盘则跳过，幂等），让下一轮模型能看到
+        写盘并经 ``_persist`` 同步进 ``_session_history``，让下一轮模型能看到
         「上一轮回答被停止」从而正确接续。
 
-        幂等保证：
+        幂等与去重保证（TASK-010：``_persist`` 已把 user / 中断记录追加进内存
+        历史，取消分支**不再手动追加**，避免同一回合出现重复消息）：
         - ``_cancel_history_recorded`` 守卫，整轮只补一次；
         - user_record 磁盘已写则不再写（``_user_record_persisted``）；
         - 工具执行中取消时 ``_execute_tools`` 已落盘的中断记录直接复用
-          （``self._interrupt_record``），不重复生成通用占位；
+          （``self._interrupt_record``），不重复生成/落盘通用占位；
         - 取消发生在 user_record 构造之前（如会话压缩阶段）时磁盘上没有任何
           本轮记录，直接返回，避免产生孤立的占位 assistant。
         """
@@ -518,33 +518,26 @@ class AgentLoop:
         if self._last_user_record is None:
             return
 
-        records_to_append: List[dict] = []
-
-        # 1) 用户消息：_run 的 _persist 已写盘则跳过，否则补写（幂等）
+        # 1) 用户消息：_run 的 _persist 已写盘并同步内存则跳过，否则补写
+        #    （_persist 会把 user 追加进 _session_history，无需再手动追加）。
         if not self._user_record_persisted:
             self._persist(self._last_user_record)
             self._user_record_persisted = True
-        records_to_append.append(self._last_user_record)
 
-        # 2) 中断占位 assistant：工具取消已落盘则复用，否则生成通用占位
-        #    （若已有部分回答文本则带上，让模型知道上一轮生成到哪一步）。
-        if self._interrupt_record is not None:
-            interrupt_record = self._interrupt_record
-        else:
+        # 2) 中断占位 assistant：工具取消已落盘（_persist 同步进内存）则复用；
+        #    否则生成通用占位并落盘（同样由 _persist 同步），不再手动追加。
+        if self._interrupt_record is None:
             partial = self._partial_answer or ""
             if partial:
                 content = f"{partial}\n\n（⏹ 回答被用户停止）"
             else:
                 content = "（上一轮回答被用户手动停止）"
-            interrupt_record = {"role": "assistant", "content": content}
-            self._persist(interrupt_record)
-        records_to_append.append(interrupt_record)
+            self._persist({"role": "assistant", "content": content})
 
-        # 统一走 canonicalize_history：保证与磁盘格式、_history_item_to_api 兼容，
-        # 且重复调用（_cancel_history_recorded 已拦）也不会产生重复/脏数据。
-        self._session_history = canonicalize_history(
-            [*self._session_history, *records_to_append]
-        )
+        # 统一规范化兜底（幂等）：上面只做了增量追加，这里整段 canonicalize
+        # 保证内存历史与磁盘 / API 契约完全对齐。user 与占位 assistant 均已由
+        # _persist 同步进 _session_history，绝不在此处重复追加。
+        self._session_history = canonicalize_history(self._session_history)
 
     def _sync_memory_patch(self, messages: list) -> None:
         """每轮对话前：跨会话记忆补丁同步（TASK-004）。
@@ -1221,12 +1214,29 @@ class AgentLoop:
         return None
 
     def _persist(self, msg: dict) -> None:
-        """把一条消息同步持久化到会话文件（供跨进程恢复）。
+        """把一条消息同步持久化到会话文件，并同步进内存历史（TASK-010）。
 
         仅持久化「用户消息 / assistant 回复 / tool 结果」这三类对话消息；
         system 提示由 ContextBuilder 每次重建，不入库。
+
+        内存同步策略：磁盘是唯一事实源——每落盘一条就把同一条（经
+        ``canonicalize_history_message`` 清洗）增量追加进 ``_session_history``，
+        把「回合完成时才同步」改为「落盘即同步」。这样任意中断路径
+        （整轮超时 / 模型 error / 异常 / 取消 / 崩溃）之后，同一 AgentLoop
+        实例的下一轮都能看到本回合已落盘的全部消息，不再「失忆」。
+
+        注意：这里刻意**不做整段 canonicalize**。工具交换是按
+        ``assistant(tool_calls) → tool...`` 协议顺序逐条落盘的（见
+        ``_persist_tool_exchange``，assistant 在前）；若在 assistant(tool_calls)
+        落盘后立即整段 canonicalize，尚未落盘的 tool 结果会被
+        ``canonicalize_history`` 的 ``close_pending`` 补成占位符，随后真正的
+        tool 结果又会被当作孤立 tool 丢弃——真实工具结果丢失。因此这里保持
+        「磁盘写入顺序」增量追加（该顺序本身即 canonicalize 期望的合法顺序），
+        由读取 / 收尾边界（``_save_to_history`` / ``_record_cancelled_turn`` /
+        记忆补丁 / 压缩）统一 canonicalize 兜底，保证内存始终等价于磁盘。
         """
         self.session_manager.save_message(self.session_key, msg)
+        self._session_history.append(canonicalize_history_message(msg))
 
     def _save_to_history(self, messages_snapshot: List[dict]) -> None:
         """保存本轮新增对话到跨轮历史（去掉首条 system 提示）。"""
