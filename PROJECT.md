@@ -113,6 +113,6 @@ Web 附加：AgentLoop 流事件 → Bus.stream → WebChannel → WebSocket（t
 
 ## 当前 Git 状态（2026-08-05）
 
-- 分支 `main` 与 `origin/main` 一致（HEAD = `c7fc581`，TASK-004 跨会话记忆同步）。
+- 分支 `main` 领先 `origin/main` 2 个提交：`6a93b9c`（TASK-005 上下文预算动态配置 + 占用显示）、`eb9f736`（TASK-005 回合级 usage 汇总补充）。
 - 仅 `kb-testset/` 未跟踪（个人知识库测试资产，归属另行处理，不混入本仓库提交）。
 - 存在 codex 外部 worktree → 多会话并行开发时严格遵守 AGENTS.md 文件所有权规则。

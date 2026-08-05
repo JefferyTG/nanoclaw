@@ -2,7 +2,9 @@
 
 ## 任务卡
 
-- 状态：已实现（TASK-005 代码+单测完成，待项目负责人验收归档）
+- 状态：已完成（2026-08-05 验收归档）
+- 提交：`6a93b9c`（主实现）+ `eb9f736`（回合级 usage 汇总补充），分支 main
+- 验收：乖宝实机验证通过（Web 进度条 / `/context` 命令 / 缓存命中与未命中展示）
 - 负责人：code-master（实现）＋ 小奈（设计/验收）
 - 基线 commit / 分支：`eece4ab`（main，TASK-004 已归档）
 - 依赖任务：无（TASK-004 已完成的 memory_sync 与本任务无耦合）
@@ -69,7 +71,8 @@
 - [x] 每轮模型调用后，Web 收到 `{type:"usage"}` 流事件，前端进度条与缓存命中率更新
 - [x] `/context` 命令在 web/feishu/weixin/cli 四渠道均直接回复占用文本（不经过模型）；命令在会话内显示当前会话占用
 - [x] 无 stream_sink / 无 usage 数据时优雅降级（进度条不显示或显示估算，不报错）
-- [x] 单元测试 + 集成测试全过（unittest，350 通过）；`git diff --check` 通过；`compileall` 通过；`import main` 通过
+- [x] 单元测试 + 集成测试全过（unittest，355 通过）；`git diff --check` 通过；`compileall` 通过；`import main` 通过
+- [x] 补充：回合级 `usage_turn` 汇总事件（累计输入/加权命中率/调用次数/未命中），Web 进度条整轮概览 + `/context` 文案「上一回合」
 - [x] 文档同步：DECISIONS.md 记录决策；任务卡状态推进；PROJECT.md 能力矩阵/配置速查同步更新
 
 ### 必须执行的验证
