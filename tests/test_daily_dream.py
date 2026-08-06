@@ -151,13 +151,15 @@ class DreamConsolidateTests(unittest.IsolatedAsyncioTestCase):
         """已有 daily 内容按分类保留，非固定分类不丢数据。"""
         with tempfile.TemporaryDirectory() as tmp:
             daily = self._make_daily(tmp)
+            # daily.append 总是写「今天」的文件，故目标日期用本地今天
+            today = datetime.now().strftime("%Y-%m-%d")
             # 先模拟 /clear 写入 + 历史遗留分类
             daily.append("会话总结", "已有会话事实")
             daily.append("压缩前保存", "旧审计事实")
             provider = _DreamProvider()
-            await dream_consolidate(provider, daily, "2026-08-05", MESSAGES)
+            await dream_consolidate(provider, daily, today, MESSAGES)
 
-            content = daily.read("2026-08-05")
+            content = daily.read(today)
             self.assertIn("- 已有会话事实", content)          # 已有内容保留
             self.assertIn("- 旧审计事实", content)            # 非固定分类保留
             self.assertEqual(content.count("## 压缩前保存"), 1)
@@ -167,9 +169,11 @@ class DreamConsolidateTests(unittest.IsolatedAsyncioTestCase):
         """模型提示中携带已记录内容，供模型做语义去重判断。"""
         with tempfile.TemporaryDirectory() as tmp:
             daily = self._make_daily(tmp)
+            # daily.append 总是写「今天」的文件，故目标日期用本地今天
+            today = datetime.now().strftime("%Y-%m-%d")
             daily.append("会话总结", "已有会话事实")
             provider = _DreamProvider()
-            await dream_consolidate(provider, daily, "2026-08-05", MESSAGES)
+            await dream_consolidate(provider, daily, today, MESSAGES)
             self.assertEqual(len(provider.requests), 1)
             prompt = provider.requests[0][0]["content"]
             self.assertIn("已记录的 daily 内容", prompt)

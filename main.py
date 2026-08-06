@@ -20,7 +20,7 @@ import json
 import os
 import signal
 import sys
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from config import load_config
@@ -338,7 +338,8 @@ async def watch_channel_start_failures(tasks, channels, *, ignore_indices=()):
     await asyncio.Future()
 
 
-# ===== 每日做梦整理（TASK-011 第二阶段：定时调度 + 启动补做）=====
+# ===== 每日做梦整理（TASK-011 定时调度 + 启动补做；TASK-013 语义修正：
+#       定时整理「昨天全天」/ 启动补做「最后有消息日期」/ 晚启动竞态修复）=====
 # 与 reminders/scheduler.py 的 ReminderScheduler 同理：独立 asyncio 后台
 # task、注入时钟、动态等待；本模块不重构 reminders，二者互不影响。
 DEFAULT_DREAM_TIME = "02:00"
@@ -387,12 +388,14 @@ async def _dream_default_wait(event: asyncio.Event, timeout: float) -> None:
 
 
 class DreamScheduler:
-    """每日定时做梦整理调度器（TASK-011）。
+    """每日定时做梦整理调度器（TASK-011；TASK-013 语义修正）。
 
     仿照 ReminderScheduler 的「动态等待 + 可注入时钟」循环：独立 asyncio
     后台 task，每个本地日到 ``dream_time``（HH:MM，实例时区）到点执行一次
-    ``consolidate_today()``（整理当天内容）；进程晚启动（已过到点）则启动后
-    立即补跑当天一次。``consolidate_today`` 内部失败静默（不抛异常），故调度
+    ``consolidate_today()``——目标日期是**昨天**（整理「上次做梦以来的完整
+    一天」：8-10 02:00 整理 8-9 全天，含凌晨尾巴）；进程晚启动（已过到点）则
+    启动后立即补跑**昨天**一次（不再像旧语义那样把「当天」记为已整理、从而
+    吞掉昨天的补做）。``consolidate_today`` 内部失败静默（不抛异常），故调度
     器不会阻塞聊天或启动。
 
     可测性：注入 ``clock``（``now() -> datetime``）与 ``wait``（event, timeout），
@@ -433,7 +436,7 @@ class DreamScheduler:
             await asyncio.gather(task, return_exceptions=True)
 
     async def run(self) -> None:
-        """调度主循环：每个本地日到点最多执行一次；晚启动立即补跑当天。
+        """调度主循环：每个本地日到点执行一次「整理昨天」；晚启动立即补跑昨天。
 
         循环结构仿照 ReminderScheduler：注入时钟 + 可中断的 wait，便于单测
         用假时钟推进，无需真实 sleep。
@@ -444,7 +447,7 @@ class DreamScheduler:
             local_today = now.astimezone(ZoneInfo(self.timezone)).date()
             if last_date != local_today:
                 # 今天还没执行过：到点时刻在今天则睡到到点（已到则 delay=0）；
-                # 到点已过（进程晚启动）则立即补跑今天。
+                # 到点已过（进程晚启动）则立即补跑昨天（整理目标本就是昨天）。
                 next_run = _next_dream_run(now, self.dream_time, self.timezone)
                 if next_run.date() == local_today:
                     delay = max(0.0, (next_run - now).total_seconds())
@@ -474,9 +477,11 @@ class DreamScheduler:
 class DreamState:
     """维护做梦状态文件 ``<memory_dir>/dream_state.json``。
 
-    记录 ``{"last_dream_date": "YYYY-MM-DD"}``：最近一次完成做梦整理的日期。
-    - 启动补做：``last_dream_date < 昨天`` → 补整理前一天并更新本文件；
-    - 每日定时到点：整理当天后同步更新（避免下次启动重复补做昨天）。
+    记录 ``{"last_dream_date": "YYYY-MM-DD"}``：最近一次**真正完成做梦整理**
+    的日期（该日有消息且整理成功；无消息日期、模型失败日期不推进）。
+    - 每日定时到点：整理昨天后同步更新；
+    - 启动补做：补做「最后有消息的日期」后更新；
+    - 单调前进：只前进不后退（定时与补做并发更新不回退）。
     文件读写均为尽力而为：缺失/损坏按「无记录」处理，写失败静默忽略
     （运行时产物，绝不阻断启动或聊天）。
     """
@@ -518,31 +523,73 @@ class DreamState:
             pass
 
 
-def should_catch_up(last_dream_date: str | None, today: datetime.date) -> str | None:
-    """启动补做目标：昨天未整理则返回昨天（YYYY-MM-DD），否则返回 None。
+def find_last_active_date(
+    session_manager,
+    last_dream_date: str | None,
+    today: datetime.date,
+    *,
+    timezone: str = "UTC",
+) -> str | None:
+    """启动补做目标：从昨天往前找最后一个有消息的日期（YYYY-MM-DD）。
 
-    - 无状态文件（首次启动）视为「昨天未整理」，补做一次昨天；
-    - ``last_dream_date < 昨天`` 时只补最近 1 天（昨天），超期不回溯；
-    - ``last_dream_date`` 已覆盖昨天（== 或晚于）则无需补做。
+    语义（TASK-013）：只补「最后有消息的那一天」，无消息日期不做无用功、
+    也不推进状态。
+    - 只在 ``last_dream_date < D < today`` 内找：严格晚于上次真正整理完成的
+      日期、且早于今天（当天内容不完整，归明天的定时整理）；
+    - 复用 ``collect_messages_for_date`` 的过滤（含 memory_patch/snapshot 过滤
+      与按会话文件 mtime 剪枝），日期倒序扫描、命中即返回——**只补一天**，
+      不做全量回溯；
+    - 找不到（含 last 已覆盖昨天、未来标记等）返回 None，调用方不做、不推进。
     """
-    yesterday = today - timedelta(days=1)
-    yesterday_str = yesterday.isoformat()
-    if last_dream_date is None or last_dream_date < yesterday_str:
-        return yesterday_str
+    last: datetime.date | None = None
+    if last_dream_date:
+        try:
+            last = date.fromisoformat(last_dream_date)
+        except ValueError:
+            last = None
+    cursor = today - timedelta(days=1)
+    while last is None or cursor > last:
+        if collect_messages_for_date(
+            session_manager, cursor.isoformat(), timezone=timezone, stop_at_first=True
+        ):
+            return cursor.isoformat()
+        cursor -= timedelta(days=1)
+        if cursor.year <= 2000:
+            break  # 兜底护栏：异常状态（last 远古/损坏）下避免无限扫描
     return None
 
 
-def collect_messages_for_date(session_manager, date_str: str) -> list:
-    """收集指定日期（YYYY-MM-DD）各会话的关键消息，供做梦整理。
+def collect_messages_for_date(
+    session_manager,
+    date_str: str,
+    *,
+    timezone: str = "UTC",
+    stop_at_first: bool = False,
+) -> list:
+    """收集指定日期（YYYY-MM-DD）各会话的关键消息，供做梦整理 / 补做目标查找。
 
     - 枚举所有会话 JSONL，取 ``timestamp`` 命中该日期的消息（保留原始消息，
       供模型提取事件）；
     - 过滤掉系统内部的记忆补丁/快照消息（``<memory_patch>/<memory_snapshot>``，
       非用户事件，避免污染整理输入）；
+    - 剪枝：会话文件未被该日修改过（mtime 早于该日零点）则不可能含该日消息，
+      跳过不读，避免「找最后有消息日期」做无谓全量扫描；
+    - ``stop_at_first=True`` 时命中首条即返回（只需判断「该日有没有消息」）；
     - 单会话读取失败静默跳过（不影响其他会话，也不阻断启动）。
     """
     messages: list = []
+    try:
+        year, month, day = (int(part) for part in date_str.split("-"))
+        day_start_epoch = datetime(year, month, day, tzinfo=ZoneInfo(timezone)).timestamp()
+    except (ValueError, KeyError):
+        day_start_epoch = 0.0  # 非法日期/时区：不剪枝，按旧行为全读
     for stem in session_manager.list_sessions():
+        path = os.path.join(session_manager.sessions_dir, stem + ".jsonl")
+        try:
+            if os.path.getmtime(path) < day_start_epoch:
+                continue
+        except OSError:
+            pass
         key = stem.replace("_", ":")
         try:
             records = session_manager.get_session_messages(key)
@@ -555,22 +602,34 @@ def collect_messages_for_date(session_manager, date_str: str) -> list:
             if is_patch_message(msg) or is_snapshot_message(msg):
                 continue
             messages.append(msg)
+            if stop_at_first:
+                return messages
     return messages
 
 
 async def run_dream_for_date(
-    provider, daily, session_manager, dream_state, date_str: str
+    provider,
+    daily,
+    session_manager,
+    dream_state,
+    date_str: str,
+    *,
+    timezone: str = "UTC",
 ) -> None:
     """对指定日期执行一次做梦整理（失败静默，供启动补做与定时调度共用）。
 
     - 数据源：当天各会话关键消息（``collect_messages_for_date``）+ 当天 daily
       已有内容（``dream_consolidate`` 内部读取并让模型去重）；
-    - 完成后更新 ``dream_state``（last_dream_date = date_str）；模型调用失败
-      时不更新，保证下次启动补做可重试该日期；
+    - 该日期**无消息**：不调模型、不更新 last_dream_date（不做无意义整理，
+      也不把无消息日期记为已整理——否则会推进状态导致有内容的日子被永久跳过）；
+    - 有消息且模型整理成功：更新 ``dream_state``（last_dream_date = date_str）；
+      模型调用失败时不更新，保证下次启动补做可重试该日期；
     - 任何异常静默返回，不阻塞聊天或启动。
     """
     try:
-        messages = collect_messages_for_date(session_manager, date_str)
+        messages = collect_messages_for_date(session_manager, date_str, timezone=timezone)
+        if not messages:
+            return
         done = await dream_consolidate(provider, daily, date_str, messages)
     except Exception:  # noqa: BLE001 - 做梦失败静默
         return
@@ -579,6 +638,97 @@ async def run_dream_for_date(
             dream_state.write_last_dream_date(date_str)
         except Exception:  # noqa: BLE001 - 状态写失败不阻断
             pass
+
+
+class DreamComponents:
+    """每日做梦整理的可测组装件：定时调度器 + 启动补做协程。
+
+    ``build_dream_components`` 返回本对象，供 build_shared 启动/收尾使用，
+    也便于单测直接构造完整做梦管线（注入假时钟验证定时目标与补做目标）。
+    """
+
+    def __init__(self, scheduler, consolidate_today, catch_up_yesterday):
+        self.scheduler = scheduler
+        self.consolidate_today = consolidate_today
+        self.catch_up_yesterday = catch_up_yesterday
+
+
+def build_dream_components(
+    provider,
+    daily_memory,
+    session_manager,
+    dream_state,
+    *,
+    timezone: str,
+    dream_time: str = DEFAULT_DREAM_TIME,
+    clock=None,
+) -> DreamComponents:
+    """组装每日做梦整理（TASK-011 定时调度 + 启动补做；TASK-013 语义修正）。
+
+    - 定时做梦（``consolidate_today``）：整理**昨天**（today−1）——每个本地日
+      到 dream_time 整理「上次做梦以来的完整一天」；
+    - 启动补做（``catch_up_yesterday``）：从昨天往前找「最后一个有消息的日期」
+      补做它（仅一天）；无消息则不做、不推进状态；
+    - ``last_dream_date`` 只推进到真正整理完成的日期（无消息/模型失败不推进，
+      只前进不后退）；
+    - 竞态修复：晚启动时调度器「立即补跑」的目标也是昨天（不再是当天），从根
+      上消除「当天补跑先推进 last → 昨天补做被跳过」的旧路径；定时补跑与启动
+      补做可能算出同一目标（如 last < 昨天且昨天有消息），经本进程去重集合 +
+      串行锁保证只整理一次、不重复不冲突。
+    - ``last_dream_date`` 只前进不后退：无消息/模型失败不推进，并发更新不回退。
+
+    可测性：``clock``（``now() -> datetime``）注入后，定时与补做的「今天」都
+    以该时钟为准；生产环境不传则用系统时钟。
+    """
+    now_fn = clock.now if clock is not None else None
+    # 本进程「本次启动已整理完成」的日期集合 + 串行锁：定时补跑与启动补做可能
+    # 算出同一个目标（如 last < 昨天 且昨天有消息时两者都指向昨天），先到者整理、
+    # 后到者见已整理即跳过，避免并发重复调模型/重复写盘。
+    _dedup_lock = asyncio.Lock()
+    _done_this_run: set = set()
+
+    def _today() -> datetime.date:
+        """实例时区下的「今天」（可注入时钟；与 daily 按本地日期命名一致）。"""
+        if now_fn is None:
+            return _today_date(timezone)
+        return _as_aware(now_fn()).astimezone(ZoneInfo(timezone)).date()
+
+    async def run_dream(date_str: str) -> None:
+        async with _dedup_lock:
+            if date_str in _done_this_run:
+                return  # 本进程本次启动已整理过该日
+            await run_dream_for_date(
+                provider, daily_memory, session_manager, dream_state, date_str,
+                timezone=timezone,
+            )
+            # run_dream_for_date 完成后若该日已真正整理完成（last 已覆盖它），
+            # 记入去重集合；无消息/模型失败不推进 last → 不入集合，下次可重试。
+            last = dream_state.read_last_dream_date()
+            if last is not None and last >= date_str:
+                _done_this_run.add(date_str)
+
+    async def consolidate_today() -> None:
+        """定时到点整理「昨天」全天（含凌晨尾巴），无论上次状态如何都推进。"""
+        await run_dream((_today() - timedelta(days=1)).isoformat())
+
+    async def catch_up_yesterday() -> None:
+        """启动补做：补「最后有消息的日期」（last < D < 今天），只补一天。"""
+        target = find_last_active_date(
+            session_manager,
+            dream_state.read_last_dream_date(),
+            _today(),
+            timezone=timezone,
+        )
+        if target is not None:
+            await run_dream(target)
+
+    scheduler = DreamScheduler(
+        consolidate_today,
+        dream_time=dream_time,
+        timezone=timezone,
+        clock=clock,
+    )
+    return DreamComponents(scheduler, consolidate_today, catch_up_yesterday)
 
 
 def build_shared() -> dict:
@@ -1005,42 +1155,28 @@ async def amain() -> None:
         reminder_service.attach_scheduler(reminder_scheduler)
         reminder_service.attach_cleanup(cleanup_scheduled_task)
 
-    # 每日做梦整理（TASK-011）：启动补做 + 每日定时调度。
-    # - 启动补做：异步后台执行，不阻塞启动；昨天未整理则补整理前一天。
-    # - 定时调度：独立 asyncio 后台 task，每个本地日到 dream_time 整理当天。
+    # 每日做梦整理（TASK-011 定时调度 + 启动补做；TASK-013 语义修正）。
+    # - 定时调度：独立 asyncio 后台 task，每个本地日到 dream_time 整理「昨天
+    #   全天」（完整 24h，含凌晨尾巴）；进程晚启动（已过到点）立即补跑昨天。
+    # - 启动补做：异步后台执行，不阻塞启动；从昨天往前找「最后一个有消息的
+    #   日期」补做它（仅一天），无消息日期不做、不推进状态。
+    # - last_dream_date 只推进到真正整理完成的日期；无消息/模型失败不推进。
     # 两者失败静默（内部已吞异常），不会阻塞聊天或启动；与 reminders 调度器
     # 是相互独立的 task，互不影响（优雅关闭见下方 amain 收尾段）。
     dream_state = DreamState(
         os.path.join(shared["config"].workspace, "workspace", "memory")
     )
-
-    async def run_dream(date_str: str) -> None:
-        await run_dream_for_date(
-            shared["provider"],
-            shared["daily_memory"],
-            shared["session_manager"],
-            dream_state,
-            date_str,
-        )
-
-    async def consolidate_today() -> None:
-        await run_dream(_today_date(shared["config"].timezone).isoformat())
-
-    async def catch_up_yesterday() -> None:
-        target = should_catch_up(
-            dream_state.read_last_dream_date(),
-            _today_date(shared["config"].timezone),
-        )
-        if target is not None:
-            await run_dream(target)
-
-    dream_scheduler = DreamScheduler(
-        consolidate_today,
-        dream_time=shared["config"].dream_time,
+    dream_components = build_dream_components(
+        shared["provider"],
+        shared["daily_memory"],
+        shared["session_manager"],
+        dream_state,
         timezone=shared["config"].timezone,
+        dream_time=shared["config"].dream_time,
     )
+    dream_scheduler = dream_components.scheduler
     dream_scheduler_task = dream_scheduler.start()
-    catch_up_task = asyncio.create_task(catch_up_yesterday())
+    catch_up_task = asyncio.create_task(dream_components.catch_up_yesterday())
 
     def clear_callback(session_key: str) -> None:
         """/clear 命令回调：按完整 session_key 清空对应会话历史。

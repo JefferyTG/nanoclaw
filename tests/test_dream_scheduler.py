@@ -1,15 +1,20 @@
-"""Tests for TASK-011 第二阶段：定时做梦调度 + 启动补做 + dream_time 配置。
+"""Tests for TASK-011 定时做梦调度 + 启动补做 + dream_time 配置；
+TASK-013 语义修正（定时整理昨天 / 补做最后有消息日期 / 晚启动竞态 / 无消息不推进）。
 
 覆盖：
 - config：dream_time 默认值 / 配置文件覆盖 / 缺省回退不报错（同 context_budget_tokens）；
-- DreamState：dream_state.json 读写、缺失/损坏按无记录、写失败静默；
-- should_catch_up：首次启动补昨天、已整理不重复补、超期只补最近 1 天；
-- collect_messages_for_date：按日期过滤 + 过滤记忆补丁/快照消息；
-- DreamScheduler：mock 时钟推进到 dream_time 触发执行、晚启动立即补跑当天、
+- DreamState：dream_state.json 读写、缺失/损坏按无记录、写失败静默、只前进不后退；
+- find_last_active_date（替代旧 should_catch_up）：从昨天往前找最后一个有消息的
+  日期（last < D < today）、只补一天、今天消息不算、patch/snapshot 不计为有消息；
+- collect_messages_for_date：按日期过滤 + 过滤记忆补丁/快照消息 + mtime 剪枝；
+- DreamScheduler：mock 时钟推进到 dream_time 触发执行、晚启动立即补跑（目标=昨天）、
   实例时区换算、stop 优雅关闭、整理异常不影响调度循环；
 - 与 ReminderScheduler 独立 task 互不影响；
-- run_dream_for_date：补做写 daily + 更新状态；模型失败不更新状态；
-  无消息不调模型但标记已整理；
+- run_dream_for_date：有消息补做写 daily + 更新状态；模型失败不更新状态；
+  无消息不调模型、不推进状态；
+- DreamPipelineTests（TASK-013 验收）：定时到点整理昨天、连续每日不重不漏、
+  停机多天补最后有消息日期、晚启动竞态修复、旧代码「last=当天」遗留状态仍恢复昨天、
+  无消息不推进、last 只前进不后退；
 - dream_consolidate 返回值契约（True=完成 / False=模型失败）。
 """
 
@@ -26,9 +31,10 @@ from config import NanoClawConfig, load_config
 from main import (
     DreamScheduler,
     DreamState,
+    build_dream_components,
     collect_messages_for_date,
+    find_last_active_date,
     run_dream_for_date,
-    should_catch_up,
 )
 from agent.daily import DailyMemory, dream_consolidate
 from providers.base import LLMResponse
@@ -77,6 +83,35 @@ MESSAGES = [
     {"role": "user", "content": "今天完成了做梦机制的第二阶段"},
     {"role": "assistant", "content": "好的，已整理到 daily。"},
 ]
+
+
+def _write_session_file(sessions_dir, records):
+    """写一个 cli_direct 会话文件，并把文件 mtime 拨到「最后一条消息日期 + 1 天」。
+
+    测试常使用相对系统时钟的「未来」时间戳（如 2026-08-10 的消息），而
+    collect_messages_for_date 现在按会话文件 mtime 剪枝：若 mtime 早于目标日零点
+    会误判该日无消息。把 mtime 拨到消息日期之后可避免剪枝误伤，同时不影响
+    「确实没有消息的日期」仍被正确剪枝。
+    """
+    os.makedirs(sessions_dir, exist_ok=True)
+    path = os.path.join(sessions_dir, "cli_direct.jsonl")
+    with open(path, "w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    latest = None
+    for r in records:
+        ts = r.get("timestamp")
+        if not ts:
+            continue
+        try:
+            dt = datetime.fromisoformat(ts)
+        except ValueError:
+            continue
+        if latest is None or dt > latest:
+            latest = dt
+    if latest is not None:
+        mtime = (latest + timedelta(days=1)).timestamp()
+        os.utime(path, (mtime, mtime))
 
 
 # —— 配置：dream_time 缺省默认值 / 覆盖 / 缺省不报错 ——
@@ -132,25 +167,81 @@ class DreamStateTests(unittest.TestCase):
         state.write_last_dream_date("2026-08-04")  # 不应抛出
 
 
-# —— 启动补做判定：should_catch_up ——
+# —— 启动补做目标：find_last_active_date（从昨天往前找最后一个有消息的日期）——
 
-class ShouldCatchUpTests(unittest.TestCase):
-    def test_first_run_catches_up_yesterday(self):
-        # 首次启动无状态文件：last_dream_date 视为无，补做一次昨天
-        self.assertEqual(should_catch_up(None, date(2026, 8, 5)), "2026-08-04")
+class FindLastActiveDateTests(unittest.TestCase):
+    @staticmethod
+    def _write_session(sessions_dir, records):
+        _write_session_file(sessions_dir, records)
 
-    def test_yesterday_already_done_noop(self):
-        self.assertIsNone(should_catch_up("2026-08-04", date(2026, 8, 5)))
+    def test_first_run_no_messages_returns_none(self):
+        # 首次启动无会话/无消息：不补做
+        with tempfile.TemporaryDirectory() as tmp:
+            sm = SessionManager(os.path.join(tmp, "sessions"))
+            self.assertIsNone(find_last_active_date(sm, None, date(2026, 8, 5)))
 
-    def test_stale_state_only_catches_yesterday(self):
-        # last_dream_date 落后 3 天：只补最近 1 天（昨天），超期不回溯
-        self.assertEqual(should_catch_up("2026-08-01", date(2026, 8, 5)), "2026-08-04")
+    def test_first_run_yesterday_has_messages(self):
+        # 首次启动、昨天有消息：补做昨天
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_session(tmp, [
+                {"role": "user", "content": "x", "timestamp": "2026-08-04T10:00:00"},
+            ])
+            sm = SessionManager(tmp)
+            self.assertEqual(find_last_active_date(sm, None, date(2026, 8, 5)), "2026-08-04")
 
-    def test_today_marked_noop(self):
-        self.assertIsNone(should_catch_up("2026-08-05", date(2026, 8, 5)))
+    def test_multi_day_downtime_targets_last_active_date(self):
+        # 停机多天：8-9 有消息、8-10/11/12 无消息 → 8-13 启动 → 目标 2026-08-09（不是 8-12）
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_session(tmp, [
+                {"role": "user", "content": "8-9 的消息", "timestamp": "2026-08-09T10:00:00"},
+            ])
+            sm = SessionManager(tmp)
+            self.assertEqual(find_last_active_date(sm, None, date(2026, 8, 13)), "2026-08-09")
 
-    def test_future_marker_noop(self):
-        self.assertIsNone(should_catch_up("2026-08-06", date(2026, 8, 5)))
+    def test_already_covered_or_future_marker_noop(self):
+        # last 已覆盖昨天 / == 昨天 / 未来标记：均不重复补做
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_session(tmp, [
+                {"role": "user", "content": "x", "timestamp": "2026-08-04T10:00:00"},
+            ])
+            sm = SessionManager(tmp)
+            self.assertIsNone(find_last_active_date(sm, "2026-08-04", date(2026, 8, 5)))
+            self.assertIsNone(find_last_active_date(sm, "2026-08-05", date(2026, 8, 5)))
+            self.assertIsNone(find_last_active_date(sm, "2026-08-06", date(2026, 8, 5)))
+
+    def test_finds_latest_active_date_after_last(self):
+        # 多天有消息：返回 last 之后最近的日期（只补一天）
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_session(tmp, [
+                {"role": "user", "content": "x", "timestamp": "2026-08-09T10:00:00"},
+                {"role": "user", "content": "y", "timestamp": "2026-08-11T10:00:00"},
+            ])
+            sm = SessionManager(tmp)
+            self.assertEqual(find_last_active_date(sm, "2026-08-08", date(2026, 8, 13)), "2026-08-11")
+            self.assertEqual(find_last_active_date(sm, None, date(2026, 8, 13)), "2026-08-11")
+
+    def test_today_messages_do_not_count(self):
+        # 今天有消息不算：补做目标是今天之前的最后有消息日期
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_session(tmp, [
+                {"role": "user", "content": "昨天", "timestamp": "2026-08-04T10:00:00"},
+                {"role": "user", "content": "今天", "timestamp": "2026-08-05T10:00:00"},
+            ])
+            sm = SessionManager(tmp)
+            self.assertEqual(find_last_active_date(sm, None, date(2026, 8, 5)), "2026-08-04")
+            self.assertEqual(find_last_active_date(sm, "2026-08-04", date(2026, 8, 5)), None)
+
+    def test_patch_snapshot_only_date_is_not_active(self):
+        # 只有 memory_patch/snapshot 的日期视为无消息（不补做）
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_session(tmp, [
+                {"role": "system", "content": "<memory_patch revision=\"1\">x</memory_patch>",
+                 "timestamp": "2026-08-04T10:00:00"},
+                {"role": "system", "content": "<memory_snapshot>y</memory_snapshot>",
+                 "timestamp": "2026-08-04T11:00:00"},
+            ])
+            sm = SessionManager(tmp)
+            self.assertIsNone(find_last_active_date(sm, None, date(2026, 8, 5)))
 
 
 # —— 消息收集：按日期过滤 + 过滤记忆补丁/快照 ——
@@ -216,7 +307,7 @@ class DreamSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0], datetime(2026, 8, 5, 2, 0, tzinfo=timezone.utc))
 
     async def test_late_start_runs_immediately_then_waits_until_tomorrow(self):
-        """进程晚启动（已过 dream_time）：立即补跑当天，随后睡到明天到点。"""
+        """进程晚启动（已过 dream_time）：立即补跑一次（目标=昨天，由 consolidate 决定），随后睡到明天到点。"""
         clock = FakeClock(datetime(2026, 8, 5, 3, 0, tzinfo=timezone.utc))
         calls = []
         waits = []
@@ -411,8 +502,8 @@ class CatchUpConsolidationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(state.read_last_dream_date())
             self.assertEqual(daily.read("2026-08-04"), "")
 
-    async def test_catchup_no_messages_marks_done_without_model(self):
-        """该日期无会话消息：不调模型，但标记已整理（避免每次启动重复尝试）。"""
+    async def test_no_messages_does_not_advance_state(self):
+        """该日期无会话消息：不调模型、不推进 last_dream_date（无消息日期不做、不推进）。"""
         with tempfile.TemporaryDirectory() as tmp:
             memory_dir = os.path.join(tmp, "memory")
             os.makedirs(memory_dir)
@@ -424,7 +515,7 @@ class CatchUpConsolidationTests(unittest.IsolatedAsyncioTestCase):
             await run_dream_for_date(provider, daily, sm, state, "2026-08-04")
 
             self.assertEqual(provider.requests, [])
-            self.assertEqual(state.read_last_dream_date(), "2026-08-04")
+            self.assertIsNone(state.read_last_dream_date())
 
     async def test_dream_consolidate_return_contract(self):
         """dream_consolidate 返回值契约：True=完成，False=模型失败/空响应。"""
@@ -440,6 +531,196 @@ class CatchUpConsolidationTests(unittest.IsolatedAsyncioTestCase):
                 _DreamProvider(), daily, "2026-08-04", []))  # 无消息=无事可做
             self.assertTrue(await dream_consolidate(
                 _DreamProvider(), None, "2026-08-04", MESSAGES))  # daily 未启用
+
+
+
+
+# —— TASK-013 验收：定时整理昨天 / 补做最后有消息日期 / 晚启动竞态 / 无消息不推进 ——
+
+class DreamPipelineTests(unittest.IsolatedAsyncioTestCase):
+    """用 build_dream_components 组装完整做梦管线（注入假时钟），验证 TASK-013 语义。
+
+    覆盖验收标准：定时到点整理昨天、连续每日不重不漏、停机多天补最后有消息日期、
+    晚启动竞态修复（含旧代码「last=当天」遗留状态）、无消息不推进、last 只前进不后退。
+    """
+
+    def _make(self, tmp, clock, records=None):
+        memory_dir = os.path.join(tmp, "memory")
+        sessions_dir = os.path.join(tmp, "sessions")
+        os.makedirs(memory_dir)
+        if records:
+            _write_session_file(sessions_dir, records)
+        daily = DailyMemory(memory_dir)
+        provider = _DreamProvider()
+        state = DreamState(memory_dir)
+        sm = SessionManager(sessions_dir)
+        comps = build_dream_components(
+            provider, daily, sm, state, timezone="UTC", clock=clock
+        )
+        return comps, provider, daily, state
+
+    async def test_scheduled_targets_yesterday(self):
+        """定时到点语义：8-10 02:00 的 consolidate_today 整理「2026-08-09」（昨天全天）。"""
+        clock = FakeClock(datetime(2026, 8, 10, 2, 0, tzinfo=timezone.utc))
+        with tempfile.TemporaryDirectory() as tmp:
+            comps, provider, daily, state = self._make(tmp, clock, records=[
+                {"role": "user", "content": "8-9 白天的重要消息", "timestamp": "2026-08-09T10:00:00"},
+                {"role": "user", "content": "8-10 凌晨的消息不归昨天", "timestamp": "2026-08-10T00:30:00"},
+            ])
+            await comps.consolidate_today()
+            content = daily.read("2026-08-09")
+            self.assertIn("# 2026-08-09", content)          # 整理的是 8-9
+            self.assertIn("- 用户偏好中文回复", content)      # _DreamProvider 固定输出落盘
+            self.assertEqual(daily.read("2026-08-10"), "")  # 8-10（当天）不被整理
+            self.assertEqual(state.read_last_dream_date(), "2026-08-09")
+            self.assertEqual(len(provider.requests), 1)   # 8-9 有消息 → 模型被调用一次
+
+    async def test_consecutive_days_no_skip_no_dup(self):
+        """正常每日连续运行：8-10 02:00 整理 8-9、8-11 02:00 整理 8-10（不重不漏）。"""
+        clock = FakeClock(datetime(2026, 8, 10, 1, 0, tzinfo=timezone.utc))
+        with tempfile.TemporaryDirectory() as tmp:
+            comps, provider, daily, state = self._make(tmp, clock, records=[
+                {"role": "user", "content": "8-9 的事", "timestamp": "2026-08-09T12:00:00"},
+                {"role": "user", "content": "8-10 的事", "timestamp": "2026-08-10T12:00:00"},
+            ])
+            scheduler = comps.scheduler
+
+            async def wait(event, timeout):
+                clock.advance(timedelta(seconds=timeout))
+                if daily.read("2026-08-10"):
+                    await scheduler.stop()
+
+            scheduler._wait = wait
+            await scheduler.run()
+
+            self.assertIn("- 用户偏好中文回复", daily.read("2026-08-09"))
+            self.assertIn("- 用户偏好中文回复", daily.read("2026-08-10"))
+            self.assertEqual(state.read_last_dream_date(), "2026-08-10")
+
+    async def test_stale_catch_up_targets_last_active_date(self):
+        """停机多天：8-9 有消息、8-10/11/12 无消息 → 8-13 启动 → 补做 2026-08-09（不是 8-12）。"""
+        clock = FakeClock(datetime(2026, 8, 13, 9, 25, tzinfo=timezone.utc))
+        with tempfile.TemporaryDirectory() as tmp:
+            comps, provider, daily, state = self._make(tmp, clock, records=[
+                {"role": "user", "content": "8-9 的消息", "timestamp": "2026-08-09T10:00:00"},
+            ])
+            await comps.catch_up_yesterday()
+            self.assertIn("# 2026-08-09", daily.read("2026-08-09"))
+            self.assertEqual(daily.read("2026-08-12"), "")
+            self.assertEqual(state.read_last_dream_date(), "2026-08-09")  # 只推进到 8-9
+
+    async def test_late_start_recovers_yesterday_not_today(self):
+        """晚启动竞态修复：进程 8-6 09:25 启动（last=08-05、08-05 有消息未整理）→
+        补做 08-05 成功，不被「当天补跑」顶掉（last 不推进到 8-06）。"""
+        clock = FakeClock(datetime(2026, 8, 6, 9, 25, tzinfo=timezone.utc))
+        with tempfile.TemporaryDirectory() as tmp:
+            memory_dir = os.path.join(tmp, "memory")
+            sessions_dir = os.path.join(tmp, "sessions")
+            os.makedirs(memory_dir)
+            _write_session_file(sessions_dir, [
+                {"role": "user", "content": "8-5 白天没被整理的消息", "timestamp": "2026-08-05T14:00:00"},
+                {"role": "user", "content": "8-6 今天的消息", "timestamp": "2026-08-06T09:00:00"},
+            ])
+            daily = DailyMemory(memory_dir)
+            provider = _DreamProvider()
+            state = DreamState(memory_dir)
+            state.write_last_dream_date("2026-08-05")  # 旧代码留下的状态：last=8-5 但 8-5 全天未整理
+            sm = SessionManager(sessions_dir)
+            comps = build_dream_components(provider, daily, sm, state, timezone="UTC", clock=clock)
+
+            # 模拟 build_shared 的完整启动：定时调度（晚启动立即补跑）与启动补做并发执行
+            scheduler_task = asyncio.create_task(comps.scheduler.run())
+            catch_up_task = asyncio.create_task(comps.catch_up_yesterday())
+            await asyncio.sleep(0.1)
+            await comps.scheduler.stop()
+            await asyncio.gather(catch_up_task, scheduler_task, return_exceptions=True)
+
+            self.assertIn("- 用户偏好中文回复", daily.read("2026-08-05"))  # 8-5 被补做
+            self.assertEqual(daily.read("2026-08-06"), "")                # 当天不被整理
+            self.assertEqual(state.read_last_dream_date(), "2026-08-05")  # last 未被顶到 8-6
+
+    async def test_legacy_last_marked_today_still_recovers_yesterday(self):
+        """旧代码遗留：last 被「当天补跑」推进到当天（last=8-10、今天=8-10）时，
+        定时补跑仍整理昨天 8-9，不被状态误导跳过。"""
+        clock = FakeClock(datetime(2026, 8, 10, 9, 0, tzinfo=timezone.utc))
+        with tempfile.TemporaryDirectory() as tmp:
+            memory_dir = os.path.join(tmp, "memory")
+            sessions_dir = os.path.join(tmp, "sessions")
+            os.makedirs(memory_dir)
+            _write_session_file(sessions_dir, [
+                {"role": "user", "content": "8-9 的消息", "timestamp": "2026-08-09T12:00:00"},
+            ])
+            daily = DailyMemory(memory_dir)
+            provider = _DreamProvider()
+            state = DreamState(memory_dir)
+            state.write_last_dream_date("2026-08-10")  # 旧代码「当天补跑」把 last 推到当天
+            sm = SessionManager(sessions_dir)
+            comps = build_dream_components(provider, daily, sm, state, timezone="UTC", clock=clock)
+
+            await comps.consolidate_today()
+
+            self.assertIn("# 2026-08-09", daily.read("2026-08-09"))
+            self.assertEqual(state.read_last_dream_date(), "2026-08-10")  # 单调：不回退
+
+    async def test_no_messages_does_not_advance_in_pipeline(self):
+        """无消息日期（昨天空转）：定时到点不调模型、不推进 last_dream_date。"""
+        clock = FakeClock(datetime(2026, 8, 10, 2, 0, tzinfo=timezone.utc))
+        with tempfile.TemporaryDirectory() as tmp:
+            comps, provider, daily, state = self._make(tmp, clock)  # 无任何会话消息
+            await comps.consolidate_today()
+            self.assertEqual(provider.requests, [])
+            self.assertIsNone(state.read_last_dream_date())
+
+
+    async def test_late_start_no_double_consolidation(self):
+        """晚启动且 last<昨天、昨天有消息：调度器补跑与启动补做指向同一目标，
+        经本进程去重只整理一次（模型只被调用一次、不重复写盘）。"""
+        clock = FakeClock(datetime(2026, 8, 6, 9, 25, tzinfo=timezone.utc))
+        with tempfile.TemporaryDirectory() as tmp:
+            memory_dir = os.path.join(tmp, "memory")
+            sessions_dir = os.path.join(tmp, "sessions")
+            os.makedirs(memory_dir)
+            _write_session_file(sessions_dir, [
+                {"role": "user", "content": "8-5 的消息", "timestamp": "2026-08-05T12:00:00"},
+            ])
+            daily = DailyMemory(memory_dir)
+            provider = _DreamProvider()
+            state = DreamState(memory_dir)
+            state.write_last_dream_date("2026-08-04")  # last < 昨天：两者都会指向 8-5
+            sm = SessionManager(sessions_dir)
+            comps = build_dream_components(provider, daily, sm, state, timezone="UTC", clock=clock)
+
+            scheduler_task = asyncio.create_task(comps.scheduler.run())
+            catch_up_task = asyncio.create_task(comps.catch_up_yesterday())
+            await asyncio.sleep(0.1)
+            await comps.scheduler.stop()
+            await asyncio.gather(catch_up_task, scheduler_task, return_exceptions=True)
+
+            self.assertEqual(len(provider.requests), 1)  # 只整理一次
+            self.assertIn("- 用户偏好中文回复", daily.read("2026-08-05"))
+            self.assertEqual(state.read_last_dream_date(), "2026-08-05")
+
+    async def test_state_never_regresses_in_pipeline(self):
+        """last 只前进不后退：last=8-06 时补做 8-05 不回退状态（补做内容仍写盘）。"""
+        clock = FakeClock(datetime(2026, 8, 6, 9, 25, tzinfo=timezone.utc))
+        with tempfile.TemporaryDirectory() as tmp:
+            memory_dir = os.path.join(tmp, "memory")
+            sessions_dir = os.path.join(tmp, "sessions")
+            os.makedirs(memory_dir)
+            _write_session_file(sessions_dir, [
+                {"role": "user", "content": "8-5 的消息", "timestamp": "2026-08-05T10:00:00"},
+            ])
+            daily = DailyMemory(memory_dir)
+            provider = _DreamProvider()
+            state = DreamState(memory_dir)
+            state.write_last_dream_date("2026-08-06")  # 更晚的整理记录
+            sm = SessionManager(sessions_dir)
+            comps = build_dream_components(provider, daily, sm, state, timezone="UTC", clock=clock)
+
+            await comps.consolidate_today()  # 昨天=8-5，但 last 已是 8-6
+
+            self.assertIn("- 用户偏好中文回复", daily.read("2026-08-05"))  # 内容仍补做
+            self.assertEqual(state.read_last_dream_date(), "2026-08-06")   # 状态不回退
 
 
 if __name__ == "__main__":
