@@ -240,7 +240,7 @@ workspace/
 - 多模态历史在文件仍存在时按原字节重建，因此进程重启前后 API 形态一致；文件删除/变化是显式内容边界，且供应商是否缓存图片未知。
 - 子 Agent 图片沿用父会话 key；父 `assistant(tool_calls)` 记录保存有界的 `subagent_runs` 回放摘要和 `generated_images`。这些 UI 元数据在恢复模型上下文前会被剥离。
 - USER 偏长期个人信息，MEMORY 偏项目/工作事实；HISTORY 曾保存压缩轨迹（TASK-011 起不再写入，旧文件保留）；daily 保存 best-effort 事件摘要——`/clear` 追加写入 + 每日做梦整理（固定分类、去重、合并更新）。
-- MemorySearcher 启动时重建全部索引；每次搜索只刷新记忆文件部分，会话索引在当前进程内不会实时更新。
+- MemorySearcher 启动时重建全部索引；每次搜索前刷新记忆文件部分并**增量刷新会话索引**（TASK-012）：按会话文件 mtime/size 对比，只对变化/新增会话整会话重索引、对已删除（如 /clear）会话清索引，未变化跳过——新会话/新消息实时可搜，无需重启。
 - Weixin 状态目录为 `0700`，状态文件原子替换。context token 按 account/user
   持久化；一批入站先保存 context、发事件并等待 Python ack，整批完成后才提交
   去重 ID 和 cursor。崩溃语义为 at-least-once：允许重复，不允许先推进 cursor

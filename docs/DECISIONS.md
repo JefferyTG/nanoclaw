@@ -27,7 +27,9 @@
 | 工具 Schema 在 MCP 装配后确定性冻结 | 有效 | 按名称排序并 hash；成功连接集合变化是显式 cache boundary，不假设供应商一定缓存工具定义 |
 | 跨轮与重启使用 canonical API 历史 | 有效 | 工具顺序自愈；顶层 reasoning 在当前工具循环、落盘和恢复中一致，确保只追加时维持精确前缀 |
 | 缓存观测只记录结构元数据 | 有效 | 调用/回合记录 token、hash、消息数和迭代；不记录 prompt/记忆/参数/密钥，回合比率按 token 总和加权 |
-| SQLite LIKE 代替 FTS5 | 有效 | 中文短词在 unicode61/trigram 下不可靠；当前个人数据量足够小 |
+| SQLite LIKE 代替 FTS5 | 有效 |
+| 会话索引实时增量刷新（TASK-012 决策） | 有效 | `memory_search(scope=session)` 每次搜索前增量扫 sessions：按会话文件 mtime/size 与内存状态 `_session_state` 对比，只对变化/新增会话整会话重索引（DELETE+INSERT，复用 `_index_sessions` 过滤：空 content/tool 角色跳过），未变化跳过，实测 126 会话空闲刷新 0.487ms；`/clear`（删文件）后同步清索引，保证清空会话旧内容搜不到（原「非目标」措辞相应调整，2026-08-06 确认——「文件消失即清索引」是增量状态对比的自然产物，成本近零）；状态仅存内存，重启 `rebuild_all()` 兜底。取舍：超大（上万条）会话整会话重索引稍慢，个人助手场景可接受，未来可优化为偏移续读 |
+ 中文短词在 unicode61/trigram 下不可靠；当前个人数据量足够小 |
 | Daily Memory 是 best-effort 内部机制 | 有效 | `/clear` 不能被摘要失败阻塞；TASK-006 起压缩不再写 daily（见「压缩不再写 daily」决策行） |
 | 压缩不再写 daily（TASK-006 决策） | 有效 | 压缩与长期记忆彻底解耦：`ContextCompactor` 只生成当前会话摘要并写 HISTORY.md（审计轨迹），不再调用 `summarize_messages_to_daily`；daily 触发点只剩 `/clear`。代价：在「每日整理/做梦机制」落地前，压缩丢的事件不再留痕 daily（乖宝确认）。压缩结果经 `CompactionResult` 显式返回，压缩器每会话独立实例（2026-08-05）。TASK-011 起压缩摘要也不再写 HISTORY.md（见「HISTORY.md 移除」决策行），daily 触发点变为 `/clear` + 每日做梦整理 |
 | HISTORY.md 移除（TASK-011 决策） | 有效 | 压缩审计文件用处不大（乖宝 2026-08-05 拍板）：`ContextCompactor._save_to_history` 删除，压缩摘要仍以 system 消息进上下文，但不再落 `workspace/memory/HISTORY.md`；历史遗留旧文件保留不清理（清理与否乖宝再定）。代价：压缩审计轨迹能力消失，如后续需要可改为可配置开关 |

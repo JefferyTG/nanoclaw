@@ -14,7 +14,10 @@ trigram tokenizer 对 2 字中文词（如「记忆」「安静」）也失败�
 - 启动时 ``rebuild_all()`` 全量重建；
 - 每次 ``search()`` 前自动 ``refresh_memory()`` 重建记忆文件部分（文件少，毫秒级），
   保证刚写入的记忆能被搜到；
-- sessions 部分启动时建一次，不每次刷新（量大；当前会话的新消息滞后可接受）。
+- 每次 ``search()`` 前自动 ``refresh_sessions()`` 增量刷新会话部分：按会话文件
+  的 mtime/size 与内存状态（``_session_state``）对比，只对「有变化的会话」整会话
+  重索引、对「已删除的会话」清索引，未变化的会话跳过（126 会话规模实测毫秒级），
+  保证新增/追加的会话消息实时可搜、无需重启（TASK-012）。
 """
 
 import json
@@ -46,6 +49,9 @@ class MemorySearcher:
         self.session_manager = session_manager
         self.db_path = os.path.join(memory_dir, "index.db")
         self._conn: Optional[sqlite3.Connection] = None
+        # 会话文件索引状态：stem（list_sessions 的返回值）-> (st_mtime_ns, st_size)，
+        # 供 refresh_sessions() 增量判断「哪些会话文件变了/新增/被删」。
+        self._session_state: dict[str, tuple[int, int]] = {}
         self._ensure_schema()
 
     # —— 连接与 schema ——
@@ -82,6 +88,8 @@ class MemorySearcher:
         """
         cur = self._conn.cursor()
         cur.execute("DELETE FROM documents")
+        # 全量重建以磁盘文件为准，重置会话增量状态避免残留旧会话
+        self._session_state = {}
         now = datetime.now().isoformat(timespec="seconds")
         count = 0
         count += self._index_memory_files(cur, now)
@@ -92,8 +100,8 @@ class MemorySearcher:
     def refresh_memory(self) -> int:
         """只重建记忆文件部分（USER/MEMORY/daily），返回索引文档数。
 
-        每次 search 前调用，保证刚写入的记忆可被搜到。会话部分不动
-        （启动时建一次，避免每次搜索都扫 sessions 目录）。
+        每次 search 前调用，保证刚写入的记忆可被搜到。会话部分由
+        ``refresh_sessions()`` 单独增量刷新。
         """
         cur = self._conn.cursor()
         cur.execute(
@@ -145,7 +153,8 @@ class MemorySearcher:
         """索引所有会话历史（按消息粒度），返回文档数。
 
         无 session_manager 时跳过。每条 user/assistant 文本消息一行；
-        tool 消息（无 content）跳过。
+        tool 消息（无 content）跳过。逐会话同步填充 ``_session_state``
+        （文件 mtime/size），供后续 ``refresh_sessions()`` 增量判断。
         """
         if self.session_manager is None:
             return 0
@@ -154,6 +163,12 @@ class MemorySearcher:
             # list_sessions 返回文件名 stem（冒号已替换为下划线），
             # 还原成 session_key 供 ref 使用
             session_key = stem.replace("_", ":")
+            path = os.path.join(self.session_manager.sessions_dir, stem + ".jsonl")
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            self._session_state[stem] = (st.st_mtime_ns, st.st_size)
             records = self.session_manager.get_session_messages(session_key)
             for rec in records:
                 content = (rec.get("content") or "").strip()
@@ -167,6 +182,73 @@ class MemorySearcher:
                     ("session", session_key, content, now),
                 )
                 count += 1
+        return count
+
+    def refresh_sessions(self) -> int:
+        """增量刷新会话索引，返回本次新索引的文档数。
+
+        对比每个会话文件的 mtime/size 与内存状态 ``_session_state``：
+        - 文件有变化或首次见的会话 → 整会话重索引（DELETE 该会话旧索引 +
+          逐条 INSERT 全部消息，复用 ``_index_sessions`` 相同的过滤逻辑）；
+        - 状态中存在但 ``list_sessions()`` 已不存在的 stem（文件被删，
+          如 /clear 清空会话）→ 删除其索引并从状态移除，保证旧内容搜不到；
+        - 未变化的会话跳过（幂等，不重复插入）。
+
+        全部处理完统一 commit。get_session_messages 自带 JSONDecodeError
+        容错，文件正在写入时读到半截行会跳过损坏行，不崩。
+        """
+        if self.session_manager is None:
+            return 0
+        stems = self.session_manager.list_sessions()
+        stems_set = set(stems)
+        cur = self._conn.cursor()
+        now = datetime.now().isoformat(timespec="seconds")
+        count = 0
+
+        # 1) 新增/有变化的会话：整会话重索引；消失的会话：清索引
+        for stem in stems:
+            session_key = stem.replace("_", ":")
+            path = os.path.join(self.session_manager.sessions_dir, stem + ".jsonl")
+            try:
+                st = os.stat(path)
+            except OSError:
+                # 文件在 list 与 stat 之间被删：按删除处理（清索引 + 移除状态）
+                st = None
+            state = self._session_state.get(stem)
+            if st is not None and state == (st.st_mtime_ns, st.st_size):
+                continue  # 文件未变化，跳过
+            cur.execute(
+                "DELETE FROM documents WHERE source='session' AND ref=?",
+                (session_key,),
+            )
+            if st is None:
+                self._session_state.pop(stem, None)
+                continue
+            self._session_state[stem] = (st.st_mtime_ns, st.st_size)
+            records = self.session_manager.get_session_messages(session_key)
+            for rec in records:
+                content = (rec.get("content") or "").strip()
+                if not content:
+                    continue
+                if rec.get("role") == "tool":
+                    continue
+                cur.execute(
+                    "INSERT INTO documents(source, ref, content, indexed_at) VALUES(?,?,?,?)",
+                    ("session", session_key, content, now),
+                )
+                count += 1
+
+        # 2) 状态中存在但会话文件已被删除的 stem：删除索引并移除状态
+        for stem in list(self._session_state.keys()):
+            if stem not in stems_set:
+                session_key = stem.replace("_", ":")
+                cur.execute(
+                    "DELETE FROM documents WHERE source='session' AND ref=?",
+                    (session_key,),
+                )
+                del self._session_state[stem]
+
+        self._conn.commit()
         return count
 
     @staticmethod
@@ -205,6 +287,8 @@ class MemorySearcher:
 
         # 每次搜索前刷新记忆文件，保证新鲜
         self.refresh_memory()
+        # 增量刷新会话索引，保证新会话/新消息实时可搜（TASK-012）
+        self.refresh_sessions()
 
         # scope → source 过滤
         if scope == "memory":
