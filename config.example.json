@@ -1,5 +1,6 @@
 {
   "api_key": "",
+  "tavily_api_key": "",
   "base_url": "https://api.siliconflow.cn/v1",
   "model": "Pro/moonshotai/Kimi-K2.5",
   "subagent_model": "",

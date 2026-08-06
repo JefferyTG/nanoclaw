@@ -16,7 +16,7 @@ NanoClaw 是一个本地优先、单进程、多渠道的个人 AI Agent 网关�
 | 飞书 | `lark-oapi` | WebSocket 长连接收文本/图片、IM API 发文本/图片 |
 | 微信 | Python `asyncio` + Node.js 20+ JSONL Bridge | iLink 扫码、长轮询、CDN AES 与私有持久状态 |
 | 工具扩展 | 自定义 Tool API、MCP stdio | 内置工具注册和外部 MCP Server 接入 |
-| 网络工具 | `httpx`、`ddgs`、`html2text` | 网页抓取、搜索、生图服务请求 |
+| 网络工具 | `httpx`、`ddgs`、`html2text`、Tavily Search/Extract（REST） | 网页抓取、多通道搜索（Tavily+ddgs 降级）、抓取降级链（httpx→Jina→Chrome→Tavily）、生图服务请求 |
 | 语音输入 | MediaRecorder、FFmpeg/ffprobe、`httpx` | Web 录音、格式规范化、云端 ASR |
 | 语音输出 | `edge-tts`、HTMLAudioElement | Web 新回复分段合成、顺序播放与取消 |
 | 技能 | Markdown + YAML frontmatter | 技能发现、摘要注入与按需加载 |

@@ -25,6 +25,7 @@
 | 语音朗读 TTS | ✅ | edge-tts 分句流水线，可取消，默认关（`tts_model` 配置启用） |
 | ReAct 工具循环 | ✅ | `max_iterations`、`turn_timeout_sec` 墙钟、重复工具防爆、180s 工具兜底 / Shell 60s |
 | 内置工具 | ✅ | 26 个（含 AskImage 条件注册）+ MCP 扩展（`{server}__{tool}`） |
+| 网络搜索/抓取 | ✅ | `web_search`：Tavily 主通道（结构化正文，中文友好）+ DuckDuckGo 降级兜底；`web_fetch`：httpx 静态 → Jina Reader → 本机 Chrome 无头渲染 → Tavily Extract 四级降级链，解决 JS 动态页/反爬/iframe（TASK-016） |
 | 场景 Agent | ✅ | Profile 驱动：独立 System Prompt、白名单、私有 Skill/受控工具 |
 | 记忆体系 | ✅ | USER/MEMORY/daily、SQLite LIKE 检索（会话索引实时增量刷新，TASK-012）、上下文预算动态配置（`context_budget_tokens`，默认 512k）超预算压缩（`ContextCompactor`，每会话独立实例、压缩不写 daily，TASK-006；压缩/快照重写保留原始时间戳，TASK-015）、跨会话记忆同步（全局/会话 revision + `<memory_patch>` 补丁注入与持久化；压缩后无条件重建完整快照，TASK-007；摘要输入降噪——工具结果只留结论，TASK-008；分块结构化摘要——map-reduce 按字段组织，TASK-009） |
 | 每日做梦整理 | ✅ | `dream_time`（默认 02:00）定时整理**前一天完整 24h**（昨天全天，TASK-013）各会话事件，按固定分类（用户变化/项目进展/会话总结）合并更新写入 daily，写入前行哈希去重；启动补做目标为「最后一个有消息的日期」（只补一天，无消息不推进）；`dream_state.json` 记 `last_dream_date`（只推进到真正整理完成的日期，只前进不后退）；晚启动竞态已修复（TASK-013）；单进程多日睡眠唤醒补做「最后有消息日期」（TASK-014）；失败当日自动重试（最多 3 次、间隔 30 分钟，last 仍只推进到真正完成，TASK-015）；压缩摘要不再写 HISTORY.md（TASK-011） |
@@ -119,6 +120,6 @@ Web 附加：AgentLoop 流事件 → Bus.stream → WebChannel → WebSocket（t
 
 > **唯一事实源是 git 本身**（`git log` / `git status` / `git diff`）。本段只留指针与稳定约定，**不复制任何瞬时状态**——hash 列表、领先/落后数量、未跟踪清单都会过期，一律不写，需要时直接查 git。
 
-- 当前里程碑：TASK-001~015 已完成并归档（任务卡见 `docs/tasks/completed/`）；active：暂无。
+- 当前里程碑：TASK-001~016 已完成并归档（任务卡见 `docs/tasks/completed/`）；active：暂无。
 - 最新提交、分支、领先/落后、工作区状态：`git log` / `git status`。
 - 稳定约定：`kb-testset/`（个人知识库测试资产）已在 `.gitignore` 中不追踪；存在 codex 外部 worktree → 多会话并行开发时严格遵守 AGENTS.md 文件所有权规则。

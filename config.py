@@ -55,6 +55,9 @@ _WEIXIN_FIELDS = (
 # 参与序列化/反序列化的字段清单（用于从 JSON 安全填充，避免读到无关键）
 _CONFIG_FIELDS = (
     "api_key",
+    # Tavily 搜索/抓取降级链 API Key：web_search 主通道与 web_fetch 第4级
+    # Extract 使用；留空自动降级 ddgs/前三级免费通道。可走环境变量 TAVILY_API_KEY 覆盖。
+    "tavily_api_key",
     "base_url",
     "model",
     "subagent_model",
@@ -116,6 +119,10 @@ class NanoClawConfig:
     """
 
     api_key: str = ""
+    # Tavily API Key：web_search 主通道（Tavily Search）与 web_fetch 第4级
+    # （Tavily Extract）使用。留空则 web_search 直接用 DuckDuckGo、web_fetch
+    # 只走前三级免费通道；建议环境变量 TAVILY_API_KEY 注入（最高优先级）。
+    tavily_api_key: str = ""
     base_url: str = _SILICONFLOW_URL
     model: str = "Pro/moonshotai/Kimi-K2.5"
     # 子 Agent 默认模型：留空(None)则子 Agent 沿用主模型 model；
@@ -342,6 +349,11 @@ def load_config(config_path: str = "config.json") -> NanoClawConfig:
     if env_video_key:
         cfg.video_gen_model = dict(cfg.video_gen_model)
         cfg.video_gen_model["api_key"] = env_video_key
+
+    # Tavily 搜索/抓取降级链 API Key 走环境变量覆盖（TAVILY_API_KEY 命中即覆盖）
+    env_tavily_key = os.environ.get("TAVILY_API_KEY")
+    if env_tavily_key:
+        cfg.tavily_api_key = env_tavily_key
 
     # ASR 使用独立密钥，避免默认复用主聊天模型的权限与账单边界。
     env_asr_key = os.environ.get("ASR_API_KEY")
