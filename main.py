@@ -339,7 +339,8 @@ async def watch_channel_start_failures(tasks, channels, *, ignore_indices=()):
 
 
 # ===== 每日做梦整理（TASK-011 定时调度 + 启动补做；TASK-013 语义修正：
-#       定时整理「昨天全天」/ 启动补做「最后有消息日期」/ 晚启动竞态修复）=====
+#       定时整理「昨天全天」/ 启动补做「最后有消息日期」/ 晚启动竞态修复；
+#       TASK-014 睡眠唤醒补做：单进程多日睡眠唤醒时补做「最后有消息日期」）=====
 # 与 reminders/scheduler.py 的 ReminderScheduler 同理：独立 asyncio 后台
 # task、注入时钟、动态等待；本模块不重构 reminders，二者互不影响。
 DEFAULT_DREAM_TIME = "02:00"
@@ -398,6 +399,12 @@ class DreamScheduler:
     吞掉昨天的补做）。``consolidate_today`` 内部失败静默（不抛异常），故调度
     器不会阻塞聊天或启动。
 
+    TASK-014 睡眠唤醒补做：进程多日睡眠/挂起后唤醒（同一实例 ``last_date`` 与
+    今天间隔 >1 天，如 8-9 → 8-13）时，在整理昨天之外再补做一次「最后有消息的
+    日期」——通过 ``on_wake_catch_up`` 注入（默认 None，不注入时行为与 TASK-013
+    完全一致）；唤醒补做与定时到点/启动补做共用 ``_done_this_run`` + 锁去重，
+    不重复整理同一日期。
+
     可测性：注入 ``clock``（``now() -> datetime``）与 ``wait``（event, timeout），
     测试用假时钟推进 + 假 wait 直接跳到到点时刻，无需真实 sleep。
     """
@@ -410,12 +417,14 @@ class DreamScheduler:
         timezone: str = "Asia/Shanghai",
         clock=None,
         wait=None,
+        on_wake_catch_up=None,
     ):
         self.consolidate_today = consolidate_today
         self.dream_time = dream_time
         self.timezone = timezone
         self.clock = clock or SystemClock()
         self._wait = wait or _dream_default_wait
+        self._on_wake_catch_up = on_wake_catch_up
         self._wake_event = asyncio.Event()
         self._stopped = False
         self._task = None
@@ -455,7 +464,15 @@ class DreamScheduler:
                     await self._wait(self._wake_event, delay)
                     if self._stopped:
                         return
+                wake_gap = (
+                    (local_today - last_date).days if last_date is not None else 0
+                )
                 await self._safe_consolidate()
+                if self._on_wake_catch_up is not None and wake_gap > 1:
+                    # TASK-014：真实多日睡眠唤醒（如 8-9 → 8-13）——昨天整理
+                    # 之外，再补做一次「最后有消息的日期」（如 8-9），避免多日
+                    # 停机期间有消息的内容被漏掉（昨天无消息时不推进 last）。
+                    await self._safe_wake_catch_up()
                 last_date = local_today
             else:
                 # 今天已执行过：睡到下一次（明天）到点
@@ -471,6 +488,13 @@ class DreamScheduler:
         try:
             await self.consolidate_today()
         except Exception:  # noqa: BLE001 - 做梦失败绝不影响调度循环
+            pass
+
+    async def _safe_wake_catch_up(self) -> None:
+        """多日睡眠唤醒时补做一次「最后有消息的日期」；异常静默，不破坏循环。"""
+        try:
+            await self._on_wake_catch_up()
+        except Exception:  # noqa: BLE001 - 补做失败绝不影响调度循环
             pass
 
 
@@ -675,6 +699,10 @@ def build_dream_components(
       上消除「当天补跑先推进 last → 昨天补做被跳过」的旧路径；定时补跑与启动
       补做可能算出同一目标（如 last < 昨天且昨天有消息），经本进程去重集合 +
       串行锁保证只整理一次、不重复不冲突。
+    - TASK-014 睡眠唤醒补做：``catch_up_yesterday`` 同时注入 DreamScheduler 作为
+      ``on_wake_catch_up``；进程多日睡眠唤醒（同一实例跨日 >1 天）时由调度器在
+      整理昨天之外再触发一次补做，与定时/启动补做共用 ``_done_this_run`` + 锁
+      去重，不重复整理同一日期。
     - ``last_dream_date`` 只前进不后退：无消息/模型失败不推进，并发更新不回退。
 
     可测性：``clock``（``now() -> datetime``）注入后，定时与补做的「今天」都
@@ -727,6 +755,7 @@ def build_dream_components(
         dream_time=dream_time,
         timezone=timezone,
         clock=clock,
+        on_wake_catch_up=catch_up_yesterday,
     )
     return DreamComponents(scheduler, consolidate_today, catch_up_yesterday)
 

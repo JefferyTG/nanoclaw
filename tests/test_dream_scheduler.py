@@ -15,6 +15,8 @@ TASK-013 语义修正（定时整理昨天 / 补做最后有消息日期 / 晚�
 - DreamPipelineTests（TASK-013 验收）：定时到点整理昨天、连续每日不重不漏、
   停机多天补最后有消息日期、晚启动竞态修复、旧代码「last=当天」遗留状态仍恢复昨天、
   无消息不推进、last 只前进不后退；
+- TASK-014 睡眠唤醒补做：单进程多日睡眠（8-9 → 8-13）唤醒时在整理昨天之外补做
+  「最后有消息日期」（如 8-9），跨日==1 不触发、与启动补做共用去重、无消息不推进；
 - dream_consolidate 返回值契约（True=完成 / False=模型失败）。
 """
 
@@ -388,6 +390,130 @@ class DreamSchedulerTests(unittest.IsolatedAsyncioTestCase):
         await scheduler.run()
         self.assertEqual(len(calls), 1)  # 异常被吞，循环存活并正常停止
 
+    async def test_multi_day_wake_triggers_wake_catch_up_once(self):
+        """TASK-014：进程 8-9 起运行、睡眠到 8-13 唤醒（同一实例跨日>1）→
+        唤醒分支额外调用一次 on_wake_catch_up，且只调一次。"""
+        clock = FakeClock(datetime(2026, 8, 9, 3, 0, tzinfo=timezone.utc))
+        consolidate_calls = []
+        catch_up_calls = []
+
+        async def consolidate():
+            consolidate_calls.append(clock.now())
+
+        async def catch_up():
+            catch_up_calls.append(clock.now())
+
+        scheduler = DreamScheduler(
+            consolidate, on_wake_catch_up=catch_up,
+            dream_time="02:00", timezone="UTC", clock=clock,
+        )
+
+        waits = []
+
+        async def wait(event, timeout):
+            waits.append(timeout)
+            if len(waits) == 1:
+                # 8-9 03:00 起运行后机器睡眠，直接跳到 8-13 09:00 唤醒
+                clock.advance(timedelta(days=4, hours=6))
+            else:
+                await scheduler.stop()
+
+        scheduler._wait = wait
+        await scheduler.run()
+
+        self.assertEqual(len(consolidate_calls), 2)   # 8-9 首轮 + 8-13 唤醒轮
+        self.assertEqual(len(catch_up_calls), 1)      # 唤醒补做恰好一次
+        self.assertEqual(
+            catch_up_calls[0], datetime(2026, 8, 13, 9, 0, tzinfo=timezone.utc))
+
+    async def test_daily_cross_day_does_not_trigger_wake_catch_up(self):
+        """TASK-014：正常每日连续运行（跨日==1）不触发唤醒补做，仍只整理昨天。"""
+        clock = FakeClock(datetime(2026, 8, 9, 3, 0, tzinfo=timezone.utc))
+        consolidate_calls = []
+        catch_up_calls = []
+
+        async def consolidate():
+            consolidate_calls.append(clock.now())
+
+        async def catch_up():
+            catch_up_calls.append(clock.now())
+
+        scheduler = DreamScheduler(
+            consolidate, on_wake_catch_up=catch_up,
+            dream_time="02:00", timezone="UTC", clock=clock,
+        )
+
+        waits = []
+
+        async def wait(event, timeout):
+            waits.append(timeout)
+            clock.advance(timedelta(seconds=timeout))
+            if len(waits) >= 2:
+                await scheduler.stop()
+
+        scheduler._wait = wait
+        await scheduler.run()
+
+        self.assertEqual(len(consolidate_calls), 2)   # 8-9 补跑 + 8-10 到点
+        self.assertEqual(catch_up_calls, [])          # 跨日==1 不触发补做
+
+    async def test_wake_catch_up_error_does_not_kill_loop(self):
+        """TASK-014：唤醒补做回调抛异常被静默吞掉，不破坏调度循环（同 consolidate）。"""
+        clock = FakeClock(datetime(2026, 8, 9, 3, 0, tzinfo=timezone.utc))
+        consolidate_calls = []
+
+        async def consolidate():
+            consolidate_calls.append(clock.now())
+
+        async def catch_up():
+            raise RuntimeError("boom")
+
+        scheduler = DreamScheduler(
+            consolidate, on_wake_catch_up=catch_up,
+            dream_time="02:00", timezone="UTC", clock=clock,
+        )
+
+        waits = []
+
+        async def wait(event, timeout):
+            waits.append(timeout)
+            if len(waits) == 1:
+                clock.advance(timedelta(days=4, hours=6))
+            else:
+                await scheduler.stop()
+
+        scheduler._wait = wait
+        await scheduler.run()  # 不应抛出
+
+        self.assertEqual(len(consolidate_calls), 2)   # 循环存活，唤醒轮仍完成
+
+    async def test_multi_day_wake_without_catch_up_injection_unchanged(self):
+        """TASK-014 向后兼容：未注入 on_wake_catch_up（默认 None）时，
+        多日唤醒行为与旧版完全一致（不额外补做）。"""
+        clock = FakeClock(datetime(2026, 8, 9, 3, 0, tzinfo=timezone.utc))
+        consolidate_calls = []
+
+        async def consolidate():
+            consolidate_calls.append(clock.now())
+
+        scheduler = DreamScheduler(
+            consolidate, dream_time="02:00", timezone="UTC", clock=clock,
+        )  # 不传 on_wake_catch_up
+
+        waits = []
+
+        async def wait(event, timeout):
+            waits.append(timeout)
+            if len(waits) == 1:
+                clock.advance(timedelta(days=4, hours=6))
+            else:
+                await scheduler.stop()
+
+        scheduler._wait = wait
+        await scheduler.run()
+
+        self.assertEqual(len(consolidate_calls), 2)   # 8-9 + 8-13 唤醒轮，无额外补做
+
     async def test_start_stop_lifecycle(self):
         """start() 创建独立后台 task，stop() 优雅关闭。"""
         clock = FakeClock(datetime(2026, 8, 5, 1, 0, tzinfo=timezone.utc))
@@ -699,6 +825,83 @@ class DreamPipelineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(provider.requests), 1)  # 只整理一次
             self.assertIn("- 用户偏好中文回复", daily.read("2026-08-05"))
             self.assertEqual(state.read_last_dream_date(), "2026-08-05")
+
+    async def test_wake_after_multi_day_sleep_catches_up_last_active(self):
+        """TASK-014 验收：进程 8-9 起运行（last=8-8）、睡眠跨到 8-13 唤醒 →
+        除整理昨天（8-12 无消息 no-op）外，补做「最后一个有消息的日期」8-9
+        （不是 8-12），无消息日期不推进 last。"""
+        clock = FakeClock(datetime(2026, 8, 9, 3, 0, tzinfo=timezone.utc))
+        with tempfile.TemporaryDirectory() as tmp:
+            memory_dir = os.path.join(tmp, "memory")
+            sessions_dir = os.path.join(tmp, "sessions")
+            os.makedirs(memory_dir)
+            _write_session_file(sessions_dir, [
+                {"role": "user", "content": "8-9 的消息", "timestamp": "2026-08-09T10:00:00"},
+            ])
+            daily = DailyMemory(memory_dir)
+            provider = _DreamProvider()
+            state = DreamState(memory_dir)
+            state.write_last_dream_date("2026-08-08")  # 8-9 02:00 已整理完 8-8
+            sm = SessionManager(sessions_dir)
+            comps = build_dream_components(provider, daily, sm, state, timezone="UTC", clock=clock)
+            scheduler = comps.scheduler
+
+            waits = []
+
+            async def wait(event, timeout):
+                waits.append(timeout)
+                if len(waits) == 1:
+                    # 8-9 03:00 之后机器睡眠，直接跳到 8-13 09:00 唤醒
+                    clock.advance(timedelta(days=4, hours=6))
+                else:
+                    await scheduler.stop()
+
+            scheduler._wait = wait
+            await scheduler.run()
+
+            self.assertIn("# 2026-08-09", daily.read("2026-08-09"))  # 补做的是 8-9
+            self.assertEqual(daily.read("2026-08-12"), "")           # 昨天 8-12 无消息不写
+            self.assertEqual(state.read_last_dream_date(), "2026-08-09")  # 只推进到 8-9
+            self.assertEqual(len(provider.requests), 1)              # 只调一次模型（8-9）
+
+    async def test_wake_catch_up_shares_dedup_with_startup(self):
+        """TASK-014 验收：唤醒补做与启动补做共用去重（_done_this_run + 锁）——
+        启动已补做的日期，唤醒补做不会重复调模型。"""
+        clock = FakeClock(datetime(2026, 8, 9, 3, 0, tzinfo=timezone.utc))
+        with tempfile.TemporaryDirectory() as tmp:
+            memory_dir = os.path.join(tmp, "memory")
+            sessions_dir = os.path.join(tmp, "sessions")
+            os.makedirs(memory_dir)
+            _write_session_file(sessions_dir, [
+                {"role": "user", "content": "8-8 的消息", "timestamp": "2026-08-08T10:00:00"},
+            ])
+            daily = DailyMemory(memory_dir)
+            provider = _DreamProvider()
+            state = DreamState(memory_dir)
+            state.write_last_dream_date("2026-08-07")
+            sm = SessionManager(sessions_dir)
+            comps = build_dream_components(provider, daily, sm, state, timezone="UTC", clock=clock)
+            scheduler = comps.scheduler
+
+            # 启动补做：8-9 启动时补做「最后有消息日期」= 8-8（模型调用 1 次）
+            await comps.catch_up_yesterday()
+            self.assertEqual(len(provider.requests), 1)
+
+            # 睡眠到 8-13 唤醒：唤醒补做仍指向 8-8，但已被 _done_this_run 去重，不再调模型
+            waits = []
+
+            async def wait(event, timeout):
+                waits.append(timeout)
+                if len(waits) == 1:
+                    clock.advance(timedelta(days=4, hours=6))  # 8-9 03:00 → 8-13 09:00
+                else:
+                    await scheduler.stop()
+
+            scheduler._wait = wait
+            await scheduler.run()
+
+            self.assertEqual(len(provider.requests), 1)  # 不重复调模型
+            self.assertEqual(state.read_last_dream_date(), "2026-08-08")
 
     async def test_state_never_regresses_in_pipeline(self):
         """last 只前进不后退：last=8-06 时补做 8-05 不回退状态（补做内容仍写盘）。"""
