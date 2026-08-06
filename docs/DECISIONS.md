@@ -35,6 +35,7 @@
 | HISTORY.md 移除（TASK-011 决策） | 有效 | 压缩审计文件用处不大（乖宝 2026-08-05 拍板）：`ContextCompactor._save_to_history` 删除，压缩摘要仍以 system 消息进上下文，但不再落 `workspace/memory/HISTORY.md`；历史遗留旧文件保留不清理（清理与否乖宝再定）。代价：压缩审计轨迹能力消失，如后续需要可改为可配置开关 |
 | 每日做梦整理（TASK-011 决策） | 有效 | 每天 `dream_time`（默认 02:00）定时把当天各会话关键消息经模型按固定分类（`## 用户变化 / ## 项目进展 / ## 会话总结`，可配置）整理，合并更新写入当天 daily：写入前行哈希去重（模型语义去重 + 行哈希兜底）、固定分类标题不再无限堆叠；定时时刻实例未启动则下次启动补做前一天（`workspace/memory/dream_state.json` 记 `last_dream_date`，只补最近 1 天、超期不回溯）；整理异步执行、失败静默，不阻塞聊天/启动；独立 asyncio task 与 ReminderScheduler 并存互不影响；`dream_time` 属启动期配置，缺省回退默认值（与 `context_budget_tokens` 同款容错） |
 | 每日做梦整理语义修正（TASK-013 决策） | 有效 | 三处语义修正（2026-08-06，08-05 全天 1356 条消息漏整理教训）：① 定时到点整理「昨天完整自然日」而非「当天」——8-10 02:00 整理 8-9 全天（含凌晨尾巴），由 `build_dream_components.consolidate_today` 计算 today−1；② 启动补做目标改为「最后一个有消息的日期」——`find_last_active_date` 从昨天往前倒序扫，只补一天、无消息不补不推进；③ 晚启动竞态修复——调度器晚启动立即补跑的也是「昨天」（不再是当天），从根上消除「当天补跑先推进 last → 昨天补做被跳过」；定时补跑与启动补做经 `_done_this_run` 集合 + 串行锁去重，只整理一次。`last_dream_date` 只推进到真正整理完成的日期（无消息/模型失败不推进），只前进不后退。取舍：停机多日有多个活跃日时只补最后一天，更早的活跃日不进 daily（任务卡非目标明确不做全量回溯）。遗留：单进程多日睡眠唤醒不触发 catch_up（仅重启触发）；消息时间戳按机器本地记、做梦归日按 config.timezone，二者需一致（当前部署 CST==Asia/Shanghai 自洽）；mtime 剪枝对「回填历史时间戳」场景不安全（当前无回填） |
+| 睡眠唤醒补做（TASK-014 决策） | 有效 | 单进程多日睡眠/挂起后唤醒（同一实例跨日 >1 天，如 8-9 → 8-13）时，除整理昨天外再补做一次「最后有消息的日期」：`DreamScheduler.__init__` 新增可选 `on_wake_catch_up` 回调（默认 None 向后兼容），`run()` 跨日分支计算 `wake_gap = (local_today - last_date).days`，`last_date` 非 None 且 `wake_gap > 1` 时在 `_safe_consolidate` 之外调 `_safe_wake_catch_up`；注入的正是 `catch_up_yesterday` 闭包，天然复用 `find_last_active_date` + `_done_this_run` + 串行锁去重，不重复调模型；触发顺序先 consolidate 后 catch_up（昨天有消息时 last 先推进，扫描区间自动排除昨天）。首启（last_date is None）不触发（启动 catch_up task 已覆盖）；跨日==1 不触发。取舍：真实系统休眠时 asyncio 挂起/恢复未端到端验证（mock 时钟覆盖逻辑层）；反复唤醒多一次只读日期扫描可接受 |
 | 压缩→无条件重建完整快照（TASK-007 决策） | 有效 | 压缩发生 = 前缀缓存已破，`_sync_memory_patch` 不再因「revision 已最新（本会话自写已刷基线）」或「无落后 entries」提前 return，无条件执行 `_rebuild_memory_snapshot`：读磁盘最新 USER.md/MEMORY.md 生成 <memory_snapshot> 替换历史里旧补丁，模型上下文始终有完整记忆。**与 GPT 方案 §4.5「压缩不参与快照重建判断」相反**：压缩后补丁消息可能已被摘要吞掉，靠 entries 判断会漏（模型只剩摘要残影）；塞一条完整快照是破缓存后的免费增量。重建读磁盘不依赖 entries，revision 不落后也安全（`_advance_memory_revision` 幂等）。未压缩时行为不变（零注入/补丁/快照按原阈值）。`_should_rebuild_memory` 中 `consolidated` 提升为决定性条件（2026-08-05，TASK-007，待乖宝验收） |
 | Skill 与人设解耦 | 有效 | Skill 写行为机制，具体口吻由 identity 决定 |
 | 视觉双路径 | 有效 | 基础模型多模态则直传；否则用 `ask_image` 调独立视觉模型 |
@@ -109,6 +110,7 @@
 - 历史日志对统一工具超时互相冲突；当前普通工具由 `ToolRegistry.execute()` 使用 180 秒兜底，Shell 另有 60 秒超时。子 Agent 由自身回合上限管理，生图由单请求超时和整次任务预算管理，避免普通工具上限提前截断长任务和重试。
 - 历史日志称最后提交无法 push；当前 Git 实测 `HEAD` 与 `origin/main` 均为 `0daefc4`，领先/落后为 `0/0`，此项已核销。
 - “飞书不支持图片”已核销：当前支持私聊图片入站，以及 Agent/子 Agent 生成图片出站；群聊仍要求事件包含 @ 提醒。
+- NC-BUG-005 已核销（TASK-012 会话索引实时性）：`memory_search(scope=session)` 每次搜索前增量扫 sessions（mtime/size 对比只重索引变化/新增），`/clear` 后同步清索引；重启 `rebuild_all()` 兜底，新会话内容无需重启即可搜到。
 - 工具消息重启后可能触发 400 已核销：新记录按 `assistant(tool_calls) → tool` 落盘；读取旧会话时会重排历史前置 tool、补齐缺失结果并丢弃孤立 tool。飞书因稳定复用 `chat_id` 更容易暴露旧问题，Web 的新连接默认产生新 ID，但接回旧会话时同样受修复保护。
 
 ## 5. 当前遗留问题清单
@@ -139,7 +141,6 @@
 | NC-TEST-001 | 无 CI、lint、类型检查基线 | 当前已有 unittest 回归集，但尚未自动化运行；应建立 CI，并逐步加入静态检查与关键并发覆盖 |
 | NC-BUG-003 | 工具循环硬熔断不可达 | 重复签名达到 10 次后直接返回警告且不再累计，永远到不了 20 次硬熔断；调整计数语义并测试 10/20 边界 |
 | NC-BUG-004 | session_key 文件名映射有损 | `:` 写为 `_`，列表再把所有 `_` 还原成 `:`；原 key 含下划线时失真/碰撞，飞书 chat_id 正常会含 `_`；需可逆编码或显式元数据 |
-| NC-BUG-005 | 当前进程的会话检索索引陈旧 | `rebuild_all()` 只在启动执行，搜索仅刷新 memory 文件；新会话内容重启前搜不到；需增量更新或刷新策略 |
 | NC-ARCH-001 | 配置热更新对象分裂 | 新会话只更新部分 Provider/Context；MCP、skills、workspace、共享 memory provider、工具注册仍是启动值；UI 需明确每字段生效方式或统一重载 |
 | NC-ARCH-002 | 无背压且缓存不回收 | Queue 无 maxsize，每消息无界 create_task，Agent/lock 永久缓存；需并发上限、队列策略和会话回收 |
 | NC-ARCH-003 | Channel 停止不是优雅关闭 | Web/飞书后台守护线程未真正 stop；测试、热重启和嵌入式运行可能泄漏资源 |
@@ -158,7 +159,25 @@
 | NC-LICENSE-001 | 微信社区基础缺少独立 LICENSE | 上游 `package.json` 声明 MIT，但仓库没有 LICENSE 文件；当前已固定来源/NOTICE，正式分发前仍需维护者或法律复核 |
 | NC-WEIXIN-001 | 微信真实端点未验收 | 自动化使用 fake iLink HTTP/CDN/clock/process；真实扫码、长轮询、图片和主动发送需用户授权后受控手工验收 |
 | NC-WEIXIN-002 | 微信主动发送需要历史 context token | 对端至少入站交互一次后才可发送；Bridge 按 account/user 持久化，V1 不绕过服务端这项协议约束 |
+| （未编号·TASK-011 遗留） | `write_dream` 读-合并-写回无文件锁 | `DailyMemory.write_dream` 是「读-合并-写回」：假定做梦时段（02:00）无并发 `/clear` 写入；单进程风险低。曾误标为 NC-MEM-002（TASK-013/014 卡，已修正 2026-08-06）——NC-MEM-002 实为「压缩改写会话文件时间戳」 |
 | NC-CACHE-001 | 工具 Schema 与图片缓存存在供应商差异 | 本地只保证请求表示稳定并记录 hash；供应商可能不缓存工具或图片。图片缺失/变化与 ContextCompactor 摘要替换都会形成前缀断点 |
+
+### P3：低风险 / 观察 / 决策待定（2026-08-06 盘点收拢，来自历次任务卡遗留）
+
+| 来源 | 项目 | 说明 |
+|---|---|---|
+| TASK-003 遗留 | `read_file` 路径语义不统一 | 文件引用为 `files/YYYY-MM/name`（相对数据根 `workspace/`），`ReadFileTool` 根为 `config.workspace`（项目根）；Agent 按引用读需写 `workspace/files/...`。实测模型能自行拼对；若要让 `files/...` 直接可读需另开任务统一 read_file 根或调整路径语义 |
+| TASK-003 遗留 | 50MB 大小上限两侧常量 | Python 侧 `max_inbound_file_bytes` 固定 50MB；若单独调低 Bridge env 上限，Python 仍按 50MB 读满，无实际风险 |
+| TASK-004 遗留 | Web 前端对历史 system 补丁渲染未验证 | 与压缩摘要同路径，风险低 |
+| TASK-008 遗留 | `agent/daily.py` 同构降噪副本未统一 | `_messages_to_text`/`_summary_content` 副本未降噪（TASK-008 只降噪压缩路径）；轻微 over-retention，TASK-009 前评估统一 |
+| TASK-008 遗留 | `_titles_only` 对正文 `###` 开头行误留 | 轻微 over-retention，可加行长度护栏 |
+| TASK-009 遗留 | 真实模型摘要质量人工抽查 | 分块结构化摘要的真实模型质量属人工范畴，使用中留意 |
+| TASK-011 遗留 | 定时整理失败当日不自动重试 | 模型失败那天被跳过，仅下次重启且昨天未整理时补做；数据不丢（仍在会话/daily） |
+| TASK-011 遗留 | `collect_messages_for_date` key 还原有损 | `stem.replace("_", ":")` 恒映射回同一文件，不丢消息；与既有处理一致 |
+| TASK-011 遗留 | 去重近似性 | 语义去重靠模型，行哈希兜底只能拦规范化后完全一致的重复 |
+| TASK-011 决策项 | `workspace/memory/HISTORY.md` 历史文件清理 | TASK-011 起停止新写入；旧文件保留与否待乖宝拍板，默认保留不动 |
+| TASK-013 遗留 | 重启当天重复整理昨天 1 次安全冗余 / 首启全扫描性能 / 时区假设 / 测试代理弱化 | P2 留档不改，详见 TASK-013 任务卡「实现进展」段 |
+| TASK-014 遗留 | 真实休眠 asyncio 挂起/恢复未端到端验证 | mock 时钟已覆盖逻辑层；系统休眠期间 `asyncio.wait_for` 挂起/恢复行为未实测，逻辑层已覆盖 |
 
 ## 6. 运行和产品边界
 
