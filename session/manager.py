@@ -6,6 +6,10 @@
 TASK-004：会话元数据（``session.memory_revision``）用同名侧车文件
 ``<safe_key>.meta.json`` 持久化，与消息 JSONL 解耦——不改动消息行的读取、
 规范化和 Web 历史回放格式；重启恢复时经 ``get_memory_revision`` 读回。
+
+TASK-015（NC-MEM-002）：``save_messages`` 新增 ``preserve_timestamps`` 参数，
+「压缩/快照重写历史但保留原始时间戳」的场景不再把整段会话消息的时间戳统一
+改写为写入时刻。
 """
 
 import json
@@ -14,6 +18,33 @@ from datetime import datetime
 from typing import Optional
 
 from agent.history import canonicalize_history, canonicalize_history_message
+
+
+def _message_identity_key(message: dict) -> Optional[tuple]:
+    """返回消息的稳定身份键，供 ``save_messages`` 保留模式匹配 timestamp。
+
+    ``canonicalize_history_message`` 会剥离 ``timestamp`` 字段（API 历史里不
+    允许出现），因此保留模式在写入前先把「原始 timestamp」按身份键暂存、
+    canonicalize 后再挂回。键取 role / tool_call_id / content / tool_calls 的
+    稳定序列化，保证 canonicalize 前后同一消息身份一致（canonicalize 只会清洗
+    字段、补缺失工具结果，不会改变这些字段的值）。
+    """
+    if not isinstance(message, dict):
+        return None
+    role = message.get("role")
+    tool_call_id = message.get("tool_call_id")
+    try:
+        content_key = json.dumps(
+            message.get("content"), ensure_ascii=False, sort_keys=True
+        )
+    except (TypeError, ValueError):
+        content_key = str(message.get("content"))
+    calls = message.get("tool_calls")
+    try:
+        calls_key = json.dumps(calls, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        calls_key = str(calls)
+    return (role, tool_call_id, content_key, calls_key)
 
 
 class SessionManager:
@@ -52,7 +83,12 @@ class SessionManager:
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    def save_messages(self, session_key: str, messages: list[dict]) -> None:
+    def save_messages(
+        self,
+        session_key: str,
+        messages: list[dict],
+        preserve_timestamps: bool = False,
+    ) -> None:
         """用给定消息列表【覆盖写回】某会话的 JSONL 文件。
 
         与 :meth:`save_message`（追加单条）不同，本方法会先清空原文件、
@@ -60,14 +96,62 @@ class SessionManager:
         版本的写时转换场景——否则压缩结果只留在内存、磁盘上的原始长历史
         不缩短，重启后又会从长历史重新压缩。
 
-        每条消息仍统一附加 ``timestamp``（与 :meth:`save_message` 行为一致），
-        因此后续 :meth:`get_history` 读取时的格式完全一致。
+        ``preserve_timestamps``（TASK-015 / NC-MEM-002）：
+            - False（默认）：与旧行为一致——每条消息统一附加当前时间
+              （覆盖写回语义，调用方行为不变）；
+            - True：**保留原始时间戳**——按「规范化身份」依次取：① 输入消息
+              自带的 ``timestamp``；② 原文件里同身份消息的 ``timestamp``
+              （覆盖写回前读一次旧文件，找回被覆盖的原始时间戳）；两者都取
+              不到（如新生成的摘要/快照消息）才补当前时间。供「压缩/快照
+              重写历史但保留原始时间戳真实性」的场景使用：压缩写回时尾部
+              保留的消息应保持原时间戳、仅新摘要取压缩时刻；TASK-007 的
+              「压缩→无条件重建完整快照」紧随压缩在同一回合执行，同样需要
+              保留模式，否则重建会立刻把时间戳再改写掉。
+
+        无论哪种模式，写入后的消息都带 ``timestamp``，后续 :meth:`get_history`
+        读取时的格式完全一致。
         """
         path = self._get_session_path(session_key)
+        # 保留模式：先把「输入消息自带 timestamp」与「原文件已有 timestamp」
+        # 按身份键暂存（canonicalize 会剥离 timestamp，需写入前捕获、规范化
+        # 后挂回）。原文件查找是 NC-MEM-002 的关键：覆盖写回前旧文件还保留
+        # 原始时间戳，压缩/快照重建的输入消息本身不带 timestamp，要靠它找回。
+        ts_by_identity: dict = {}
+        if preserve_timestamps:
+            for m in messages:
+                if not isinstance(m, dict):
+                    continue
+                ts = m.get("timestamp")
+                key = _message_identity_key(m)
+                if ts and key is not None:
+                    ts_by_identity.setdefault(key, ts)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            old = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(old, dict):
+                            continue
+                        ts = old.get("timestamp")
+                        key = _message_identity_key(old)
+                        if ts and key is not None:
+                            ts_by_identity.setdefault(key, ts)
+            except OSError:
+                pass  # 文件不存在/读失败：无原始时间戳可参考，缺失补当前时间
+        now = datetime.now().isoformat(timespec="seconds")
         with open(path, "w", encoding="utf-8") as f:
             for message in canonicalize_history(messages):
                 record = canonicalize_history_message(message)
-                record["timestamp"] = datetime.now().isoformat(timespec="seconds")
+                ts = None
+                if preserve_timestamps:
+                    key = _message_identity_key(record)
+                    ts = ts_by_identity.get(key) if key is not None else None
+                record["timestamp"] = ts or now
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def get_history(self, session_key: str) -> list[dict]:

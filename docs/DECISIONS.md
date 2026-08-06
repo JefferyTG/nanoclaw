@@ -77,6 +77,9 @@
 | 记忆同步一刀切只同步 USER.md/MEMORY.md | 有效 | 不做「重要性」判断；daily/ 永不注入（需要时走 memory_search），规则简单、系统可执行 |
 | 记忆补丁角色用 system 而非 developer | 有效 | DeepSeek 不支持 developer 角色（已核实）；OpenAI 兼容 API 允许多条 system 消息（压缩摘要已有先例） | 渠道在会话内恒定，每轮注入是冗余的；快照零每轮 token、System Prompt 前缀稳定（Prompt Cache 友好）。渠道+用户已天然编码在 session_key（`channel:sender_id`）中，`make_agent_factory` 解析后注入 ContextBuilder，与 identity/USER/MEMORY 同构；时间戳因每轮变化仍走每轮前缀注入 |
 
+| 压缩/快照重写保留原始时间戳（TASK-015 / NC-MEM-002） | 有效 | `save_messages(preserve_timestamps=True)`：覆盖写回前按「规范化身份」依次取输入消息自带 timestamp → 原文件同身份消息 timestamp → 补当前时间。压缩写回与压缩后「无条件重建完整快照」（TASK-007）都走保留模式——尾部原样保留的消息保持原始时间戳（内容不变则时间戳真实性应保持），仅新生成的摘要/快照消息取当前时刻。取舍：身份匹配用 role/tool_call_id/content/tool_calls 稳定序列化，canonicalize 前后一致；带图片的 user 消息经 `_history_item_to_api` 转多模态 content 后与磁盘原文身份不同，此类消息时间戳退化为当前时刻（罕见边缘）；默认 False 行为不变（取消补历史走 `_persist`/`save_message`、子 Agent 走 no-op，均不受影响） |
+| write_dream 进程内写锁（TASK-015 / TASK-011 遗留） | 有效 | `DailyMemory` 实例级 `threading.Lock`：`write_dream`（读-合并-写回）整体持锁，`append` 共享同一把锁（头部「文件不存在时建」是先查后写，也需串行）。asyncio 单线程事件循环内锁从不阻塞（临界区无 await，天然原子），跨线程时由锁串行。append 本身是单次 open 追加、无读-改-写，不加锁也不会丢数据，但与 write_dream 同锁可防「先查后写」竞态。取舍：仍非崩溃安全（进程崩溃可能留半截文件），如需更强可升级「临时文件 + os.replace」原子写（本任务未做） |
+| 定时整理失败当日自动重试（TASK-015） | 有效 | `run_dream_for_date` 返回 bool（True=完成/无事可做，False=模型失败/空响应/异常）。DreamScheduler 失败后在当日稍后重试：最多 `dream_max_retries` 次（默认 3）、间隔 `dream_retry_interval` 秒（默认 1800=30 分钟，可注入时钟/wait 单测），重试等待跨日即放弃；`last_dream_date` 仍只推进到真正整理完成的日期，失败不提前标记（下次启动补做兜底）。与 `_done_this_run` + 串行锁去重配合：失败日期不入去重集合可重试，成功入集合不重复调模型。None（旧式回调）视为成功向后兼容 |
 | 上下文预算动态配置 + 占用显示（TASK-005） | 有效 | `config.json` 的 `context_budget_tokens`（默认 524288=512k）作为 ContextCompactor 压缩阈值，替换硬编码 192k；旧配置缺字段回退默认值（向后兼容）。AgentLoop 每次模型响应后经 stream_sink 推 `{type:"usage",...}`（input/cached/uncached/budget/ratio/cache_ratio，无真实 usage 时回退估算）；新增公开方法 `get_context_usage()` 供 web/feishu/weixin/cli 的 `/context` 命令直接回复占用文本（不经模型）。Web 输入框上方渲染进度条 + 缓存命中率，随会话切换各自显示；无数据优雅降级。预算属启动期配置，改后需重启（2026-08-05） |
 
 这些约定来自 `.workbuddy/memory/MEMORY.md` 和 2026-07-22 至 2026-07-26 的开发日志；原日志被 Git 忽略，因此本表是跨会话的正式摘录。
@@ -99,6 +102,7 @@
 | 08-05 | TASK-007 压缩触发→无条件重建记忆快照：`_sync_memory_patch` 将 `consolidated` 判断提前到 early-return 之前，压缩过即重建（修「本会话自写记忆 + 压缩后完整记忆只剩摘要残影」洞）；`_should_rebuild_memory` 的 `consolidated` 提升为决定性条件（与 GPT 方案 §4.5 相反） | 压缩=缓存已破=塞完整快照最划算；重建读磁盘不依赖 entries，revision 已最新也安全；未压缩路径逐字不变，前缀缓存命中不受影响 |
 | 08-05 | TASK-010 会话中断回合上下文丢失修复（Agent「失忆」bug）：`_persist` 改为「落盘即同步内存」——每写一条磁盘就按磁盘顺序增量追加进 `_session_history`，磁盘是唯一事实源；`_record_cancelled_turn` 去重不再手动追加；刻意不做整段 canonicalize（避免工具交换被 close_pending 补占位符导致真实 tool 结果丢失），收尾边界统一 canonicalize 兜底 | 「回合完成时才同步内存」是失忆根因；任意中断路径（超时/error/异常/取消/崩溃）内存都不丢；真进程重启本就从磁盘全量恢复（不受影响）；遗留：压缩 `save_messages` 改写时间戳潜在风险（NC-MEM-002） |
 | 08-06 | TASK-013 每日做梦整理语义修正：定时整理「昨天完整自然日」而非「当天」（`consolidate_today` 目标=today−1）；启动补做改为 `find_last_active_date`（从昨天往前找最后有消息日期，只补一天、无消息不推进）；晚启动竞态修复（调度器立即补跑目标也是昨天）+ `_done_this_run`/锁去重；`run_dream_for_date` 无消息早退不推进 last；`collect_messages_for_date` 增加 mtime 剪枝与 stop_at_first | 定时与补做目标统一为「最后有消息日期」才能从根上消除竞态；无消息不推进是「不漏整理」的关键；mtime 剪枝只跳过「未被该日修改过」的文件（安全方向）；与 TASK-011 冲突处以本卡为准 |
+| 08-06 | TASK-015 记忆小尾巴修复：① NC-MEM-002——`save_messages` 新增 `preserve_timestamps`（保留模式按规范化身份依次取：输入自带 → 原文件同身份 → 补当前时间）；压缩写回与压缩后「无条件重建快照」（TASK-007）都走保留模式，尾部保留消息时间戳不再被改写成压缩时刻；② `DailyMemory.write_dream`/`append` 加进程内 threading.Lock（读-合并-写回与头部「先查后写」串行，append 单次 open 追加本无读-改-写）；③ DreamScheduler 失败当日自动重试（`run_dream_for_date` 改返回 bool；最多 3 次、间隔 30 分钟可注入，跨日放弃，`last_dream_date` 仍只推进到真正完成）；④ 摘要质量抽查脚本 `scripts/dream_summary_spotcheck.py` 就绪（读会话 JSONL + 真实 provider 跑 ContextCompactor 分块结构化摘要，`--dry-run` 不花 token，待乖宝确认后执行） | 压缩后重建快照是压缩链路的下一环，不改它时间戳照样被立刻改写（集成测试证实）；保留时间戳靠「原文件按身份找回」而非输入自带（canonicalize 剥离 timestamp）；重试成功才推进 last 与 `_done_this_run`，失败日期可被重试/下次启动补做再次进入；scripts/ 目录被 .gitignore 忽略属项目既有约定 |
 | 08-05 | TASK-011 每日做梦整理：砍 HISTORY 写入（`_save_to_history` 删除，压缩摘要不再落盘）；`agent/daily.py` 新增 `dream_consolidate`（固定分类 + 行哈希去重 + 合并更新）；`main.py` 新增 DreamScheduler（每日定时）+ DreamState（启动补做前一天）+ `collect_messages_for_date` + `dream_time` 配置 | 定时整理要能注入时钟可单测；补做状态单调前进、模型失败不标记（重启可重试）；整理失败静默符合 daily nice-to-have 原则；与 ReminderScheduler 独立 task 互不影响 |
 | 08-04 | 微信文件接收（TASK-003）：Bridge FILE 入站下载 → FileStore 按月归档 → content 只带引用 | 文件名不可信需消毒防穿越；文件大小需设上限防撑爆磁盘；命令消息保持纯文本判断不变；批量持久化需兼容旧批次缺 `files` 字段 |
 
@@ -112,6 +116,9 @@
 - “飞书不支持图片”已核销：当前支持私聊图片入站，以及 Agent/子 Agent 生成图片出站；群聊仍要求事件包含 @ 提醒。
 - NC-BUG-005 已核销（TASK-012 会话索引实时性）：`memory_search(scope=session)` 每次搜索前增量扫 sessions（mtime/size 对比只重索引变化/新增），`/clear` 后同步清索引；重启 `rebuild_all()` 兜底，新会话内容无需重启即可搜到。
 - 工具消息重启后可能触发 400 已核销：新记录按 `assistant(tool_calls) → tool` 落盘；读取旧会话时会重排历史前置 tool、补齐缺失结果并丢弃孤立 tool。飞书因稳定复用 `chat_id` 更容易暴露旧问题，Web 的新连接默认产生新 ID，但接回旧会话时同样受修复保护。
+- NC-MEM-002 已核销（TASK-015）：压缩 `save_messages` 覆盖写回改写会话文件时间戳的问题已修复——`save_messages` 新增 `preserve_timestamps` 参数（保留模式从原文件按身份找回原始时间戳），压缩写回与压缩后「无条件重建快照」均走保留模式；时间戳真实性不再被压缩改写。
+- 「（未编号·TASK-011 遗留）`write_dream` 读-合并-写回无文件锁」已核销（TASK-015）：`DailyMemory` 增加实例级 `threading.Lock`，`write_dream` 与 `append` 共享锁串行写，并发不丢数据（新增多线程并发测试）。
+- 「定时整理失败当日不自动重试」已核销（TASK-015）：`run_dream_for_date` 返回 bool，DreamScheduler 失败后当日自动重试（最多 3 次、间隔 30 分钟可注入），`last_dream_date` 仍只推进到真正整理完成的日期。
 
 ## 5. 当前遗留问题清单
 
@@ -155,11 +162,11 @@
 | NC-DOC-001 | README 与实现有少量漂移 | README 称 MCP 多 Server 并行连接，当前实现为顺序 await；配置热更新描述也需更精确 |
 | NC-SEC-002 | WebFetch 可访问内网地址 | 只限制 http/https 且跟随重定向；不可信输入下应评估 SSRF 防护 |
 | NC-CLEAN-001 | `agent/skills/` 历史副本 | 当前运行入口使用根 `skills/`；确认无外部依赖后可移除重复副本 |
-| NC-MEM-002 | 压缩 `save_messages` 覆盖写回会改写会话文件时间戳 | 压缩发生在 `_run` 开头（loop.py:753-755），`save_messages` 整段写回磁盘，原始消息时间戳被改写（内容不受影响）。TASK-010 已保证内存=磁盘一致、中断回合不丢，此风险仅剩时间戳真实性层面；暂不处理，如未来依赖时间戳审计需改为保留原始值 |
+| ~~NC-MEM-002~~（TASK-015 已核销） | 压缩 `save_messages` 覆盖写回会改写会话文件时间戳 | 已修复：`save_messages(preserve_timestamps=True)` 从原文件按身份找回原始时间戳，压缩写回与压缩后无条件重建快照均走保留模式，详见 §4 核销记录 |
 | NC-LICENSE-001 | 微信社区基础缺少独立 LICENSE | 上游 `package.json` 声明 MIT，但仓库没有 LICENSE 文件；当前已固定来源/NOTICE，正式分发前仍需维护者或法律复核 |
 | NC-WEIXIN-001 | 微信真实端点未验收 | 自动化使用 fake iLink HTTP/CDN/clock/process；真实扫码、长轮询、图片和主动发送需用户授权后受控手工验收 |
 | NC-WEIXIN-002 | 微信主动发送需要历史 context token | 对端至少入站交互一次后才可发送；Bridge 按 account/user 持久化，V1 不绕过服务端这项协议约束 |
-| （未编号·TASK-011 遗留） | `write_dream` 读-合并-写回无文件锁 | `DailyMemory.write_dream` 是「读-合并-写回」：假定做梦时段（02:00）无并发 `/clear` 写入；单进程风险低。曾误标为 NC-MEM-002（TASK-013/014 卡，已修正 2026-08-06）——NC-MEM-002 实为「压缩改写会话文件时间戳」 |
+| ~~（未编号·TASK-011 遗留）~~（TASK-015 已核销） | `write_dream` 读-合并-写回无文件锁 | 已修复：`DailyMemory` 实例级 `threading.Lock` 串行 write_dream/append，详见 §4 核销记录 |
 | NC-CACHE-001 | 工具 Schema 与图片缓存存在供应商差异 | 本地只保证请求表示稳定并记录 hash；供应商可能不缓存工具或图片。图片缺失/变化与 ContextCompactor 摘要替换都会形成前缀断点 |
 
 ### P3：低风险 / 观察 / 决策待定（2026-08-06 盘点收拢，来自历次任务卡遗留）

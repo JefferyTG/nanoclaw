@@ -211,6 +211,59 @@ class DreamConsolidateTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(daily.read("2026-08-05"), "")
 
 
+class WriteDreamConcurrencyTests(unittest.TestCase):
+    """TASK-015：write_dream 是「读-合并-写回」，进程内写锁保证并发不丢数据。
+
+    append（/clear 场景）是单次 open 追加、无读-改-写，与 write_dream 共享
+    同一把锁（头部创建的「先查后写」也需串行）；并发下任何事实都不丢。
+    """
+
+    def test_concurrent_write_dream_does_not_lose_data(self):
+        """多线程并发 write_dream：读-合并-写回被进程内锁串行化，事实不丢。"""
+        import concurrent.futures
+        with tempfile.TemporaryDirectory() as tmp:
+            daily = DailyMemory(os.path.join(tmp, "memory"))
+            date_str = "2026-08-05"
+            n = 20
+
+            def worker(i):
+                daily.write_dream(date_str, {"会话总结": [f"并发事实{i}"]})
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+                list(ex.map(worker, range(n)))
+
+            content = daily.read(date_str)
+            for i in range(n):
+                self.assertIn(f"- 并发事实{i}", content)
+            self.assertEqual(content.count("# 2026-08-05"), 1)
+            self.assertEqual(content.count("## 会话总结"), 1)
+
+    def test_concurrent_append_and_write_dream_share_lock(self):
+        """append 与 write_dream 并发写同一日期文件：共享锁串行，两边事实都保留。"""
+        import concurrent.futures
+        with tempfile.TemporaryDirectory() as tmp:
+            daily = DailyMemory(os.path.join(tmp, "memory"))
+            date_str = datetime.now().strftime("%Y-%m-%d")  # append 写「今天」
+            n = 10
+
+            def worker_append(i):
+                daily.append("会话总结", f"append事实{i}")
+
+            def worker_dream(i):
+                daily.write_dream(date_str, {"用户变化": [f"dream事实{i}"]})
+
+            jobs = [(worker_append, i) for i in range(n)] + [
+                (worker_dream, i) for i in range(n)
+            ]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+                list(ex.map(lambda job: job[0](job[1]), jobs))
+
+            content = daily.read(date_str)
+            for i in range(n):
+                self.assertIn(f"- append事实{i}", content)
+                self.assertIn(f"- dream事实{i}", content)
+
+
 class ClearStillWritesDailyTests(unittest.IsolatedAsyncioTestCase):
     """回归：/clear 触发写入行为不变（append-only + 分类标题）。"""
 

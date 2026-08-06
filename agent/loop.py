@@ -674,7 +674,12 @@ class AgentLoop:
         )
         self._session_history = history
         try:
-            self.session_manager.save_messages(self.session_key, history)
+            # NC-MEM-002：快照重建同样是「覆盖写回已有历史」，走保留时间戳
+            # 模式——已有消息时间戳不变（含压缩后刚保住的尾部原始时间戳），
+            # 仅新生成的 <memory_snapshot> 消息补当前时刻。
+            self.session_manager.save_messages(
+                self.session_key, history, preserve_timestamps=True
+            )
         except Exception:  # noqa: BLE001 - 重建后落盘失败不阻断本轮
             logger.exception("重建快照后持久化会话历史失败，session_key=%s", self.session_key)
         self._advance_memory_revision(global_rev)
@@ -745,7 +750,15 @@ class AgentLoop:
             if compaction.compacted:
                 new_history = canonicalize_history(compaction.messages[1:-1])
                 self._session_history = new_history
-                self.session_manager.save_messages(self.session_key, new_history)
+                # NC-MEM-002：压缩写回走「保留时间戳」模式——save_messages
+                # 从原文件按身份找回尾部保留消息的原始 timestamp（压缩不改变
+                # 这些消息内容，时间戳真实性应保持），新生成的摘要消息无匹配
+                # 补当前压缩时刻。紧随其后的「压缩→无条件重建完整快照」
+                # （_sync_memory_patch，TASK-007）也走保留模式，否则重建会
+                # 立刻把时间戳再改写掉。
+                self.session_manager.save_messages(
+                    self.session_key, new_history, preserve_timestamps=True
+                )
                 print(
                     f"\033[2;35m🗜️  会话历史已压缩：{len(messages)} 条 → "
                     f"{len(compaction.messages)} 条；估算 {compaction.estimated_tokens} / "

@@ -407,6 +407,11 @@ class DreamScheduler:
 
     可测性：注入 ``clock``（``now() -> datetime``）与 ``wait``（event, timeout），
     测试用假时钟推进 + 假 wait 直接跳到到点时刻，无需真实 sleep。
+
+    TASK-015 失败重试：``consolidate_today()`` 返回 False（模型失败/空响应）
+    或抛异常时，在当日稍后重试，最多 ``dream_max_retries`` 次（默认 3）、
+    间隔 ``dream_retry_interval`` 秒（默认 1800=30 分钟）；``last_dream_date``
+    仍只推进到真正整理完成的日期，失败不提前标记（下次启动补做兜底）。
     """
 
     def __init__(
@@ -418,6 +423,8 @@ class DreamScheduler:
         clock=None,
         wait=None,
         on_wake_catch_up=None,
+        dream_max_retries: int = 3,
+        dream_retry_interval: float = 1800,
     ):
         self.consolidate_today = consolidate_today
         self.dream_time = dream_time
@@ -425,6 +432,12 @@ class DreamScheduler:
         self.clock = clock or SystemClock()
         self._wait = wait or _dream_default_wait
         self._on_wake_catch_up = on_wake_catch_up
+        # TASK-015：定时整理失败当日自动重试——最多 ``dream_max_retries`` 次，
+        # 每次间隔 ``dream_retry_interval`` 秒（默认 30 分钟）；全部失败当日
+        # 放弃，交给下次启动补做/明日到点兜底。last_dream_date 仍只推进到
+        # 真正整理完成的日期（重试成功才推进）。
+        self._dream_max_retries = max(0, int(dream_max_retries))
+        self._dream_retry_interval = max(0.0, float(dream_retry_interval))
         self._wake_event = asyncio.Event()
         self._stopped = False
         self._task = None
@@ -467,7 +480,8 @@ class DreamScheduler:
                 wake_gap = (
                     (local_today - last_date).days if last_date is not None else 0
                 )
-                await self._safe_consolidate()
+                # TASK-015：整理昨天；失败时在当日稍后自动重试（有限次数）。
+                await self._run_with_retry(local_today)
                 if self._on_wake_catch_up is not None and wake_gap > 1:
                     # TASK-014：真实多日睡眠唤醒（如 8-9 → 8-13）——昨天整理
                     # 之外，再补做一次「最后有消息的日期」（如 8-9），避免多日
@@ -483,12 +497,51 @@ class DreamScheduler:
                 if self._stopped:
                     return
 
-    async def _safe_consolidate(self) -> None:
-        """执行一次整理；任何异常（含整理函数自身未吞的）都不让调度循环退出。"""
+    async def _safe_consolidate(self) -> bool:
+        """执行一次整理；返回是否真正完成（False=模型失败/异常，供重试）。
+
+        - 只有**显式返回 False**（``consolidate_today`` 传播 ``run_dream_for_date``
+          的模型失败契约）才视为失败并触发当日重试；
+        - None（旧式回调/无返回）与 True 都视为成功——向后兼容既有调用方；
+        - 任何异常（含整理函数自身未吞的）都转为 False，绝不让调度循环退出。
+        """
         try:
-            await self.consolidate_today()
+            result = await self.consolidate_today()
         except Exception:  # noqa: BLE001 - 做梦失败绝不影响调度循环
-            pass
+            return False
+        return result is not False
+
+    async def _run_with_retry(self, local_today) -> None:
+        """整理昨天；失败时在当日稍后自动重试（TASK-015）。
+
+        - 失败 = ``consolidate_today()`` 返回 False（模型调用失败/空响应）或抛异常；
+        - 重试次数上限 ``dream_max_retries``（默认 3 次），间隔
+          ``dream_retry_interval``（默认 30 分钟，可注入时钟/wait 单测）；
+          全部失败当日放弃，交给下次启动补做/明日到点兜底；
+        - ``last_dream_date`` 仍只推进到真正整理完成的日期（重试成功才由
+          ``run_dream_for_date`` 推进），失败不推进、不提前标记；
+        - 与 ``_done_this_run`` + 串行锁去重配合：每次重试都走
+          ``build_dream_components`` 内 ``run_dream`` 的去重判定（成功即入
+          去重集合），不会与启动补做/唤醒补做重复整理同一日期；
+        - 重试等待期间若已跨日（本地日期变化），放弃本轮重试——明天的到点
+          调度会处理新的一天，失败日期留给下次启动补做。
+        """
+        attempts = 0
+        while True:
+            ok = await self._safe_consolidate()
+            if ok:
+                return
+            attempts += 1
+            if attempts > self._dream_max_retries:
+                return
+            # 等待重试间隔（可被 stop 唤醒/取消；用注入 wait 便于假时钟推进）
+            self._wake_event.clear()
+            await self._wait(self._wake_event, self._dream_retry_interval)
+            if self._stopped:
+                return
+            now = _as_aware(self.clock.now())
+            if now.astimezone(ZoneInfo(self.timezone)).date() != local_today:
+                return
 
     async def _safe_wake_catch_up(self) -> None:
         """多日睡眠唤醒时补做一次「最后有消息的日期」；异常静默，不破坏循环。"""
@@ -639,7 +692,7 @@ async def run_dream_for_date(
     date_str: str,
     *,
     timezone: str = "UTC",
-) -> None:
+) -> bool:
     """对指定日期执行一次做梦整理（失败静默，供启动补做与定时调度共用）。
 
     - 数据源：当天各会话关键消息（``collect_messages_for_date``）+ 当天 daily
@@ -647,21 +700,27 @@ async def run_dream_for_date(
     - 该日期**无消息**：不调模型、不更新 last_dream_date（不做无意义整理，
       也不把无消息日期记为已整理——否则会推进状态导致有内容的日子被永久跳过）；
     - 有消息且模型整理成功：更新 ``dream_state``（last_dream_date = date_str）；
-      模型调用失败时不更新，保证下次启动补做可重试该日期；
+      模型调用失败时不更新，保证下次启动补做/当日重试可重试该日期；
     - 任何异常静默返回，不阻塞聊天或启动。
+
+    返回值（TASK-015：定时失败当日自动重试依赖此契约）：
+        True  = 该日期已整理完成（有消息且整理成功；或无消息/无事可做）；
+        False = 模型调用失败、空响应或异常——调用方**不**把该日期记为已整理，
+                可在当日稍后重试，仍失败则留给下次启动补做/明日到点兜底。
     """
     try:
         messages = collect_messages_for_date(session_manager, date_str, timezone=timezone)
         if not messages:
-            return
+            return True
         done = await dream_consolidate(provider, daily, date_str, messages)
     except Exception:  # noqa: BLE001 - 做梦失败静默
-        return
+        return False
     if done:
         try:
             dream_state.write_last_dream_date(date_str)
         except Exception:  # noqa: BLE001 - 状态写失败不阻断
             pass
+    return done
 
 
 class DreamComponents:
@@ -686,6 +745,8 @@ def build_dream_components(
     timezone: str,
     dream_time: str = DEFAULT_DREAM_TIME,
     clock=None,
+    dream_max_retries: int = 3,
+    dream_retry_interval: float = 1800,
 ) -> DreamComponents:
     """组装每日做梦整理（TASK-011 定时调度 + 启动补做；TASK-013 语义修正）。
 
@@ -721,11 +782,16 @@ def build_dream_components(
             return _today_date(timezone)
         return _as_aware(now_fn()).astimezone(ZoneInfo(timezone)).date()
 
-    async def run_dream(date_str: str) -> None:
+    async def run_dream(date_str: str) -> bool:
+        """对某日期执行做梦整理（_dedup_lock + _done_this_run 去重）。
+
+        返回 ``run_dream_for_date`` 的结果（True=完成/无事可做，False=模型
+        失败需重试）；失败日期不入去重集合，调度器的当日重试可再次进入本函数。
+        """
         async with _dedup_lock:
             if date_str in _done_this_run:
-                return  # 本进程本次启动已整理过该日
-            await run_dream_for_date(
+                return True  # 本进程本次启动已整理过该日（成功）
+            ok = await run_dream_for_date(
                 provider, daily_memory, session_manager, dream_state, date_str,
                 timezone=timezone,
             )
@@ -734,13 +800,21 @@ def build_dream_components(
             last = dream_state.read_last_dream_date()
             if last is not None and last >= date_str:
                 _done_this_run.add(date_str)
+            return ok
 
-    async def consolidate_today() -> None:
-        """定时到点整理「昨天」全天（含凌晨尾巴），无论上次状态如何都推进。"""
-        await run_dream((_today() - timedelta(days=1)).isoformat())
+    async def consolidate_today() -> bool:
+        """定时到点整理「昨天」全天（含凌晨尾巴），无论上次状态如何都推进。
 
-    async def catch_up_yesterday() -> None:
-        """启动补做：补「最后有消息的日期」（last < D < 今天），只补一天。"""
+        返回 True=完成/无事可做；False=模型失败（调度器据此当日自动重试）。
+        """
+        return await run_dream((_today() - timedelta(days=1)).isoformat())
+
+    async def catch_up_yesterday() -> bool:
+        """启动补做：补「最后有消息的日期」（last < D < 今天），只补一天。
+
+        返回 True=完成/无事可做；False=模型失败（启动补做不自动重试，留给
+        下次启动；与定时失败重试同走 run_dream 的去重判定）。
+        """
         target = find_last_active_date(
             session_manager,
             dream_state.read_last_dream_date(),
@@ -748,7 +822,8 @@ def build_dream_components(
             timezone=timezone,
         )
         if target is not None:
-            await run_dream(target)
+            return await run_dream(target)
+        return True
 
     scheduler = DreamScheduler(
         consolidate_today,
@@ -756,6 +831,8 @@ def build_dream_components(
         timezone=timezone,
         clock=clock,
         on_wake_catch_up=catch_up_yesterday,
+        dream_max_retries=dream_max_retries,
+        dream_retry_interval=dream_retry_interval,
     )
     return DreamComponents(scheduler, consolidate_today, catch_up_yesterday)
 

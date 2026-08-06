@@ -62,7 +62,14 @@ class DummySessionManager(SessionManager):
     def save_message(self, session_key: str, message: dict) -> None:
         pass
 
-    def save_messages(self, session_key: str, messages: list) -> None:
+    def save_messages(
+        self,
+        session_key: str,
+        messages: list,
+        preserve_timestamps: bool = False,
+    ) -> None:
+        # 子 Agent 不落盘：preserve_timestamps 仅为与 SessionManager.save_messages
+        # 签名保持一致（DummySessionManager 全 no-op，任何模式行为不变）。
         pass
 
     def get_memory_revision(self, session_key: str):

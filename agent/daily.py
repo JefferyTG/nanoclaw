@@ -17,6 +17,7 @@
 
 import json
 import os
+import threading
 from datetime import datetime
 from typing import List, Optional
 
@@ -68,6 +69,13 @@ class DailyMemory:
         """
         self.daily_dir = os.path.join(memory_dir, "daily")
         os.makedirs(self.daily_dir, exist_ok=True)
+        # 进程内写锁（TASK-011 遗留，TASK-015 修复）：write_dream 是「读-合并-
+        # 写回」、append 的「文件不存在时建头部」也是先查后写，同一进程内并发
+        # 写 daily 时用锁串行化，避免读-改-写丢数据。asyncio 单线程事件循环内
+        # 锁从不阻塞（临界区无 await，天然原子），跨线程时由锁串行；append 虽
+        # 是单次 open 追加（无读-改-写），但与 write_dream 共享同一把锁，保证
+        # 头部创建与整文件写入全串行（防「先查后写」竞态）。
+        self._lock = threading.Lock()
 
     def _path_for(self, date_str: str) -> str:
         """指定日期的 daily 文件路径（date_str 格式 YYYY-MM-DD）。"""
@@ -99,20 +107,21 @@ class DailyMemory:
         if not content:
             return
 
-        path = self._path()
-        # 文件不存在时先写头部（# 日期）
-        if not os.path.exists(path):
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(f"# {datetime.now().strftime('%Y-%m-%d')}\n\n")
+        with self._lock:
+            path = self._path()
+            # 文件不存在时先写头部（# 日期）
+            if not os.path.exists(path):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(f"# {datetime.now().strftime('%Y-%m-%d')}\n\n")
 
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(f"## {category}\n\n")
-            # 多行内容逐行加 - 前缀，保持列表格式
-            for line in content.splitlines():
-                line = line.strip()
-                if line:
-                    f.write(f"- {line}\n")
-            f.write("\n")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(f"## {category}\n\n")
+                # 多行内容逐行加 - 前缀，保持列表格式
+                for line in content.splitlines():
+                    line = line.strip()
+                    if line:
+                        f.write(f"- {line}\n")
+                f.write("\n")
 
     def write_dream(
         self,
@@ -134,6 +143,18 @@ class DailyMemory:
             sections: {分类名: [事实行, ...]}，来自做梦整理模型输出。
             categories: 固定分类顺序（默认 DREAM_CATEGORIES）。
         """
+        # 读-合并-写回整体持锁（TASK-015）：并发 write_dream / append 串行执行，
+        # 防止「两个写者各读同一旧文件 → 各自写回 → 后写者覆盖先写者」丢数据。
+        with self._lock:
+            self._write_dream_locked(date_str, sections, categories)
+
+    def _write_dream_locked(
+        self,
+        date_str: str,
+        sections: dict,
+        categories: tuple = DREAM_CATEGORIES,
+    ) -> None:
+        """write_dream 的实际逻辑；调用方必须已持有 ``self._lock``。"""
         path = self._path_for(date_str)
         existing = self.read(date_str)
         parsed = _parse_daily_sections(existing)
