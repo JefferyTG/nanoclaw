@@ -28,6 +28,10 @@ from providers.openai_compat import OpenAICompatProvider
 from voice.asr.openai_compat import OpenAICompatibleASRProvider
 from voice.asr.service import AudioTranscriptionService
 from voice.tts.edge import EdgeTTSProvider
+from voice.tts.dashscope_realtime import (
+    DEFAULT_MODEL as DASHSCOPE_DEFAULT_MODEL,
+    DashScopeRealtimeTTSProvider,
+)
 from voice.tts.service import TextToSpeechService
 from agent.tools.registry import ToolRegistry
 from agent.tools.mcp import MCPClientManager
@@ -141,8 +145,11 @@ def build_tts_service(config):
     settings = config.tts_model if isinstance(config.tts_model, dict) else {}
     if not settings.get("enabled", True):
         return None
-    if settings.get("provider", "edge_tts") != "edge_tts":
-        print("[!] TTS 未启用：当前仅支持 provider=edge_tts")
+    provider_name = settings.get("provider", "edge_tts")
+    if provider_name == "dashscope_realtime":
+        return _build_dashscope_realtime_tts_service(settings)
+    if provider_name != "edge_tts":
+        print("[!] TTS 未启用：当前仅支持 provider=edge_tts / dashscope_realtime")
         return None
 
     voice = str(settings.get("voice") or "").strip()
@@ -171,6 +178,68 @@ def build_tts_service(config):
         return None
 
     print(f"（网页文字朗读：服务已就绪·音色 {voice}·页面默认关闭）")
+    return service
+
+
+def _build_dashscope_realtime_tts_service(settings):
+    """按 tts_model.dashscope_realtime 分支装配甘雨音色流式 TTS。
+
+    配置不合法（缺 api_key / 缺 voice_id / 参数非法）时打印警告并返回 None，
+    只禁用朗读，绝不影响其它服务启动。api_key 支持环境变量 DASHSCOPE_API_KEY
+    最高优先级覆盖（密钥不落盘 config.json）。
+    """
+    ds = settings.get("dashscope_realtime")
+    ds = ds if isinstance(ds, dict) else {}
+    api_key = os.environ.get("DASHSCOPE_API_KEY") or str(
+        ds.get("api_key") or ""
+    ).strip()
+    voice_id = str(ds.get("voice_id") or "").strip()
+    model = str(ds.get("model") or DASHSCOPE_DEFAULT_MODEL).strip()
+    if not api_key:
+        print(
+            "[!] TTS 未启用（dashscope_realtime）：请配置 "
+            "tts_model.dashscope_realtime.api_key 或环境变量 DASHSCOPE_API_KEY"
+        )
+        return None
+    if not voice_id:
+        print(
+            "[!] TTS 未启用（dashscope_realtime）：请配置 "
+            "tts_model.dashscope_realtime.voice_id"
+        )
+        return None
+
+    try:
+        provider = DashScopeRealtimeTTSProvider(
+            api_key=api_key,
+            voice_id=voice_id,
+            model=model,
+            sample_rate=int(ds.get("sample_rate", 24000)),
+            session_ready_timeout_sec=float(
+                ds.get("session_ready_timeout_sec", 10)
+            ),
+            close_grace_sec=float(ds.get("close_grace_sec", 5)),
+            overall_timeout_sec=float(ds.get("overall_timeout_sec", 120)),
+            max_audio_bytes=int(
+                ds.get("max_audio_bytes", 16 * 1024 * 1024)
+            ),
+        )
+        service = TextToSpeechService(
+            provider,
+            max_text_chars=int(settings.get("max_text_chars", 4000)),
+            max_audio_bytes=int(
+                ds.get("max_audio_bytes", 16 * 1024 * 1024)
+            ),
+            max_concurrency=int(settings.get("max_concurrency", 2)),
+            timeout_sec=float(settings.get("timeout_sec", 60)),
+        )
+    except (TypeError, ValueError) as exc:
+        print(f"[!] TTS 未启用：配置值无效（{exc}）")
+        return None
+
+    print(
+        "（网页文字朗读：服务已就绪·provider=dashscope_realtime"
+        f"·音色 {voice_id}·页面默认关闭）"
+    )
     return service
 
 

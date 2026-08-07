@@ -22,7 +22,7 @@
 | 微信文件接收 | ✅ | 文件按月归档 `workspace/files/YYYY-MM/`（消毒名+重名加后缀+50MB 上限）；发模型只带「文件名+路径+大小」引用、不读内容不花 token；乖宝说「帮我看看」时 Agent 用 `read_file` 按需读取 |
 | 网页端 | ✅ | 流式思考/逐字输出、会话侧边栏、历史接回/删除、断线重连、「⏹ 停止」回合取消 |
 | 语音输入 ASR | ✅ | OpenAI-compatible，FFmpeg 归一化，仅 Web（`asr_model` 配置启用） |
-| 语音朗读 TTS | ✅ | edge-tts 分句流水线，可取消，默认关（`tts_model` 配置启用） |
+| 语音朗读 TTS | ✅ | edge-tts 分句流水线（默认）或 DashScope 甘雨音色流式 TTS（`provider=dashscope_realtime`，QwenTtsRealtime WebSocket 流式合成 WAV，支持录音复刻换音色 `create_voice_by_clone`，TASK-017），可取消，默认关（`tts_model` 配置启用） |
 | ReAct 工具循环 | ✅ | `max_iterations`、`turn_timeout_sec` 墙钟、重复工具防爆、180s 工具兜底 / Shell 60s |
 | 内置工具 | ✅ | 26 个（含 AskImage 条件注册）+ MCP 扩展（`{server}__{tool}`） |
 | 网络搜索/抓取 | ✅ | `web_search`：Tavily 主通道（结构化正文，中文友好）+ DuckDuckGo 降级兜底；`web_fetch`：httpx 静态 → Jina Reader → 本机 Chrome 无头渲染 → Tavily Extract 四级降级链，解决 JS 动态页/反爬/iframe（TASK-016） |

@@ -18,7 +18,7 @@ NanoClaw 是一个本地优先、单进程、多渠道的个人 AI Agent 网关�
 | 工具扩展 | 自定义 Tool API、MCP stdio | 内置工具注册和外部 MCP Server 接入 |
 | 网络工具 | `httpx`、`ddgs`、`html2text`、Tavily Search/Extract（REST） | 网页抓取、多通道搜索（Tavily+ddgs 降级）、抓取降级链（httpx→Jina→Chrome→Tavily）、生图服务请求 |
 | 语音输入 | MediaRecorder、FFmpeg/ffprobe、`httpx` | Web 录音、格式规范化、云端 ASR |
-| 语音输出 | `edge-tts`、HTMLAudioElement | Web 新回复分段合成、顺序播放与取消 |
+| 语音输出 | `edge-tts`（默认）、`dashscope`（甘雨音色 `QwenTtsRealtime` 流式，可选）、HTMLAudioElement | Web 新回复分段合成、顺序播放与取消；DashScope 输出 WAV |
 | 技能 | Markdown + YAML frontmatter | 技能发现、摘要注入与按需加载 |
 | 数据 | JSONL、Markdown、图片文件、SQLite | 会话、长期/每日记忆、图片、LIKE 检索索引 |
 
@@ -143,7 +143,7 @@ Linux 后台控制脚本通过 `setsid` 建立独立进程组，并用 PID 文�
 
 ASR 在启动期按 `asr_model` 配置装配并只注入 WebChannel。浏览器把完整录音上传到独立 HTTP 端点，WebChannel 在主事件循环调用共享转写服务；成功且非空的文本再通过原有 WebSocket 文本入口进入 MessageBus。音频字节、临时路径和 Provider 原始响应均不进入 Bus 或会话持久化。
 
-TTS 同样在启动期按 `tts_model` 配置装配并只注入 WebChannel，但不进入 MessageBus。网页仅在用户主动开启朗读后，从实时 Agent `token/done` 事件按标点和长度切分新回复，经独立 HTTP 端点合成短 MP3；当前片段播放时预合成下一片段。关闭朗读、发送新消息、切换会话或断线会取消请求并清空播放状态，历史回放不会触发 TTS。
+TTS 同样在启动期按 `tts_model` 配置装配并只注入 WebChannel，但不进入 MessageBus。`provider=edge_tts` 合成 MP3；`provider=dashscope_realtime` 走 DashScope `QwenTtsRealtime`（WebSocket 流式，provider 内部收集 PCM 后封装 WAV，commit 模式以服务端 `response.done` 判定完成，不阻塞事件循环），支持录音复刻换音色（`voice/tts/dashscope_realtime.create_voice_by_clone`，TASK-017）。网页仅在用户主动开启朗读后，从实时 Agent `token/done` 事件按标点和长度切分新回复，经独立 HTTP 端点合成短音频；当前片段播放时预合成下一片段。关闭朗读、发送新消息、切换会话或断线会取消请求并清空播放状态，历史回放不会触发 TTS。
 
 飞书图片沿用同一套渠道无关协议。入站 `image` 事件先建立按 chat、会话序号和发送者隔离的待处理批次，再用消息 ID 与 `image_key` 调飞书鉴权资源接口下载；校验通过后保存到共享 `ImageStore`。批次默认等待 10 秒接收后续文字，连续图片会重置计时；文字到达或计时结束后，整批图片作为一条 `InboundMessage.images` 进入既有视觉链路。下载期间即使用户切换会话，图片仍归属事件到达时的会话序号。出站时 `AgentLoop` 汇总本轮（含子 Agent）生成的图片 ID，Gateway 在原会话中解析为 `ImageRef` 并放入 `OutboundMessage.images`；飞书 Channel 上传图片取得 `image_key` 后发送 `image` 消息。Web 上传本身就是单条图文消息，不使用飞书的等待合并机制；Web 的图片展示继续使用流事件，不重复消费最终出站图片。
 

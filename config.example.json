@@ -65,7 +65,17 @@
     "receive_timeout_sec": 60,
     "max_text_chars": 4000,
     "max_audio_bytes": 16777216,
-    "max_concurrency": 2
+    "max_concurrency": 2,
+    "dashscope_realtime": {
+      "api_key": "",
+      "voice_id": "qwen-tts-vc-myclone-voice-20260807125201837-750c",
+      "model": "qwen3-tts-vc-realtime-2026-01-15",
+      "sample_rate": 24000,
+      "overall_timeout_sec": 120,
+      "session_ready_timeout_sec": 10,
+      "close_grace_sec": 5,
+      "max_audio_bytes": 16777216
+    }
   },
   "reminders": {
     "enabled": true,

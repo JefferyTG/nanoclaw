@@ -228,6 +228,20 @@ class NanoClawConfig:
             "max_text_chars": 4000,
             "max_audio_bytes": 16 * 1024 * 1024,
             "max_concurrency": 2,
+            # DashScope 甘雨音色流式 TTS 分支：provider=dashscope_realtime 时使用。
+            # api_key 可走环境变量 DASHSCOPE_API_KEY 覆盖（最高优先级，不落盘）；
+            # voice_id 默认甘雨（绑定 qwen3-tts-vc-realtime-2026-01-15，不可跨模型）。
+            # overall/session_ready/close_grace 为 WebSocket 各阶段超时（秒）。
+            "dashscope_realtime": {
+                "api_key": "",
+                "voice_id": "qwen-tts-vc-myclone-voice-20260807125201837-750c",
+                "model": "qwen3-tts-vc-realtime-2026-01-15",
+                "sample_rate": 24000,
+                "overall_timeout_sec": 120,
+                "session_ready_timeout_sec": 10,
+                "close_grace_sec": 5,
+                "max_audio_bytes": 16 * 1024 * 1024,
+            },
         }
     )
     # 提醒数据库位于 workspace 下的独立持久库，不与可重建的 memory/index.db 混用。
