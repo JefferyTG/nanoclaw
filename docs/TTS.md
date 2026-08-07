@@ -99,6 +99,23 @@ DashScope SDK 的 `QwenTtsRealtime`（WebSocket）流式合成，provider 内部
   兜底总超时（`TextToSpeechService` 外层还有 `tts_model.timeout_sec` 的 60s
   wait_for 先兜底）。
 
+### 情绪指令（instructions）
+
+`DashScopeRealtimeTTSProvider` 支持 Qwen-TTS 合成指令（自然语言描述情绪/语气/风格），
+每次合成时读取，运行时切换立即生效（同 `voice_id` 模式）：
+
+```python
+provider.instructions = "用可爱甜美的语气朗读，语速轻快带俏皮尾音"  # 运行时换语气
+provider.instructions = None  # 恢复不带指令
+```
+
+配置：`tts_model.dashscope_realtime.instructions`（默认空 = 不带指令；只加不改，
+Qwen-TTS 指令文本限中文/英文 ≤1600 Token）。当前本机 config.json 已配「可爱甜美」
+基调（适配小奈感觉，乖宝 2026-08-07 指定）。空值/空串不传 `instructions` 参数，
+行为与 TASK-017 一致。
+
+> 动态情绪（回复内容自动切换语气）需改 `channels/web.py` 链路传指令，未实现（另立任务）。
+
 ### 录音复刻换音色
 
 模块级 API（不阻塞事件循环，`httpx` 异步实现，`post` 参数可注入 fake 测试）：

@@ -148,6 +148,9 @@ class DashScopeRealtimeTTSProvider(TTSProvider):
 
     - ``voice_id`` 每次合成时读取，运行时直接改 ``provider.voice_id`` 即可
       立即换音色（复刻接口返回的新 voice_id 赋值即生效）。
+    - ``instructions`` 为合成指令（情绪/语气/风格控制，Qwen-TTS 指令文本），
+      每次合成时读取；运行时直接改 ``provider.instructions`` 即可动态切换
+      语气基调（如「可爱撒娇」→「温柔清冷」）。空值/None 表示不带指令。
     - ``realtime_factory`` 为可注入 factory（同 edge.py 的 communicate_factory），
       测试用它注入 fake，不真调 API。
     """
@@ -160,6 +163,7 @@ class DashScopeRealtimeTTSProvider(TTSProvider):
         model: str = DEFAULT_MODEL,
         sample_rate: int = DEFAULT_SAMPLE_RATE,
         language_type: str = DEFAULT_LANGUAGE_TYPE,
+        instructions: str | None = None,
         session_ready_timeout_sec: float = 10.0,
         close_grace_sec: float = 5.0,
         overall_timeout_sec: float = 120.0,
@@ -191,6 +195,7 @@ class DashScopeRealtimeTTSProvider(TTSProvider):
         self.model = model.strip()
         self.sample_rate = sample_rate
         self.language_type = language_type
+        self.instructions = instructions.strip() if isinstance(instructions, str) else None
         self.session_ready_timeout_sec = float(session_ready_timeout_sec)
         self.close_grace_sec = float(close_grace_sec)
         self.overall_timeout_sec = float(overall_timeout_sec)
@@ -219,12 +224,15 @@ class DashScopeRealtimeTTSProvider(TTSProvider):
                 client = self._realtime_factory(model=self.model, callback=callback)
                 holder["client"] = client
                 client.connect()  # 阻塞至连接成功（SDK 内部超时上限 5s）
-                client.update_session(
+                session_kwargs = dict(
                     voice=voice_id,
                     mode="commit",
                     sample_rate=self.sample_rate,
                     language_type=self.language_type,
                 )
+                if self.instructions:
+                    session_kwargs["instructions"] = self.instructions
+                client.update_session(**session_kwargs)
                 # 用服务端 session.created/updated 握手替代魔法 sleep(0.8)：
                 # 确认会话就绪后再 append，避免 append 过早导致合成失败。
                 if not callback.session_ready.wait(

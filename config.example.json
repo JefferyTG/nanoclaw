@@ -74,7 +74,8 @@
       "overall_timeout_sec": 120,
       "session_ready_timeout_sec": 10,
       "close_grace_sec": 5,
-      "max_audio_bytes": 16777216
+      "max_audio_bytes": 16777216,
+      "instructions": ""
     }
   },
   "reminders": {

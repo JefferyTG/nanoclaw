@@ -222,6 +222,7 @@ def _build_dashscope_realtime_tts_service(settings):
             max_audio_bytes=int(
                 ds.get("max_audio_bytes", 16 * 1024 * 1024)
             ),
+            instructions=str(ds.get("instructions") or "").strip() or None,
         )
         service = TextToSpeechService(
             provider,

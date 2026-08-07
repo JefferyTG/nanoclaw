@@ -190,6 +190,10 @@
 | TASK-011 决策项 | `workspace/memory/HISTORY.md` 历史文件清理 | TASK-011 起停止新写入；旧文件保留与否待乖宝拍板，默认保留不动 |
 | TASK-013 遗留 | 重启当天重复整理昨天 1 次安全冗余 / 首启全扫描性能 / 时区假设 / 测试代理弱化 | P2 留档不改，详见 TASK-013 任务卡「实现进展」段 |
 | TASK-014 遗留 | 真实休眠 asyncio 挂起/恢复未端到端验证 | mock 时钟已覆盖逻辑层；系统休眠期间 `asyncio.wait_for` 挂起/恢复行为未实测，逻辑层已覆盖 |
+| TASK-017/018 决策 | 甘雨音色绑定 `qwen3-tts-vc-realtime-2026-01-15`，音色不可跨模型；合成必须走 QwenTtsRealtime WebSocket（HTTP 400） | 实测确认（TASK-017） |
+| TASK-018 决策 | VC 模型 `instructions` 参数真实接受（合成无报错），听感影响待乖宝实测 | 官方文档指令控制明确支持 Instruct-Flash 系列；VC 系列 SDK 层有参数，已真实调用验证接受 |
+| TASK-018 遗留 | 动态情绪（回复自动切语气）未实现 | 需改 web.py 链路传 instructions，超授权另立任务 |
+| TASK-018 遗留 | VC 模型 instructions 听感影响未确认 | 若服务端忽略（听感无变化）需换 Qwen-Audio-TTS 情感标签或 Instruct 模型（需重新复刻音色） |
 
 ## 6. 运行和产品边界
 

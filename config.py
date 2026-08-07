@@ -241,6 +241,9 @@ class NanoClawConfig:
                 "session_ready_timeout_sec": 10,
                 "close_grace_sec": 5,
                 "max_audio_bytes": 16 * 1024 * 1024,
+                # 合成指令（情绪/语气/风格，Qwen-TTS 指令文本；空=不带指令）。
+                # 示例：「用可爱甜美的语气朗读，声音温柔清澈，带一点俏皮和元气」
+                "instructions": "",
             },
         }
     )

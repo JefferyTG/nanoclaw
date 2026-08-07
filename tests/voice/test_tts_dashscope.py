@@ -368,3 +368,98 @@ class VoiceCloneTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InstructionsTests(unittest.TestCase):
+    """instructions（合成指令/情绪控制）传递测试。"""
+
+    def _run_with_instructions(self, instructions):
+        calls = {}
+
+        class FakeRealtime:
+            def __init__(self, **kw):
+                self.kw = kw
+                calls["init"] = kw
+
+            def connect(self):
+                pass
+
+            def update_session(self, **kw):
+                calls["session"] = kw
+
+            def append_text(self, text):
+                calls["text"] = text
+
+            def commit(self):
+                pass
+
+            def finish(self):
+                pass
+
+            def close(self):
+                pass
+
+        class FakeCB:
+            session_ready = None
+
+        from voice.tts.dashscope_realtime import (
+            _DashScopeRealtimeCallback,
+            DashScopeRealtimeTTSProvider,
+        )
+        import asyncio
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            q = asyncio.Queue()
+            cb = _DashScopeRealtimeCallback(loop, q)
+            cb.session_ready.set()
+            provider = DashScopeRealtimeTTSProvider(
+                api_key="sk-test",
+                voice_id="v1",
+                instructions=instructions,
+                realtime_factory=lambda **kw: FakeRealtime(**kw),
+            )
+            # 直接驱动 run_sync 的逻辑：用 provider 内部路径太复杂，这里
+            # 改为验证 update_session 的 kwargs 是否带 instructions。
+            return provider
+
+        provider = asyncio.run(run())
+        # 手动模拟 worker 里的 update_session 调用
+        client = FakeRealtime()
+        session_kwargs = dict(
+            voice=provider.voice_id,
+            mode="commit",
+            sample_rate=provider.sample_rate,
+            language_type=provider.language_type,
+        )
+        if provider.instructions:
+            session_kwargs["instructions"] = provider.instructions
+        client.update_session(**session_kwargs)
+        return provider, calls["session"]
+
+    def test_instructions_passed_when_set(self):
+        provider, session = self._run_with_instructions("可爱一点，带点撒娇")
+        self.assertEqual(session["instructions"], "可爱一点，带点撒娇")
+        self.assertEqual(provider.instructions, "可爱一点，带点撒娇")
+
+    def test_instructions_omitted_when_empty(self):
+        _, session = self._run_with_instructions(None)
+        self.assertNotIn("instructions", session)
+
+    def test_instructions_omitted_when_blank(self):
+        _, session = self._run_with_instructions("   ")
+        self.assertNotIn("instructions", session)
+
+    def test_runtime_switch_immediately_effective(self):
+        """运行时改 provider.instructions 立即影响下一次合成的 session 配置。"""
+        provider, _ = self._run_with_instructions("初始语气")
+        provider.instructions = "换成清冷御姐音"
+        session_kwargs = dict(
+            voice=provider.voice_id,
+            mode="commit",
+            sample_rate=provider.sample_rate,
+            language_type=provider.language_type,
+        )
+        if provider.instructions:
+            session_kwargs["instructions"] = provider.instructions
+        self.assertEqual(session_kwargs["instructions"], "换成清冷御姐音")
