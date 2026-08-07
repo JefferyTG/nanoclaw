@@ -72,7 +72,7 @@ git diff --check
 
 ## 执行交接
 
-- 状态：实现完成（真实合成已实测通过；待 commit）
+- 状态：**已完成（2026-08-07 归档）**
 - 实际改动文件：
   - 新增 `voice/tts/dashscope_realtime.py`：DashScope 甘雨音色流式 TTS Provider（`DashScopeRealtimeTTSProvider`）+ 录音复刻模块 API（`create_voice_by_clone`）+ `pcm_to_wav`；惰性导入 dashscope（模块级导入不依赖包存在）
   - 新增 `tests/voice/test_tts_dashscope.py`：18 个用例（fake realtime factory / fake post，零真实网络）

@@ -55,7 +55,7 @@ git diff --check
 
 ## 执行交接
 
-- 状态：实现完成（待验收；未 commit / 未 push）
+- 状态：**已完成（2026-08-07 归档）**
 - 实际改动文件：
   - `voice/tts/dashscope_realtime.py`：`__init__` 加 `instructions` 参数 + 可变属性；`update_session` 调用改为动态 kwargs（非空才传 `instructions`）；docstring 更新
   - `config.py`：dashscope_realtime 分支加 `"instructions": ""` 默认字段（只加不改）
