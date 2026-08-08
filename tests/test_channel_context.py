@@ -153,6 +153,33 @@ class ChannelContextTests(unittest.TestCase):
         self.assertNotIn(CHANNEL_SECTION_TITLE, prompt)
         self.assertNotIn("本会话所在渠道", prompt)
 
+    def test_weixin_channel_has_daily_chat_mode(self):
+        """weixin 渠道 System Prompt 含「微信日常对话模式」指令（TASK-019）。"""
+        agent = self.factory("weixin:yyy")
+        prompt = agent.context.build_system_prompt()
+        self.assertIn("微信日常对话模式", prompt)
+        self.assertIn("短句、口语、轻松自然", prompt)
+        self.assertIn("甜度不变", prompt)
+        self.assertIn("连发多条消息", prompt)
+        self.assertIn("先接住最新一条", prompt)
+        # 原「文件只确认不读」指令保留，不被覆盖
+        self.assertIn("只向用户确认收到", prompt)
+
+    def test_web_channel_does_not_have_weixin_daily_mode(self):
+        """web 渠道 System Prompt 不含微信日常对话模式指令（防回归，TASK-019）。"""
+        agent = self.factory("web:zzz")
+        prompt = agent.context.build_system_prompt()
+        self.assertNotIn("微信日常对话模式", prompt)
+        self.assertNotIn("连发多条消息", prompt)
+
+    def test_feishu_cli_scheduled_have_no_weixin_daily_mode(self):
+        """feishu / cli / scheduled 渠道均不含微信日常指令（防回归，TASK-019）。"""
+        for session_key in ("feishu:xxx", "cli:local1", "scheduled:123:456"):
+            with self.subTest(session_key=session_key):
+                agent = self.factory(session_key)
+                prompt = agent.context.build_system_prompt()
+                self.assertNotIn("微信日常对话模式", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
