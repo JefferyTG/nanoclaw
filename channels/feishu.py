@@ -21,16 +21,20 @@
 """
 
 import asyncio
+import io
 import json
 import logging
 import os
 import re
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
+    CreateFileRequest,
+    CreateFileRequestBody,
     CreateImageRequest,
     CreateImageRequestBody,
     CreateMessageRequest,
@@ -41,6 +45,8 @@ from lark_oapi.api.im.v1 import (
 from channels.base import Channel
 from bus.queue import InboundMessage, OutboundMessage
 from voice.asr.base import ASRError
+from voice.media import MediaError, encode_to_opus
+from voice.tts.base import TTSError
 
 if TYPE_CHECKING:
     from reminders.models import DeliveryResult
@@ -94,6 +100,8 @@ class FeishuChannel(Channel):
         image_store=None,
         image_merge_window_sec: float = 10.0,
         asr_service=None,
+        tts_service=None,
+        max_voice_chars: int = 300,
         bind_callback=None,
         unbind_callback=None,
     ) -> None:
@@ -112,6 +120,17 @@ class FeishuChannel(Channel):
         # 可选 ASR 服务由组合根注入；为 None 时收到语音回「未启用」提示，
         # 保持向后兼容（既有调用方不传也能用）。
         self.asr_service = asr_service
+        # 可选 TTS 服务由组合根注入；为 None 时语音入站仍正常（文字兜底回复）。
+        self.tts_service = tts_service
+        try:
+            max_voice_chars = int(max_voice_chars)
+        except (TypeError, ValueError):
+            max_voice_chars = 300
+        # 超过该字符数的回复不硬转语音（飞书语音有大小限制、长文本合成慢）。
+        self.max_voice_chars = max(0, max_voice_chars)
+        # 语音对语音：语音入站成功转写后记录该 chat 待发语音回复标记（chat_id 集合，
+        # 幂等 add）。仅由主事件循环访问。
+        self._voice_reply_pending: set[str] = set()
         # 仅由主事件循环访问：key=(chat_id, session sequence, sender_open_id)。
         self._pending_image_batches: dict[tuple[str, int, str], _PendingImageBatch] = {}
         self._stopping = False
@@ -409,6 +428,9 @@ class FeishuChannel(Channel):
             await self._publish_text_inbound(
                 chat_id, chat_type, sequence, sender_open_id, text
             )
+            # 语音入站成功（转写成功并已投递）→ 本次回复优先回语音气泡。
+            # 转写失败路径已提前 return，不会走到这里；set 幂等，多轮竞态可接受。
+            self._voice_reply_pending.add(chat_id)
         except Exception as exc:  # noqa: BLE001
             logger.exception("处理飞书语音入站消息失败：%s", exc)
             await self._publish_image_error(
@@ -834,6 +856,20 @@ class FeishuChannel(Channel):
         if not text and image_refs:
             return last_result
 
+        # 语音对语音：语音入站后本次出站优先回语音气泡。标记单次消费——先取走
+        # 再尝试；若合成期间又来一条新语音（标记被重新加入）则留给下一次回复，
+        # 符合多轮竞态约定。tts_service 未注入或文本超长时直接走文字，不残留标记。
+        if chat_id in self._voice_reply_pending:
+            self._voice_reply_pending.discard(chat_id)
+            if (
+                self.tts_service is not None
+                and text
+                and len(text) <= self.max_voice_chars
+            ):
+                voice_result = await self._try_send_voice_reply(chat_id, text)
+                if voice_result is not None:
+                    return voice_result
+
         # 按字符切分；无图片且内容为空时仍发一条占位，保持原有行为。
         chunks = [text[i:i + _MAX_CHUNK] for i in range(0, len(text), _MAX_CHUNK)] or [""]
         for i, chunk in enumerate(chunks):
@@ -923,6 +959,130 @@ class FeishuChannel(Channel):
             message=f"Feishu image upload error {code}: "
             f"{getattr(response, 'msg', '')}",
         )
+
+    async def _try_send_voice_reply(
+        self, chat_id: str, text: str
+    ) -> "DeliveryResult | None":
+        """尝试用语音气泡回复本次出站文本；成功返回结果，失败回 None（走文字兜底）。
+
+        链路：TTS 合成 → ffmpeg 转 OPUS → ``CreateFileRequest`` 上传（file_type=opus）
+        → ``msg_type=audio`` 发送。任何一步失败都记录日志并返回 None，由 send() 回
+        文字原文，绝不静默丢弃。
+        """
+        try:
+            tts_result = await self.tts_service.synthesize(text)
+        except TTSError as exc:
+            logger.warning("语音回复合成失败，改用文字回复：%s", exc.message)
+            return None
+        except Exception as exc:  # noqa: BLE001 - 细节只进日志，用户走文字兜底
+            logger.exception("语音回复合成异常，改用文字回复：%s", exc)
+            return None
+        audio = getattr(tts_result, "audio", None)
+        media_type = getattr(tts_result, "media_type", "audio/wav")
+        if not audio:
+            logger.warning("语音回复合成返回空音频，改用文字回复")
+            return None
+        try:
+            opus = await self._convert_audio_to_opus(audio, media_type)
+        except MediaError as exc:
+            logger.warning("语音回复 OPUS 转换失败，改用文字回复：%s", exc.message)
+            return None
+
+        file_key, upload_failure = await self._upload_audio(opus)
+        if upload_failure is not None:
+            logger.warning(
+                "语音回复上传失败，改用文字回复：%s", upload_failure.message
+            )
+            return None
+
+        payload = json.dumps({"file_key": file_key}, ensure_ascii=False)
+        request = (
+            CreateMessageRequest.builder()
+            .receive_id_type("chat_id")
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(chat_id)
+                .msg_type("audio")
+                .content(payload)
+                .build()
+            )
+            .build()
+        )
+        result = await self._send_request(self._client.im.v1.message.create, request)
+        if not result.success:
+            logger.warning("语音回复发送失败，改用文字回复：%s", result.message)
+            return None
+        logger.info("飞书语音回复已发送（chat_id=%s）", chat_id)
+        return result
+
+    @staticmethod
+    async def _convert_audio_to_opus(audio: bytes, media_type: str) -> bytes:
+        """把 TTS 合成音频转成 16 kHz 单声道 OPUS 字节。
+
+        ``encode_to_opus`` 内部用 asyncio 子进程跑 ffmpeg（非阻塞），随 ASR service
+        同款模式在主事件循环 await；临时目录即用即删，音频不落盘。
+        """
+        with tempfile.TemporaryDirectory(prefix="nanoclaw-tts-") as directory:
+            return await encode_to_opus(
+                audio,
+                media_type=media_type,
+                directory=directory,
+            )
+
+    async def _upload_audio(self, opus: bytes):
+        """上传 OPUS 音频并返回 ``(file_key, failure)``；仿 ``_upload_image`` 的错误分类。"""
+        try:
+            response = await asyncio.to_thread(self._upload_audio_sync, opus)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            return None, self._delivery_result(
+                success=False, retryable=True, message=str(exc)
+            )
+        if response is None:
+            return None, self._delivery_result(
+                success=False, message="audio upload failed"
+            )
+        code = getattr(response, "code", None)
+        if response.success():
+            file_key = getattr(getattr(response, "data", None), "file_key", None)
+            if file_key:
+                return file_key, None
+            return None, self._delivery_result(
+                success=False,
+                code=code,
+                message="audio upload returned no file key",
+            )
+        return None, self._delivery_result(
+            success=False,
+            retryable=self._retryable_code(code),
+            code=code,
+            message=f"Feishu audio upload error {code}: "
+            f"{getattr(response, 'msg', '')}",
+        )
+
+    def _upload_audio_sync(self, opus: bytes):
+        """上传 OPUS 音频并返回 SDK response；由 ``to_thread`` 调用。
+
+        ``file_key`` 仅作飞书资源标识，绝不当成本地路径；音频字节留在内存，
+        不落盘。
+        """
+        with io.BytesIO(opus) as audio_file:
+            request = (
+                CreateFileRequest.builder()
+                .request_body(
+                    CreateFileRequestBody.builder()
+                    .file_type("opus")
+                    .file_name("reply.opus")
+                    .file(audio_file)
+                    .build()
+                )
+                .build()
+            )
+            resp = self._client.im.v1.file.create(request)
+        if not resp.success() or not getattr(resp, "data", None):
+            logger.error("飞书音频上传失败：code=%s msg=%s", resp.code, resp.msg)
+        return resp
 
     async def _send_request(self, request_fn, request) -> "DeliveryResult":
         """Make one SDK request and classify the result for the scheduler."""

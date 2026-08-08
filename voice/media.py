@@ -1,4 +1,4 @@
-"""Private, short-lived media normalization for ASR requests."""
+"""Private, short-lived media conversion helpers（ASR 归一化 / TTS 出站转 OPUS）。"""
 
 import asyncio
 import json
@@ -154,3 +154,77 @@ async def normalize_to_pcm_wav(
     if not normalized:
         raise MediaError("media_invalid", "音频转换未生成有效输出。")
     return ASRAudio(normalized, "audio.wav", "audio/wav")
+
+
+# 已合成音频（TTS 输出）的常见 MIME → 扩展名映射，供 ffmpeg 输入文件命名使用。
+_MEDIA_TYPE_SUFFIX = {
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/ogg": ".ogg",
+    "audio/opus": ".opus",
+    "audio/mp4": ".m4a",
+    "audio/x-m4a": ".m4a",
+    "audio/aac": ".aac",
+    "audio/webm": ".webm",
+    "audio/amr": ".amr",
+    "audio/x-amr": ".amr",
+    "audio/flac": ".flac",
+}
+
+
+async def encode_to_opus(
+    audio: bytes,
+    *,
+    media_type: str,
+    directory: str,
+    ffmpeg_path: str = "ffmpeg",
+    timeout_sec: float = 30.0,
+) -> bytes:
+    """把一段已合成音频转成 16 kHz 单声道 OPUS 字节（飞书语音消息用）。
+
+    输入可为 WAV / MP3 等 ffmpeg 支持的音频格式；输出 libopus（.opus 容器）。
+    临时文件由调用方负责（``directory`` 即用即删），音频不落盘。
+    """
+    if not audio:
+        raise MediaError("input_invalid", "音频内容为空。")
+    declared = (media_type or "").split(";", 1)[0].strip().lower()
+    suffix = _MEDIA_TYPE_SUFFIX.get(declared, ".bin")
+    workdir = Path(directory)
+    source = workdir / f"input{suffix}"
+    output = workdir / "output.opus"
+    source.write_bytes(audio)
+    await _run(
+        [
+            ffmpeg_path,
+            "-y",
+            "-nostdin",
+            "-v",
+            "error",
+            "-xerror",
+            "-i",
+            str(source),
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-sn",
+            "-dn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "libopus",
+            str(output),
+        ],
+        timeout_sec=timeout_sec,
+        failure_category="media_invalid",
+    )
+    try:
+        opus = output.read_bytes()
+    except OSError as exc:
+        raise MediaError("media_invalid", "音频转换未生成有效输出。") from exc
+    if not opus:
+        raise MediaError("media_invalid", "音频转换未生成有效输出。")
+    return opus
