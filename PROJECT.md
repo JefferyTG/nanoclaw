@@ -21,7 +21,7 @@
 | 微信语音转写 | ✅ | 语音经腾讯 STT 转写（`voice_item.text`）进入 Agent，不落地本地 ASR |
 | 微信文件接收 | ✅ | 文件按月归档 `workspace/files/YYYY-MM/`（消毒名+重名加后缀+50MB 上限）；发模型只带「文件名+路径+大小」引用、不读内容不花 token；乖宝说「帮我看看」时 Agent 用 `read_file` 按需读取 |
 | 网页端 | ✅ | 流式思考/逐字输出、会话侧边栏、历史接回/删除、断线重连、「⏹ 停止」回合取消 |
-| 语音输入 ASR | ✅ | OpenAI-compatible，FFmpeg 归一化，仅 Web（`asr_model` 配置启用） |
+| 语音输入 ASR | ✅ | OpenAI-compatible，FFmpeg 归一化；Web 录音即时转写 + 飞书语音入站自动转写（TASK-020，`asr_model` 配置启用） |
 | 语音朗读 TTS | ✅ | edge-tts 分句流水线（默认）或 DashScope 甘雨音色流式 TTS（`provider=dashscope_realtime`，QwenTtsRealtime WebSocket 流式合成 WAV，支持录音复刻换音色 `create_voice_by_clone`，支持情绪指令 `instructions`（可爱基调，TASK-018）），可取消，默认关（`tts_model` 配置启用） |
 | ReAct 工具循环 | ✅ | `max_iterations`、`turn_timeout_sec` 墙钟、重复工具防爆、180s 工具兜底 / Shell 60s |
 | 内置工具 | ✅ | 26 个（含 AskImage 条件注册）+ MCP 扩展（`{server}__{tool}`） |
@@ -120,6 +120,6 @@ Web 附加：AgentLoop 流事件 → Bus.stream → WebChannel → WebSocket（t
 
 > **唯一事实源是 git 本身**（`git log` / `git status` / `git diff`）。本段只留指针与稳定约定，**不复制任何瞬时状态**——hash 列表、领先/落后数量、未跟踪清单都会过期，一律不写，需要时直接查 git。
 
-- 当前里程碑：TASK-001~019 已完成并归档（任务卡见 `docs/tasks/completed/`）；active：暂无。
+- 当前里程碑：TASK-001~020 已完成并归档（任务卡见 `docs/tasks/completed/`）；active：暂无。
 - 最新提交、分支、领先/落后、工作区状态：`git log` / `git status`。
 - 稳定约定：`kb-testset/`（个人知识库测试资产）已在 `.gitignore` 中不追踪；存在 codex 外部 worktree → 多会话并行开发时严格遵守 AGENTS.md 文件所有权规则。

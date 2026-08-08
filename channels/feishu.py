@@ -40,6 +40,7 @@ from lark_oapi.api.im.v1 import (
 
 from channels.base import Channel
 from bus.queue import InboundMessage, OutboundMessage
+from voice.asr.base import ASRError
 
 if TYPE_CHECKING:
     from reminders.models import DeliveryResult
@@ -92,6 +93,7 @@ class FeishuChannel(Channel):
         app_secret: str,
         image_store=None,
         image_merge_window_sec: float = 10.0,
+        asr_service=None,
         bind_callback=None,
         unbind_callback=None,
     ) -> None:
@@ -107,6 +109,9 @@ class FeishuChannel(Channel):
             merge_window = 10.0
         # 防止错误配置让消息长期滞留；0 明确表示关闭合并等待。
         self.image_merge_window_sec = max(0.0, min(60.0, merge_window))
+        # 可选 ASR 服务由组合根注入；为 None 时收到语音回「未启用」提示，
+        # 保持向后兼容（既有调用方不传也能用）。
+        self.asr_service = asr_service
         # 仅由主事件循环访问：key=(chat_id, session sequence, sender_open_id)。
         self._pending_image_batches: dict[tuple[str, int, str], _PendingImageBatch] = {}
         self._stopping = False
@@ -173,7 +178,7 @@ class FeishuChannel(Channel):
         try:
             event = data.event
             message = event.message
-            if message is None or message.message_type not in ("text", "image"):
+            if message is None or message.message_type not in ("text", "image", "audio"):
                 return
 
             chat_type = message.chat_type        # "p2p" / "group"
@@ -192,6 +197,18 @@ class FeishuChannel(Channel):
                 sequence = self._session_state(chat_id)["current"]
                 asyncio.run_coroutine_threadsafe(
                     self._queue_image_message(
+                        message, chat_type, sequence, sender_open_id
+                    ),
+                    self._loop,
+                )
+                return
+
+            # 语音同样要下载资源文件（type=file）+ 转写，可能慢于事件回调时限；
+            # 整个下载 + 转写 + 投递交给主事件循环，SDK 回调立刻返回。
+            if message.message_type == "audio":
+                sequence = self._session_state(chat_id)["current"]
+                asyncio.run_coroutine_threadsafe(
+                    self._queue_audio_message(
                         message, chat_type, sequence, sender_open_id
                     ),
                     self._loop,
@@ -329,6 +346,74 @@ class FeishuChannel(Channel):
                         await self._flush_image_batch(batch_key, batch)
                     elif not any(ref is not None for ref in batch.images):
                         self._discard_image_batch(batch_key, batch, delete_files=True)
+
+    async def _queue_audio_message(
+        self, message, chat_type: str, sequence: int, sender_open_id: str
+    ) -> None:
+        """下载飞书语音并交给 ASR 服务转写，成功后作为普通文本消息投递。
+
+        与图片同理：事件回调里只投递，下载 + 转写都在主事件循环完成，
+        SDK 回调立即返回；任何失败都回明确提示，绝不静默丢弃。
+        """
+        if self.asr_service is None:
+            logger.warning("收到飞书语音但未启用 ASR，已回提示")
+            await self._publish_image_error(
+                message.chat_id, "⚠️ 当前实例未启用语音转写（ASR）"
+            )
+            return
+        try:
+            content = json.loads(message.content or "{}")
+            file_key = content.get("file_key")
+            message_id = getattr(message, "message_id", None)
+            if not file_key or not message_id:
+                logger.warning("飞书语音事件缺少 file_key 或 message_id，已忽略")
+                await self._publish_image_error(
+                    message.chat_id, "⚠️ 语音消息缺少资源标识，无法读取。"
+                )
+                return
+
+            chat_id = message.chat_id
+            raw, mime = await asyncio.to_thread(
+                self._download_audio_sync, message_id, file_key
+            )
+            if not raw:
+                await self._publish_image_error(
+                    chat_id, "⚠️ 从飞书读取语音失败，请稍后重试。"
+                )
+                return
+
+            filename, media_type = self._audio_file_meta(raw, mime, file_key)
+            try:
+                result = await self.asr_service.transcribe(
+                    raw, filename=filename, media_type=media_type
+                )
+            except ASRError as exc:
+                # ASRError 是渠道可安全展示的错误，直接回用户，不扩散堆栈。
+                await self._publish_image_error(
+                    chat_id, f"⚠️ 语音转写失败：{exc.message}"
+                )
+                return
+            except Exception as exc:  # noqa: BLE001 - 细节只进日志，用户只看到安全提示
+                logger.exception("飞书语音转写服务异常：%s", exc)
+                await self._publish_image_error(
+                    chat_id, "⚠️ 语音转写服务暂时不可用，请稍后重试。"
+                )
+                return
+
+            text = str(getattr(result, "text", "") or "").strip()
+            if not text:
+                await self._publish_image_error(
+                    chat_id, "⚠️ 语音转写未返回可用文本，请重试。"
+                )
+                return
+            await self._publish_text_inbound(
+                chat_id, chat_type, sequence, sender_open_id, text
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("处理飞书语音入站消息失败：%s", exc)
+            await self._publish_image_error(
+                message.chat_id, "⚠️ 处理语音时出错，请稍后重试。"
+            )
 
     async def _publish_or_merge_text(
         self,
@@ -503,6 +588,34 @@ class FeishuChannel(Channel):
             if callable(close):
                 close()
 
+    def _download_audio_sync(self, message_id: str, file_key: str):
+        """通过 SDK 下载一条飞书语音资源；由 ``to_thread`` 调用。
+
+        ``file_key`` 仅作为飞书资源 API 的参数使用，绝不当成本地路径；
+        飞书语音/音频/视频统一走 ``type("file")``（不是 ``type("image")``）。
+        """
+        request = (
+            GetMessageResourceRequest.builder()
+            .message_id(message_id)
+            .file_key(file_key)
+            .type("file")
+            .build()
+        )
+        resp = self._client.im.v1.message_resource.get(request)
+        if not resp.success() or getattr(resp, "file", None) is None:
+            logger.error("飞书语音下载失败：code=%s msg=%s", resp.code, resp.msg)
+            return None, None
+        raw_response = getattr(resp, "raw", None)
+        headers = getattr(raw_response, "headers", {}) or {}
+        mime = headers.get("content-type", "") or headers.get("Content-Type", "")
+        resource = resp.file
+        try:
+            return resource.read(), mime
+        finally:
+            close = getattr(resource, "close", None)
+            if callable(close):
+                close()
+
     @staticmethod
     def _image_ext_mime(raw: bytes, mime: str):
         # 飞书响应头只作为后备；优先根据文件签名识别，避免把未知字节伪装成 PNG。
@@ -520,6 +633,40 @@ class FeishuChannel(Channel):
         if mime in _IMAGE_MIMES:
             return _IMAGE_MIMES[mime]
         return None
+
+    @staticmethod
+    def _audio_file_meta(raw: bytes, mime: str, file_key: str):
+        """从飞书语音下载响应推断文件名与媒体类型。
+
+        飞书语音消息不携带文件名，file_key 仅作资源标识；媒体类型优先取
+        下载响应 content-type（预期 audio/opus 等），缺失或非音频类型时
+        兜底 ``application/octet-stream``（AudioTranscriptionService 允许）。
+        文件名用 file_key 派生 + 推断扩展名，非空即可。
+        """
+        declared = (mime or "").split(";", 1)[0].strip().lower()
+        ext_by_mime = {
+            "audio/ogg": "ogg",
+            "audio/opus": "opus",
+            "audio/mpeg": "mp3",
+            "audio/mp4": "m4a",
+            "audio/x-m4a": "m4a",
+            "audio/aac": "aac",
+            "audio/wav": "wav",
+            "audio/x-wav": "wav",
+            "audio/webm": "webm",
+            "audio/amr": "amr",
+            "audio/x-amr": "amr",
+        }
+        ext = ext_by_mime.get(declared)
+        # 响应头缺失时做一次最小嗅探（Ogg 容器内常见 OPUS 语音）。
+        if ext is None and raw.startswith(b"OggS"):
+            declared, ext = "audio/ogg", "ogg"
+        filename = f"{file_key}.{ext}" if ext else f"{file_key}.audio"
+        if declared.startswith("audio/") or declared == "application/octet-stream":
+            media_type = declared or "application/octet-stream"
+        else:
+            media_type = "application/octet-stream"
+        return filename, media_type
 
     def _image_session_key(self, chat_id: str, sequence: int) -> str:
         """与 Gateway 使用的飞书会话 key 保持一致。"""

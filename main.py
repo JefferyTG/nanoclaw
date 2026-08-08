@@ -1435,6 +1435,7 @@ async def amain() -> None:
             cfg.feishu_app_secret,
             image_store=shared["image_store"],
             image_merge_window_sec=cfg.feishu_image_merge_window_sec,
+            asr_service=shared["asr_service"],  # 飞书语音入站转写（可 None，渠道内回「未启用」提示）
             bind_callback=(
                 reminder_service.bind_feishu if reminder_service is not None else None
             ),
