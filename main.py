@@ -1514,6 +1514,15 @@ async def amain() -> None:
             if isinstance(voice_settings.get("kws"), dict)
             else {}
         )
+        # TASK-027 VAD 覆盖参数：voice.vad 子字典键名即 record_audio_vad 的
+        # 参数名（energy_threshold/silence_end_sec/min_voice_sec/block_sec），
+        # 直接透传整个 vad dict，渠道内部会过滤掉 max_duration_sec/device 等
+        # 渠道级字段；非 dict / 缺失 → None（渠道用内置默认）。
+        voice_vad_cfg = (
+            voice_settings.get("vad")
+            if isinstance(voice_settings.get("vad"), dict)
+            else None
+        )
         asr_service = shared["asr_service"]  # 未配 asr_model 时为 None → 降级
         kws_detector = None
         kws_model_dir = Path(str(voice_kws_cfg.get("model_dir") or "").strip())
@@ -1589,6 +1598,16 @@ async def amain() -> None:
             max_sessions=int(
                 voice_settings.get("max_sessions", 50) or 50
             ),
+            # TASK-027 连续对讲：回复播完到下一轮开录的间隔（默认 0.5s）与
+            # 静默退出阈值（默认 5s，≤0 不因静默退出），均与 config.py 默认一致；
+            # vad_params 透传 voice.vad（渠道内过滤渠道级字段，None 用内置默认）。
+            record_delay_sec=float(
+                voice_settings.get("record_delay_sec", 0.5) or 0.5
+            ),
+            silence_timeout_sec=float(
+                voice_settings.get("silence_timeout_sec", 5.0) or 5.0
+            ),
+            vad_params=voice_vad_cfg,
             session_pruner=prune_voice_session,
         )
         voice_channel._clear_callback = clear_callback  # 复用同一清空回调

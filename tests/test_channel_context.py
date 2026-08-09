@@ -180,6 +180,49 @@ class ChannelContextTests(unittest.TestCase):
                 prompt = agent.context.build_system_prompt()
                 self.assertNotIn("微信日常对话模式", prompt)
 
+    def test_voice_channel_has_continuous_mode_prompt(self):
+        """voice 渠道（voice:local:<seq>）System Prompt 含连续对讲专属指令
+        （TASK-027）：简短俏皮口语化 + 知识类例外 + [END] 结束语约定。"""
+        agent = self.factory("voice:local:1")
+        prompt = agent.context.build_system_prompt()
+        self.assertIn(CHANNEL_SECTION_TITLE, prompt)
+        self.assertIn("voice 连续对讲模式", prompt)
+        self.assertIn("本会话所在渠道：voice", prompt)
+        self.assertIn("用户标识：local:1", prompt)
+        self.assertIn("简短俏皮口语化", prompt)
+        self.assertIn("知识类/需要详细解释的问题", prompt)
+        self.assertIn("拜拜", prompt)
+        self.assertIn("[END]", prompt)
+        self.assertIn("退出连续对话回待唤醒", prompt)
+        # voice 渠道不应误带微信日常模式指令
+        self.assertNotIn("微信日常对话模式", prompt)
+
+    def test_voice_channel_sender_id_is_local_seq(self):
+        """voice 渠道 sender_id 是 local:<seq>，与渠道专属行为无关（分支只看渠道名）。"""
+        agent = self.factory("voice:local:42")
+        prompt = agent.context.build_system_prompt()
+        self.assertIn("本会话所在渠道：voice", prompt)
+        self.assertIn("用户标识：local:42", prompt)
+        self.assertIn("voice 连续对讲模式", prompt)
+
+    def test_other_channels_have_no_voice_continuous_mode(self):
+        """weixin / web / feishu / cli / scheduled 渠道均不含 voice 连续对讲
+        分支文本（防回归，TASK-027：纯 Prompt 层、不影响其他渠道）。"""
+        for session_key in (
+            "weixin:yyy",
+            "web:zzz",
+            "feishu:xxx",
+            "cli:local1",
+            "scheduled:123:456",
+        ):
+            with self.subTest(session_key=session_key):
+                agent = self.factory(session_key)
+                prompt = agent.context.build_system_prompt()
+                self.assertNotIn("voice 连续对讲模式", prompt)
+                self.assertNotIn("本地语音对讲渠道", prompt)
+                self.assertNotIn("[END]", prompt)
+                self.assertNotIn("退出连续对话回待唤醒", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

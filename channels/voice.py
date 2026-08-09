@@ -39,6 +39,27 @@ main.py 注入的 ``session_pruner(seq)`` 回调完成（只清 voice 渠道，�
 /new /sessions /switch）不触发分片但计入活动时间；时间判断用可注入的
 ``now_fn``（默认 ``time.time``），便于测试用假时钟推进。
 
+TASK-027 连续对讲（第二步：渠道状态机）：把「单轮唤醒」升级为「连续对讲机」——
+
+- 唤醒命中 → 播甘雨回应 → **进入连续对讲模式**（``_continuous``），此后全程
+  不用再喊唤醒词：回复经 ``send()`` 播完自动调度下一轮「VAD 录音 → ASR →
+  inject_text」，循环往复，像真对讲机；
+- 录音改用 ``record_audio_vad``（TASK-027 第一步）：说完话停顿
+  ``vad.silence_end_sec``（默认 1.2s）提前结束录音立即转写，不再干等满
+  ``record_sec``（此时只是最长上限）；全程无人声判 ``is_silent``；
+- 静默退出：连续对讲模式下每轮 ``is_silent=True`` 累计实际录音时长，一旦累计
+  ≥ ``silence_timeout_sec``（默认 5s）→ 退出回待唤醒（``_emit`` 一条轻提示）；
+  ``is_silent=False`` 则清零累计；
+- [END] 结束语退出：``send()`` 收到含 ``[END]`` 标记的回复时**剥离标记**后正常
+  播告别语（标记绝不出现在播报/文字里），播完退出连续对讲回待唤醒；纯文字
+  兜底路径同样剥离并退出；剥离后为空则不播任何东西直接退出；
+- 空闲分片配合：连续对讲进行中 ``_maybe_split_session`` 直接 return（不触发
+  分片），每次 inject_text 照常 ``_bump_activity``；退出后分片逻辑恢复原样；
+- 防重入：连续对讲模式下唤醒词再次命中沿用 ``_wake_in_progress`` 合并（在
+  ``_on_wake`` 中追加 ``_continuous`` 判断）；``_schedule_next_listen`` 用
+  ``self._listen_task`` 任务引用防重复启动，录音轮次内 try/finally 保证结束
+  清引用（并发安全）。
+
 多会话：以整数序号区分不同会话，对应 ``sender_id="local:<seq>"``，Gateway
 据此推导出 session_key ``"voice:local:<seq>"``，每个序号对应一个独立会话。
 内置命令 ``/new`` 开新会话、``/sessions`` 列表、``/switch <n>`` 切换；
@@ -46,16 +67,62 @@ main.py 注入的 ``session_pruner(seq)`` 回调完成（只清 voice 渠道，�
 """
 
 import asyncio
+import io
 import random
+import re
 import time
+import wave
 
 from channels.base import Channel
 from bus.queue import InboundMessage, OutboundMessage
 from voice.asr.base import ASRError
 from voice.kws.errors import KwsError
 from voice.kws.player import play_audio
-from voice.kws.recorder import record_audio
+from voice.kws.vad import record_audio_vad
 from voice.media import MediaError
+
+
+# —— TASK-027 补充：TTS 前文本清洗正则（剥 markdown / 删 emoji 与装饰符号 /
+# 压缩连续标点；中文标点【】「」（）等 TTS 可正常处理，保留不动）——
+# emoji 与符号块：主要 emoji、区域指示符（国旗）、箭头、几何形状、杂项符号/
+# 装饰符号、补充箭头、emoji 变体选择符（U+FE0F）、ZWJ（U+200D 连接符）。
+# 注意：正则用 raw string + 单反斜杠，由 re 引擎解释元字符/反向引用。
+_TTS_EMOJI_BLOCK_RE = re.compile(
+    "["
+    "\U0001F000-\U0001FAFF"
+    "\U0001F1E6-\U0001F1FF"
+    "\U00002190-\U000021FF"
+    "\U000025A0-\U000025FF"
+    "\U00002600-\U000027BF"
+    "\U00002B00-\U00002BFF"
+    "\uFE0F"
+    "\u200D"
+    "]+"
+)
+# markdown：链接 [text](url) → text；**加粗** / __加粗__ → 加粗；`code` → code
+_TTS_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]*\)")
+_TTS_MD_BOLD_RE = re.compile(r"\*\*([^*]+)\*\*|__([^_]+)__")
+_TTS_MD_CODE_RE = re.compile(r"`([^`]*)`")
+# 行首标记：标题 #、列表 -/*/+、引用 >、数字列表 1. / 1、/ 1)（re.M 按行处理）
+_TTS_MD_LINE_RE = re.compile(
+    r"^[ \t]*(?:#{1,6}[ \t]+|[-*+][ \t]+|>\s?|\d+[.、)][ \t]+)",
+    re.M,
+)
+# 额外装饰符号（个别不在上述 Unicode 块内的）与连续标点压缩
+_TTS_EXTRA_SYMBOL_RE = re.compile(r"[★☆◆◇●○◎△▲※〓™®©]")
+_TTS_REPEAT_PUNCT_RE = re.compile(r"([!！?？。…~～])\1+")
+_TTS_SPACES_RE = re.compile(r"[ \t\u3000]+")
+
+
+def _normalize_float(value, default: float) -> float:
+    """参数归一化为数字；None / 非数字 / NaN 一律回退默认，保证不崩。"""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    if v != v:  # NaN
+        return default
+    return v
 
 
 class VoiceChannel(Channel):
@@ -65,7 +132,15 @@ class VoiceChannel(Channel):
     出站经 ``send()`` 下发（TASK-026：TTS 合成播放，失败降级文字），文字兜底
     统一走 ``_emit``。``start()`` 在注入 ``kws_detector`` 时进入唤醒监听循环，
     否则空转等待 ``_stop_event``（TASK-024 行为不变）。
+
+    TASK-027 连续对讲：唤醒后进入连续对讲模式，``send()`` 播完回复自动调度
+    下一轮 VAD 录音监听；``[END]`` 结束语 / 静默超时退出回待唤醒。构造参数
+    新增 ``record_delay_sec``（回复播完到开录的间隔）、``silence_timeout_sec``
+    （静默退出阈值）与可选 ``vad_params``（传给 record_audio_vad 的覆盖参数）。
     """
+
+    # 连续对讲结束语标记：模型回复带此标记 → 剥离后播告别语并退出连续对讲
+    _END_MARKER = "[END]"
 
     def __init__(
         self,
@@ -82,6 +157,9 @@ class VoiceChannel(Channel):
         now_fn=None,
         max_sessions: int = 50,
         session_pruner=None,
+        record_delay_sec: float = 0.5,
+        silence_timeout_sec: float = 5.0,
+        vad_params: dict | None = None,
     ) -> None:
         super().__init__(name="voice", bus=bus)
         # 停止事件：start() 的监听/空转循环等待它，stop() 置位唤醒
@@ -104,6 +182,27 @@ class VoiceChannel(Channel):
         self._wake_in_progress: bool = False
         self._coalesced_wakes: int = 0
         self._wake_count: int = 0
+
+        # —— TASK-027 连续对讲状态机 ——
+        # _continuous：连续对讲进行中标志（True 期间不触发空闲分片、唤醒词再
+        # 命中被合并、send() 播完自动调度下一轮录音）。
+        self._continuous: bool = False
+        # 静默累计时长：连续对讲模式下每轮 is_silent=True 的录音实际时长累加，
+        # 一旦 ≥ silence_timeout_sec → 退出回待唤醒；有人声则清零。
+        self._silence_accum_sec: float = 0.0
+        # 当前进行中的一轮录音监听任务引用（防重入：非 None 且未结束则不重复
+        # create_task；录音轮次结束经 try/finally 清引用）。
+        self._listen_task: asyncio.Task | None = None
+        # record_delay_sec：回复播完到下一轮开录的间隔（避免截到小奈话音尾巴）
+        self._record_delay_sec = max(
+            _normalize_float(record_delay_sec, 0.5), 0.0
+        )
+        # silence_timeout_sec：静默退出阈值；>0 启用，≤0 表示不因静默退出
+        # （仅 [END] 能退出连续对讲）。
+        self._silence_timeout_sec = _normalize_float(silence_timeout_sec, 5.0)
+        # vad_params：传给 record_audio_vad 的覆盖参数白名单（渠道级参数
+        # max_duration_sec / device 由渠道统一传入，避免冲突）。
+        self._vad_params = self._sanitize_vad_params(vad_params)
 
         # 以下属性由 main.py 或测试注入，VoiceChannel 自身不依赖 Agent
         self._clear_callback = None   # 清空历史回调（/clear 命令调用）
@@ -137,6 +236,200 @@ class VoiceChannel(Channel):
         self._session_pruner = session_pruner
         # 上次活动时间（unix 秒）：构造时初始化，之后每次 inject_text 交互更新。
         self._last_activity_ts: float = self._now()
+
+    # —— TASK-027 构造辅助 ——
+
+    @staticmethod
+    def _sanitize_vad_params(vad_params) -> dict:
+        """清洗 vad_params：只透传可覆盖参数，渠道级参数（max_duration_sec /
+        device）由渠道统一传入，避免关键字冲突。"""
+        if not isinstance(vad_params, dict):
+            return {}
+        return {
+            key: value
+            for key, value in vad_params.items()
+            if key not in ("max_duration_sec", "device")
+        }
+
+    @staticmethod
+    def _strip_end_marker(text: str) -> tuple[str, bool]:
+        """剥离 [END] 标记：返回 (剥离后文本, 是否含标记)。
+
+        [END] 是渠道内部协议标记，**绝不能**出现在播报/文字内容里——剥离要
+        在 TTS 合成之前完成。标记可以出现在回复末尾或任意位置，全部移除。
+        """
+        if not text or VoiceChannel._END_MARKER not in text:
+            return (text or "", False)
+        return (text.replace(VoiceChannel._END_MARKER, "").strip(), True)
+
+    @staticmethod
+    def _sanitize_for_tts(text: str) -> str:
+        """清洗待 TTS 合成的文本：剥 markdown、删 emoji/装饰符号、压缩连续标点。
+
+        - markdown：``[文字](url)`` → 文字、``**加粗**`` → 加粗、`` `code` `` →
+          code、行首 ``# 标题`` / ``- 列表`` / ``> 引用`` / ``1. 条目`` 标记剥离；
+        - emoji / 装饰 / 箭头 / 几何符号块整段删除（含变体选择符与 ZWJ）；
+        - 连续标点（！！！/？？/。。。）压缩为单个；
+        - 多余空白压缩、去首尾空白。中文标点【】「」（）等 TTS 可正常读，保留。
+        """
+        if not text:
+            return text or ""
+        text = _TTS_MD_LINK_RE.sub(r"\1", text)
+        text = _TTS_MD_BOLD_RE.sub(lambda m: m.group(1) or m.group(2) or "", text)
+        text = _TTS_MD_CODE_RE.sub(r"\1", text)
+        text = _TTS_MD_LINE_RE.sub("", text)
+        text = _TTS_EMOJI_BLOCK_RE.sub("", text)
+        text = _TTS_EXTRA_SYMBOL_RE.sub("", text)
+        text = _TTS_REPEAT_PUNCT_RE.sub(r"\1", text)
+        text = _TTS_SPACES_RE.sub(" ", text)
+        return text.strip()
+
+    @staticmethod
+    def _wav_duration_sec(wav: bytes) -> float:
+        """解析 WAV bytes 得到实际录音时长（秒）。解析失败回退 0。"""
+        try:
+            with wave.open(io.BytesIO(wav), "rb") as f:
+                rate = f.getframerate()
+                if rate <= 0:
+                    return 0.0
+                return f.getnframes() / rate
+        except Exception:  # noqa: BLE001 - 解析失败只回退 0，不崩
+            return 0.0
+
+    # —— TASK-027 连续对讲状态机 ——
+
+    def _enter_continuous(self) -> None:
+        """进入连续对讲模式：置标志、清零静默累计（幂等）。"""
+        self._continuous = True
+        self._silence_accum_sec = 0.0
+
+    def _exit_continuous(self) -> None:
+        """退出连续对讲模式回待唤醒（幂等）。
+
+        清除标志与静默累计；若仍有一轮监听任务在跑（防御性，正常时序下
+        send() 收到回复时上一轮已结束）则取消它——不取消当前任务自身
+        （静默超时等内部路径会自然 return）。
+        """
+        if not self._continuous:
+            return
+        self._continuous = False
+        self._silence_accum_sec = 0.0
+        print("[voice] 🔌 退出连续对讲，回待唤醒")
+        task = self._listen_task
+        self._listen_task = None
+        if (
+            task is not None
+            and task is not asyncio.current_task()
+            and not task.done()
+        ):
+            task.cancel()
+
+    def _schedule_next_listen(self) -> None:
+        """连续对讲模式下启动一轮录音监听（防重入）。
+
+        - ``_continuous`` 为 False 时不动作（已退出/从未进入）；
+        - ``self._listen_task`` 非 None 且未结束 → 已有轮次在跑，不重复创建。
+        """
+        if not self._continuous:
+            return
+        task = self._listen_task
+        if task is not None and not task.done():
+            return
+        self._listen_task = asyncio.create_task(self._listen_round())
+
+    async def _listen_round(self) -> None:
+        """连续对讲的一轮监听：等 record_delay → VAD 录音 → 静默判定 → ASR →
+        inject_text。
+
+        - 录音用 ``record_audio_vad``（record_sec 为最长上限，说话停顿提前
+          结束）；``is_silent=True``（或未采到帧）→ 累计实际录音时长，超
+          ``silence_timeout_sec`` 退出，否则调度下一轮继续听；
+        - 有人声 → 清零静默累计；ASR 转写成功 → ``inject_text`` 进 Agent，
+          回复经 ``send()`` 播完后由 send() 调度下一轮；
+        - 转写失败/没听清 → 调度下一轮继续听；
+        - 录音失败（KwsError）→ ``_emit`` 友好提示并退出连续对讲回待唤醒；
+        - 结束经 try/finally 清 ``_listen_task`` 引用（仅当引用仍指向本任务，
+          避免覆盖自调度创建的新任务引用，保证并发安全）。
+        """
+        try:
+            await asyncio.sleep(self._record_delay_sec)
+            if not self._continuous:
+                return
+
+            # —— VAD 录音（record_sec 为最长上限，静默可提前结束）——
+            try:
+                wav, is_silent = await record_audio_vad(
+                    self._record_sec,
+                    device=self._kws_device,
+                    **self._vad_params,
+                )
+            except KwsError as exc:
+                self._emit(f"📛 录音失败：{exc.message}")
+                self._exit_continuous()
+                return
+            except Exception as exc:  # noqa: BLE001 - 录音异常只提示不扩散
+                self._emit(f"📛 录音异常：{exc}")
+                self._exit_continuous()
+                return
+
+            # —— 静默判定：累计静默时长，超时退出；未超时继续听 ——
+            if is_silent or not wav:
+                # 全程无人声（或短促噪音不足 min_voice_sec）：把该轮实际录音
+                # 时长计入累计；未采到帧（wav 为 None）时按整轮 record_sec 计
+                # （避免 0 时长死循环）。
+                dur = self._wav_duration_sec(wav) if wav else self._record_sec
+                self._silence_accum_sec += dur
+                if (
+                    self._silence_timeout_sec > 0
+                    and self._silence_accum_sec >= self._silence_timeout_sec
+                ):
+                    self._emit(
+                        "不说话的话我先待机啦，喊「小奈小奈」叫我"
+                    )
+                    self._exit_continuous()
+                    return
+                self._listen_task = None  # 先清引用再自调度，避免防重入误拦
+                self._schedule_next_listen()
+                return
+
+            # 检测到有人声 → 清零静默累计
+            self._silence_accum_sec = 0.0
+
+            # —— ASR 转写 → inject_text（回复经 send() 播完后由 send() 调度
+            # 下一轮）——
+            text = await self._transcribe_round(wav)
+            if text is None:
+                self._listen_task = None  # 先清引用再自调度，避免防重入误拦
+                self._schedule_next_listen()
+                return
+            print(f"[voice] 🗣️ 乖宝说：{text}")
+            await self.inject_text(text)
+        finally:
+            if self._listen_task is asyncio.current_task():
+                self._listen_task = None
+
+    async def _transcribe_round(self, wav: bytes) -> str | None:
+        """转写一轮录音；失败/空文本走 ``_emit`` 友好提示并返回 None。"""
+        try:
+            result = await self._asr_service.transcribe(
+                wav, filename="voice_round.wav", media_type="audio/wav"
+            )
+        except (ASRError, MediaError) as exc:
+            self._emit(
+                f"📛 没听清，再说一次？（{getattr(exc, 'message', exc)}）"
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001 - 转写异常只提示不扩散
+            self._emit(f"📛 转写异常：{exc}")
+            return None
+
+        text = ""
+        if result is not None:
+            text = str(getattr(result, "text", "") or "").strip()
+        if not text:
+            self._emit("📛 没听清，再说一次？")
+            return None
+        return text
 
     def _current_sender_id(self) -> str:
         """当前活动会话对应的 sender_id（Gateway 据此推导 session_key）。"""
@@ -195,10 +488,14 @@ class VoiceChannel(Channel):
     def _maybe_split_session(self) -> None:
         """空闲自动分片（惰性检查）：距上次活动超过 idle_ttl_sec 时自动开新会话。
 
+        - TASK-027 起：连续对讲进行中（``_continuous``）直接 return，对话活跃
+          不分片；退出后逻辑恢复 TASK-026 原样；
         - idle_ttl_sec ≤ 0（禁用）或未超阈值时不动作；
         - 分片成功后与 ``/new`` 相同：seq+1 切换并清理超限老会话，同时 ``_emit``
           一条轻提示告知用户开了新话题；旧会话保留可 ``/switch`` 切回。
         """
+        if self._continuous:
+            return
         if self._idle_ttl_sec <= 0:
             return
         if self._now() - self._last_activity_ts <= self._idle_ttl_sec:
@@ -268,7 +565,8 @@ class VoiceChannel(Channel):
 
         # —— 正常输入：封装成入站消息投递进 bus ——
         # 空闲自动分片检查（惰性）：距上次活动超 idle_ttl_sec 自动开新会话、
-        # 旧会话保留；随后无论是否分片都更新活动时间。
+        # 旧会话保留；随后无论是否分片都更新活动时间。连续对讲进行中不分片
+        # （_maybe_split_session 内已短路）。
         self._maybe_split_session()
         self._bump_activity()
         # sender_id 携带当前会话序号，Gateway 据此派生独立 session_key，
@@ -285,8 +583,10 @@ class VoiceChannel(Channel):
         """启动渠道。
 
         - ``kws_detector`` 为 None：空转等待停止事件（TASK-024 行为）。
-        - 注入 ``kws_detector``：启动唤醒监听；唤醒 → 录音 → ASR → inject_text
-          由 ``_on_wake`` 完成，本方法负责等待停止事件并在期间响应 stop()。
+        - 注入 ``kws_detector``：启动唤醒监听；唤醒 → 播回应 → 连续对讲
+          （VAD 录音 → ASR → inject_text → send() 播完自动续听）由
+          ``_on_wake`` / ``_handle_wake`` 完成，本方法负责等待停止事件并在期间
+          响应 stop()。
         - 唤醒启动失败（麦克风权限/设备问题）时降级为空转，渠道仍存活。
         """
         detector = self._kws_detector
@@ -316,10 +616,17 @@ class VoiceChannel(Channel):
                 pass
 
     async def _on_wake(self) -> None:
-        """唤醒回调（在事件循环内执行）：动作进行中时新唤醒事件合并。"""
-        if self._wake_in_progress:
+        """唤醒回调（在事件循环内执行）：动作进行中或连续对讲中，新唤醒合并。
+
+        TASK-027 起连续对讲期间唤醒词再次命中也沿用 ``_wake_in_progress``
+        防抖：``_continuous`` 为 True 时新唤醒事件直接合并计数，不打断当前
+        连续对话（全程不用再喊唤醒词）。
+        """
+        if self._wake_in_progress or self._continuous:
+            print("[voice] 🎤 唤醒词命中（对话进行中，合并计数）")
             self._coalesced_wakes += 1
             return
+        print("[voice] 🎤 唤醒词命中，进入对话")
         self._wake_in_progress = True
         try:
             await self._handle_wake()
@@ -333,7 +640,7 @@ class VoiceChannel(Channel):
           直接录音（返回 False，向后兼容 TASK-025 既有行为）；
         - 合成/播放任一步失败（TTSError / KwsError / 其它异常）→ 降级跳过回应
           （``_emit`` 一条轻提示），不阻塞唤醒流程。
-        - 返回 True 表示回应已**完整播完**，调用方此时才应进入录音。
+        - 返回 True 表示回应已**完整播完**，调用方此时才应进入连续对讲。
         """
         tts = self._tts_service
         replies = self._wake_replies
@@ -351,69 +658,67 @@ class VoiceChannel(Channel):
         return True
 
     async def _handle_wake(self) -> None:
-        """唤醒处理：播放确认回应（方案 B）→ 录音 → ASR 转写 → inject_text。
+        """唤醒处理：播甘雨回应（方案 B）→ 进入连续对讲 → 启动首轮录音监听。
 
+        TASK-027 起从「单轮唤醒」升级为「连续对讲机」：回应**播完才返回**后
+        进入连续对讲模式（``_continuous``），由 ``_schedule_next_listen`` 启动
+        首轮「VAD 录音 → ASR → inject_text」监听；Agent 回复经 ``send()`` 播
+        完后自动调度下一轮，直到 ``[END]`` 结束语或静默超时退出回待唤醒。
         音频全程内存流转不落盘；转写文本才进 Agent。任一环节失败走 ``_emit``
-        友好提示，不回退崩溃。回应在录音之前播放且**播完才进入录音**，保证
-        用户听到小奈在、录音不截用户的话。
+        友好提示，不回退崩溃。
         """
         self._wake_count += 1
         if self._kws_detector is None or self._asr_service is None:
             return  # 唤醒链路未装配（缺检测器或 ASR），自动禁用
 
-        # 方案 B：先播甘雨确认回应（播完才返回），再开始录音。
+        # 方案 B：先播甘雨确认回应（播完才返回），再进入连续对讲。
         await self._play_wake_reply()
-
-        wav = None
-        try:
-            wav = await record_audio(self._record_sec, device=self._kws_device)
-        except KwsError as exc:
-            self._emit(f"📛 录音失败：{exc.message}")
-            return
-        if not wav:
-            self._emit("📛 没录到声音，再说一次？")
-            return
-
-        try:
-            result = await self._asr_service.transcribe(
-                wav, filename="voice_wake.wav", media_type="audio/wav"
-            )
-        except (ASRError, MediaError) as exc:
-            self._emit(f"📛 没听清，再说一次？（{getattr(exc, 'message', exc)}）")
-            return
-        except Exception as exc:  # noqa: BLE001 - 转写异常只提示不扩散
-            self._emit(f"📛 转写异常：{exc}")
-            return
-
-        text = ""
-        if result is not None:
-            text = str(getattr(result, "text", "") or "").strip()
-        if not text:
-            self._emit("📛 没听清，再说一次？")
-            return
-        # 转写文本作为正常入站消息进 Agent（同一会话上下文继续）
-        await self.inject_text(text)
+        self._enter_continuous()
+        self._schedule_next_listen()
 
     async def send(self, message: OutboundMessage) -> None:
         """把出站回复下发到本渠道（Agent 回复 → 甘雨 TTS → 播放默认输出）。
 
         - 内容非空且 ``tts_service`` 就绪、文本长度不超过 ``max_voice_chars``
           （>0 时）→ 先 ``synthesize`` 合成甘雨语音，再 ``play_audio`` 播放到
-          系统默认输出；
-        - 否则直接 ``_emit(text)`` 回文字（tts 未配置 / 文本超长 / 内容为空）；
+          系统默认输出；否则直接 ``_emit(text)`` 回文字（tts 未配置 / 文本
+          超长 / 内容为空）；
         - 合成或播放任一步失败（TTSError / KwsError / 其它异常）→ 先 ``_emit``
-          一条轻提示，再 ``_emit(text)`` 把原文发出，不静默、不崩溃。
+          一条轻提示，再 ``_emit(text)`` 把原文发出，不静默、不崩溃；
+        - TASK-027 ``[END]`` 结束语：收到含 ``[END]`` 标记的文本 → **在 TTS
+          合成之前**剥离标记（播报/文字内容绝不含标记），正常播告别语；播完
+          （或文字兜底路径）后退出连续对讲回待唤醒，不再触发下一轮录音；剥离
+          后为空 → 不播任何东西直接退出；
+        - TASK-027 连续对讲续听：未收到 ``[END]`` 且处于连续对讲模式
+          （``_continuous``）时，播放完成（成功或降级）后调度下一轮录音任务。
         ``_emit`` 仍是文字兜底单一出口，语义与签名不变。
         """
         text = message.content
-        tts = self._tts_service
-        limit = self._max_voice_chars
         if not text:
             # 空内容不触发 TTS（合成会因空文本报错），保持原 _emit 语义。
             self._emit(text)
             return
+        # [END] 标记剥离必须发生在 TTS 合成之前（播出的告别语不含标记）；
+        # 随后做 TTS 前清洗（剥 markdown/emoji/装饰符号），保证合成听感干净。
+        text, end_marker = self._strip_end_marker(text)
+        text = self._sanitize_for_tts(text)
+        print(
+            f"[voice] 🎀 小奈说：{text}"
+            + ("（含 [END] 结束语）" if end_marker else "")
+        )
+        if not text:
+            # 剥离后为空：不播放任何东西，直接退出连续对讲。
+            if end_marker:
+                self._exit_continuous()
+            return
+
+        tts = self._tts_service
+        limit = self._max_voice_chars
         if tts is None or (limit > 0 and len(text) > limit):
+            # 纯文字兜底路径（tts 未配置 / 文本超长）：同样剥离标记并退出。
             self._emit(text)
+            if end_marker:
+                self._exit_continuous()
             return
         try:
             result = await tts.synthesize(text)
@@ -423,3 +728,9 @@ class VoiceChannel(Channel):
                 f"🔇 语音播放失败，改文字回复（{getattr(exc, 'message', exc)}）"
             )
             self._emit(text)
+        # 播完（或降级文字）后统一处理：含 [END] → 退出连续对讲；否则连续对讲
+        # 模式下调度下一轮录音（防重入由 _schedule_next_listen 内部保证）。
+        if end_marker:
+            self._exit_continuous()
+        elif self._continuous:
+            self._schedule_next_listen()

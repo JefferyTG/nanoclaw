@@ -409,6 +409,18 @@ class _FakeDetector:
         self.stopped = True
 
 
+def _silent_wav(duration_sec: float, sample_rate: int = 16000) -> bytes:
+    """生成一段纯静音 WAV（时长 = duration_sec），供静默轮次累计时长用。"""
+    frames = int(duration_sec * sample_rate)
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(b"\x00\x00" * frames)
+    return buffer.getvalue()
+
+
 class _FakeASR:
     def __init__(self, text="今天天气怎么样"):
         self.text = text
@@ -434,21 +446,31 @@ class VoiceChannelWakeTests(unittest.IsolatedAsyncioTestCase):
         bus = MessageBus()
         detector = _FakeDetector()
         asr = _FakeASR(text="今天天气怎么样")
-        channel = VoiceChannel(bus, kws_detector=detector, asr_service=asr, record_sec=2.0)
+        channel = VoiceChannel(
+            bus,
+            kws_detector=detector,
+            asr_service=asr,
+            record_sec=2.0,
+            record_delay_sec=0.0,
+        )
         emitted: list = []
         channel._reply_sink = emitted.append
 
         start_task = asyncio.create_task(channel.start())
         await self._wait_for(lambda: detector.started)
         wav = b"RIFF-fake-wav"
-        with patch("channels.voice.record_audio", new=AsyncMock(return_value=wav)):
+        with patch(
+            "channels.voice.record_audio_vad",
+            new=AsyncMock(return_value=(wav, False)),
+        ):
             await detector.on_wake()
-        # 转写文本作为 InboundMessage 进入 bus（Agent 消费前可见）
-        msg = await asyncio.wait_for(bus.inbound_queue.get(), timeout=1)
+            # 首轮监听在后台任务跑（on_wake 仅调度），且必须待在 patch 作用域内；
+            # get() 会等到入站落库
+            msg = await asyncio.wait_for(bus.inbound_queue.get(), timeout=1)
         self.assertEqual(msg.channel, "voice")
         self.assertEqual(msg.content, "今天天气怎么样")
         # ASR 收到的是录音 WAV + 约定文件名 / media_type
-        self.assertEqual(asr.calls, [(wav, "voice_wake.wav", "audio/wav")])
+        self.assertEqual(asr.calls, [(wav, "voice_round.wav", "audio/wav")])
         # 唤醒启动提示已 emit
         self.assertTrue(any("唤醒监听已启动" in e for e in emitted))
         await channel.stop()
@@ -459,17 +481,36 @@ class VoiceChannelWakeTests(unittest.IsolatedAsyncioTestCase):
         bus = MessageBus()
         detector = _FakeDetector()
         asr = _FakeASR(text=ASRError("provider_unavailable", "语音转写服务暂时不可用。"))
-        channel = VoiceChannel(bus, kws_detector=detector, asr_service=asr, record_sec=2.0)
+        # silence_timeout_sec=3.0：首轮有人声触发 ASR 失败，之后两轮 2s 静默
+        # （2+2=4 ≥ 3）→ 自然静默退出连续对讲，避免无限续听。
+        channel = VoiceChannel(
+            bus,
+            kws_detector=detector,
+            asr_service=asr,
+            record_sec=2.0,
+            record_delay_sec=0.0,
+            silence_timeout_sec=3.0,
+        )
         emitted: list = []
         channel._reply_sink = emitted.append
 
         start_task = asyncio.create_task(channel.start())
         await self._wait_for(lambda: detector.started)
-        with patch("channels.voice.record_audio", new=AsyncMock(return_value=b"wav")):
+        silent = _silent_wav(2.0)
+        results = [(b"wav", False), (silent, True), (silent, True)]
+
+        async def fake_vad(*args, **kwargs):
+            return results.pop(0) if results else (silent, True)
+
+        with patch("channels.voice.record_audio_vad", side_effect=fake_vad):
             await detector.on_wake()
-        self.assertTrue(
-            any("没听清" in e and "语音转写服务暂时不可用" in e for e in emitted)
-        )
+            # 首轮转写失败 → 友好提示；随后静默两轮累计 4s ≥ 3s → 退出
+            await self._wait_for(
+                lambda: any(
+                    "没听清" in e and "语音转写服务暂时不可用" in e for e in emitted
+                )
+            )
+            await self._wait_for(lambda: not channel._continuous)
         self.assertTrue(bus.inbound_queue.empty())
         await channel.stop()
         await asyncio.wait_for(start_task, timeout=1)
@@ -483,7 +524,7 @@ class VoiceChannelWakeTests(unittest.IsolatedAsyncioTestCase):
 
         start_task = asyncio.create_task(channel.start())
         await self._wait_for(lambda: detector.started)
-        with patch("channels.voice.record_audio") as mocked:
+        with patch("channels.voice.record_audio_vad") as mocked:
             await detector.on_wake()
         mocked.assert_not_awaited()  # 未录音 → 未转写 → 无入站
         self.assertTrue(bus.inbound_queue.empty())
@@ -494,23 +535,32 @@ class VoiceChannelWakeTests(unittest.IsolatedAsyncioTestCase):
         bus = MessageBus()
         detector = _FakeDetector()
         asr = _FakeASR(text="你好")
-        channel = VoiceChannel(bus, kws_detector=detector, asr_service=asr, record_sec=2.0)
+        channel = VoiceChannel(
+            bus,
+            kws_detector=detector,
+            asr_service=asr,
+            record_sec=2.0,
+            record_delay_sec=0.0,
+        )
         gate = asyncio.Event()
 
-        async def slow_record(*args, **kwargs):
+        async def slow_vad(*args, **kwargs):
             await gate.wait()
-            return b"wav"
+            return (b"wav", False)
 
-        with patch("channels.voice.record_audio", new=slow_record):
+        with patch("channels.voice.record_audio_vad", new=slow_vad):
+            # 第一次唤醒进入连续对讲（_continuous=True）；第二次唤醒在连续对讲
+            # 期间命中 → 沿用防抖合并（不再打断当前连续对话）
             task1 = asyncio.create_task(channel._on_wake())
-            await asyncio.sleep(0.02)  # 第一次唤醒处理进行中
-            task2 = asyncio.create_task(channel._on_wake())  # 第二次被合并
+            task2 = asyncio.create_task(channel._on_wake())
             await asyncio.sleep(0.02)
             self.assertEqual(channel._coalesced_wakes, 1)
+            self.assertTrue(channel._continuous)
             gate.set()
             await asyncio.gather(task1, task2)
+            # 后台轮次在 patch 作用域内跑完录音/ASR/入站
+            msg = await asyncio.wait_for(bus.inbound_queue.get(), timeout=1)
         # 只有一次录音/转写/入站
-        msg = await asyncio.wait_for(bus.inbound_queue.get(), timeout=1)
         self.assertEqual(msg.content, "你好")
         self.assertTrue(bus.inbound_queue.empty())
 
@@ -563,19 +613,26 @@ class VoiceChannelWakeTests(unittest.IsolatedAsyncioTestCase):
                 cooldown_sec=0.1,
             )
             channel = VoiceChannel(
-                bus, kws_detector=detector, asr_service=asr, record_sec=2.0
+                bus,
+                kws_detector=detector,
+                asr_service=asr,
+                record_sec=2.0,
+                record_delay_sec=0.0,
             )
             emitted: list = []
             channel._reply_sink = emitted.append
             start_task = asyncio.create_task(channel.start())
             await self._wait_for(lambda: detector.running)
-            with patch("channels.voice.record_audio", new=AsyncMock(return_value=b"wav")):
+            with patch(
+                "channels.voice.record_audio_vad",
+                new=AsyncMock(return_value=(b"wav", False)),
+            ):
                 # 向 detector 队列投喂一帧 → worker 线程推理命中 → 唤醒闭环
                 detector._queue.put_nowait(np.zeros((160, 1), dtype=np.int16))
                 msg = await asyncio.wait_for(bus.inbound_queue.get(), timeout=2)
             self.assertEqual(msg.channel, "voice")
             self.assertEqual(msg.content, "今天天气怎么样")
-            self.assertEqual(asr.calls, [(b"wav", "voice_wake.wav", "audio/wav")])
+            self.assertEqual(asr.calls, [(b"wav", "voice_round.wav", "audio/wav")])
             self.assertTrue(any("唤醒监听已启动" in e for e in emitted))
             await channel.stop()
             await asyncio.wait_for(start_task, timeout=1)
@@ -603,6 +660,19 @@ class VoiceConfigTests(unittest.TestCase):
             cfg = load_config(file.name)
         self.assertTrue(cfg.voice["enabled"])
         self.assertEqual(cfg.voice["record_sec"], 8.0)
+        # TASK-027：旧 config.json 缺新字段 → 回退默认（record_delay_sec /
+        # silence_timeout_sec / vad.* 一并补全）
+        self.assertEqual(cfg.voice["record_delay_sec"], 0.5)
+        self.assertEqual(cfg.voice["silence_timeout_sec"], 5.0)
+        self.assertEqual(
+            cfg.voice["vad"],
+            {
+                "energy_threshold": 400.0,
+                "silence_end_sec": 1.2,
+                "min_voice_sec": 0.3,
+                "block_sec": 0.05,
+            },
+        )
         kws = cfg.voice["kws"]
         self.assertEqual(
             kws["model_dir"],
@@ -664,6 +734,87 @@ class VoiceConfigTests(unittest.TestCase):
             self.assertEqual(data["voice"]["kws"]["sample_rate"], 8000)
             self.assertNotIn("unknown", data["voice"]["kws"])
             self.assertEqual(data["voice"]["kws"]["model_dir"], cfg.voice["kws"]["model_dir"])
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
+
+    def test_voice_new_fields_defaults(self):
+        """默认 voice 配置含 TASK-027 新字段：record_delay_sec / silence_timeout_sec / vad.*。"""
+        settings = NanoClawConfig().voice
+        self.assertEqual(settings["record_delay_sec"], 0.5)
+        self.assertEqual(settings["silence_timeout_sec"], 5.0)
+        self.assertEqual(
+            settings["vad"],
+            {
+                "energy_threshold": 400.0,
+                "silence_end_sec": 1.2,
+                "min_voice_sec": 0.3,
+                "block_sec": 0.05,
+            },
+        )
+
+    def test_voice_record_delay_and_silence_timeout_readable(self):
+        """record_delay_sec / silence_timeout_sec 从 config.json 正常读取覆盖。"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as file:
+            json.dump(
+                {
+                    "voice": {
+                        "enabled": True,
+                        "record_delay_sec": 1.0,
+                        "silence_timeout_sec": 10.0,
+                    }
+                },
+                file,
+            )
+            file.flush()
+            cfg = load_config(file.name)
+        self.assertEqual(cfg.voice["record_delay_sec"], 1.0)
+        self.assertEqual(cfg.voice["silence_timeout_sec"], 10.0)
+
+    def test_voice_vad_partial_merge_drops_unknown_and_keeps_defaults(self):
+        """config.json 带 vad 部分字段：白名单合并，未知 vad 键丢弃，缺省字段保持默认。"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as file:
+            json.dump(
+                {
+                    "voice": {
+                        "enabled": True,
+                        "vad": {
+                            "energy_threshold": 500.0,
+                            "silence_end_sec": 2.0,
+                            "bogus_param": 123,
+                        },
+                    }
+                },
+                file,
+            )
+            file.flush()
+            cfg = load_config(file.name)
+        vad = cfg.voice["vad"]
+        self.assertNotIn("bogus_param", vad)
+        self.assertEqual(vad["energy_threshold"], 500.0)
+        self.assertEqual(vad["silence_end_sec"], 2.0)
+        # 未配置的 vad 子字段保持默认
+        self.assertEqual(vad["min_voice_sec"], 0.3)
+        self.assertEqual(vad["block_sec"], 0.05)
+
+    def test_save_config_filters_voice_vad_fields(self):
+        """save_config 按 _VOICE_VAD_FIELDS 白名单过滤 vad 未知键（与 kws 同模式）。"""
+        cfg = NanoClawConfig()
+        cfg.voice["enabled"] = True
+        cfg.voice["record_delay_sec"] = 1.2
+        cfg.voice["vad"]["energy_threshold"] = 600.0
+        cfg.voice["vad"]["bogus"] = 999
+        path = tempfile.mktemp(suffix=".json")
+        try:
+            save_config(cfg, path)
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            vad = data["voice"]["vad"]
+            self.assertEqual(vad["energy_threshold"], 600.0)
+            self.assertNotIn("bogus", vad)
+            self.assertIn("silence_end_sec", vad)  # 默认子字段保留
+            self.assertEqual(data["voice"]["record_delay_sec"], 1.2)
         finally:
             if os.path.exists(path):
                 os.unlink(path)

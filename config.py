@@ -53,7 +53,8 @@ _WEIXIN_FIELDS = (
 )
 # 本地语音渠道（TASK-025 起）白名单：旧 config.json 只有 voice.enabled 时保留，
 # 新字段（record_sec / kws.* / wake_replies / idle_ttl_sec / max_sessions /
-# max_voice_chars）按默认补全；未知字段丢弃（与 weixin 同模式）。
+# max_voice_chars / record_delay_sec / silence_timeout_sec / vad.*）按默认补全；
+# 未知字段丢弃（与 weixin 同模式）。
 _VOICE_FIELDS = (
     "enabled",
     "record_sec",
@@ -62,6 +63,9 @@ _VOICE_FIELDS = (
     "idle_ttl_sec",
     "max_sessions",
     "max_voice_chars",
+    "record_delay_sec",
+    "silence_timeout_sec",
+    "vad",
 )
 _VOICE_KWS_FIELDS = (
     "model_dir",
@@ -71,6 +75,16 @@ _VOICE_KWS_FIELDS = (
     "cooldown_sec",
     "confirm_hits",
     "int8",
+)
+# voice.vad 子字典白名单（TASK-027）：静音检测 VAD 覆盖参数，键名与
+# voice/kws/vad.py 的 record_audio_vad 参数名一致；渠道级参数
+# （max_duration_sec / device）由渠道统一传入、不进白名单。未知字段丢弃
+# （与 kws 同模式）。
+_VOICE_VAD_FIELDS = (
+    "energy_threshold",
+    "silence_end_sec",
+    "min_voice_sec",
+    "block_sec",
 )
 
 
@@ -317,6 +331,12 @@ class NanoClawConfig:
     # 会话、旧会话保留）；max_sessions 为 voice 会话保留上限（默认 50，超出
     # 清理最老 voice 会话，仅 voice 渠道）；max_voice_chars 为 Agent 回复
     # TTS 播放文本上限（默认 300，超长直接回文字不合成播放；≤0 不截断）。
+    # TASK-027 连续对讲：record_delay_sec 为回复播完到下一轮开录的间隔（默认
+    # 0.5s，避免截到小奈自己话音尾巴）；silence_timeout_sec 为静默退出阈值
+    # （默认 5s，开听后累计静默达到即退出连续对讲回待唤醒；≤0 不因静默退出）；
+    # vad.* 为流式静音检测 VAD 覆盖参数（与 voice/kws/vad.py 默认一致：
+    # energy_threshold=400.0 / silence_end_sec=1.2 / min_voice_sec=0.3 /
+    # block_sec=0.05），键名即 record_audio_vad 的参数名。
     # 修改后需重启实例。
     voice: dict = field(default_factory=lambda: {
         "enabled": False,
@@ -325,6 +345,14 @@ class NanoClawConfig:
         "idle_ttl_sec": 1800,
         "max_sessions": 50,
         "max_voice_chars": 300,
+        "record_delay_sec": 0.5,
+        "silence_timeout_sec": 5.0,
+        "vad": {
+            "energy_threshold": 400.0,
+            "silence_end_sec": 1.2,
+            "min_voice_sec": 0.3,
+            "block_sec": 0.05,
+        },
         "kws": {
             "model_dir": "voice/kws/models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01",
             "keywords_file": "",
@@ -387,6 +415,16 @@ def load_config(config_path: str = "config.json") -> NanoClawConfig:
                                 {name: kws_data[name] for name in _VOICE_KWS_FIELDS if name in kws_data}
                             )
                             merged["kws"] = kws
+                        # vad 子字典白名单合并（TASK-027）：与 kws 同模式——
+                        # 从默认 vad 重建，只接受 _VOICE_VAD_FIELDS 中的键，
+                        # 未知丢弃；voice_data 未含 vad 时保持默认不动。
+                        if isinstance(voice_data.get("vad"), dict):
+                            vad = dict((getattr(cfg, key) or {}).get("vad") or {})
+                            vad_data = voice_data["vad"]
+                            vad.update(
+                                {name: vad_data[name] for name in _VOICE_VAD_FIELDS if name in vad_data}
+                            )
+                            merged["vad"] = vad
                     else:
                         merged.update(data[key])
                     setattr(cfg, key, merged)
@@ -480,6 +518,12 @@ def save_config(cfg: NanoClawConfig, config_path: str = "config.json") -> None:
                 name: data["voice"]["kws"][name]
                 for name in _VOICE_KWS_FIELDS
                 if name in data["voice"]["kws"]
+            }
+        if isinstance(data["voice"].get("vad"), dict):
+            data["voice"]["vad"] = {
+                name: data["voice"]["vad"][name]
+                for name in _VOICE_VAD_FIELDS
+                if name in data["voice"]["vad"]
             }
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)

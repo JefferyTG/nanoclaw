@@ -182,22 +182,28 @@ class VoiceWakeReplyTests(unittest.IsolatedAsyncioTestCase):
         raise AssertionError("等待条件超时未满足")
 
     async def _run_wake(self, channel, events):
-        """挂起 detector 的 on_wake（已 patch play_audio / record_audio）。"""
+        """挂起 detector 的 on_wake（已 patch play_audio / record_audio_vad）。
+
+        TASK-027：on_wake 非阻塞（仅调度首轮连续对讲监听），首轮 VAD 录音在
+        后台任务里执行，这里等 record 事件落库后再收尾，保证断言时序稳定。
+        """
 
         async def _fake_play(audio, media_type, *args, **kwargs):
             events.append("play")
 
         async def _fake_record(*args, **kwargs):
             events.append("record")
-            return b"wav"
+            return (b"wav", False)
 
         detector = channel._kws_detector
         start_task = asyncio.create_task(channel.start())
         await self._wait_for(lambda: detector.started)
         with patch("channels.voice.play_audio", new=_fake_play), patch(
-            "channels.voice.record_audio", new=_fake_record
+            "channels.voice.record_audio_vad", new=_fake_record
         ):
             await detector.on_wake()
+            # 首轮监听是后台任务：必须待在 patch 作用域内等它跑完录音
+            await self._wait_for(lambda: "record" in events)
         await channel.stop()
         await asyncio.wait_for(start_task, timeout=1)
 
@@ -216,7 +222,7 @@ class VoiceWakeReplyTests(unittest.IsolatedAsyncioTestCase):
             bus,
             kws_detector=detector,
             asr_service=_FakeASR(),
-            record_sec=2.0,
+            record_sec=2.0, record_delay_sec=0.0,
             tts_service=_TTS(),
             wake_replies=["哎，我在呢，你说吧"],
         )
@@ -243,7 +249,7 @@ class VoiceWakeReplyTests(unittest.IsolatedAsyncioTestCase):
             bus,
             kws_detector=detector,
             asr_service=_FakeASR(),
-            record_sec=2.0,
+            record_sec=2.0, record_delay_sec=0.0,
             tts_service=_TTS(),
             wake_replies=["第一句", "第二句"],
         )
@@ -263,7 +269,7 @@ class VoiceWakeReplyTests(unittest.IsolatedAsyncioTestCase):
         detector = _FakeDetector()
         events: list = []
         channel = VoiceChannel(
-            bus, kws_detector=detector, asr_service=_FakeASR(), record_sec=2.0
+            bus, kws_detector=detector, asr_service=_FakeASR(), record_sec=2.0, record_delay_sec=0.0
         )
         await self._run_wake(channel, events)
         self.assertEqual(events, ["record"])  # 无 synthesize / play
@@ -282,7 +288,7 @@ class VoiceWakeReplyTests(unittest.IsolatedAsyncioTestCase):
             bus,
             kws_detector=detector,
             asr_service=_FakeASR(),
-            record_sec=2.0,
+            record_sec=2.0, record_delay_sec=0.0,
             tts_service=_TTS(),
             wake_replies=[],
         )
@@ -303,7 +309,7 @@ class VoiceWakeReplyTests(unittest.IsolatedAsyncioTestCase):
             bus,
             kws_detector=detector,
             asr_service=_FakeASR(),
-            record_sec=2.0,
+            record_sec=2.0, record_delay_sec=0.0,
             tts_service=_TTS(),
             wake_replies="not-a-list",  # 非法配置：渠道侧容错
         )
@@ -326,7 +332,7 @@ class VoiceWakeReplyTests(unittest.IsolatedAsyncioTestCase):
             bus,
             kws_detector=detector,
             asr_service=_FakeASR(),
-            record_sec=2.0,
+            record_sec=2.0, record_delay_sec=0.0,
             tts_service=_TTS(),
             wake_replies=["哎，我在呢，你说吧"],
         )
@@ -355,13 +361,13 @@ class VoiceWakeReplyTests(unittest.IsolatedAsyncioTestCase):
 
         async def _fake_record(*args, **kwargs):
             events.append("record")
-            return b"wav"
+            return (b"wav", False)
 
         channel = VoiceChannel(
             bus,
             kws_detector=detector,
             asr_service=_FakeASR(),
-            record_sec=2.0,
+            record_sec=2.0, record_delay_sec=0.0,
             tts_service=_TTS(),
             wake_replies=["哎，我在呢，你说吧"],
         )
@@ -369,9 +375,11 @@ class VoiceWakeReplyTests(unittest.IsolatedAsyncioTestCase):
         start_task = asyncio.create_task(channel.start())
         await self._wait_for(lambda: detector.started)
         with patch("channels.voice.play_audio", new=_fake_play), patch(
-            "channels.voice.record_audio", new=_fake_record
+            "channels.voice.record_audio_vad", new=_fake_record
         ):
             await detector.on_wake()
+            # 首轮监听是后台任务：待在 patch 作用域内等它跑完录音
+            await self._wait_for(lambda: "record" in events)
         await channel.stop()
         await asyncio.wait_for(start_task, timeout=1)
         self.assertEqual(events, ["synthesize", "play", "record"])
