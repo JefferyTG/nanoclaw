@@ -541,6 +541,7 @@ class VoiceChannelWakeTests(unittest.IsolatedAsyncioTestCase):
             asr_service=asr,
             record_sec=2.0,
             record_delay_sec=0.0,
+            wake_replies_dir="/nonexistent/",
         )
         gate = asyncio.Event()
 
@@ -618,6 +619,7 @@ class VoiceChannelWakeTests(unittest.IsolatedAsyncioTestCase):
                 asr_service=asr,
                 record_sec=2.0,
                 record_delay_sec=0.0,
+                wake_replies_dir="/nonexistent/",
             )
             emitted: list = []
             channel._reply_sink = emitted.append

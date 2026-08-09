@@ -67,6 +67,7 @@ TASK-027 连续对讲（第二步：渠道状态机）：把「单轮唤醒」�
 """
 
 import asyncio
+import os
 import io
 import random
 import re
@@ -182,6 +183,7 @@ class VoiceChannel(Channel):
         silence_timeout_sec: float = 5.0,
         vad_params: dict | None = None,
         playback_params: dict | None = None,
+        wake_replies_dir: str | None = None,
     ) -> None:
         super().__init__(name="voice", bus=bus)
         # 停止事件：start() 的监听/空转循环等待它，stop() 置位唤醒
@@ -195,6 +197,16 @@ class VoiceChannel(Channel):
         # list 或空 → 跳过回应直接录音，向后兼容既有行为）
         self._tts_service = tts_service
         self._wake_replies = wake_replies
+        # TASK-029 唤醒回应本地缓存随机播放：wake_replies_dir 指向放预录 WAV 的
+        # 目录（默认 workspace/voice/wake_replies/）；_wake_audio_cache 为 None 时
+        # 未加载，[] 为已加载但目录空/不存在。缓存非空时 _play_wake_reply 优先随机
+        # 播一条缓存 WAV（不调云端 TTS）；缓存为空回退现有云端合成路径。
+        self._wake_replies_dir = (
+            wake_replies_dir
+            if wake_replies_dir is not None
+            else "workspace/voice/wake_replies/"
+        )
+        self._wake_audio_cache: list[bytes] | None = None
         # TASK-026 回复播放文本上限：>0 时超出直接回文字不合成播放；
         # ≤0 表示不截断（0 与负数都视为「不限」）。
         self._max_voice_chars = (
@@ -682,14 +694,65 @@ class VoiceChannel(Channel):
             self._wake_in_progress = False
 
     async def _play_wake_reply(self) -> bool:
-        """唤醒确认回应（方案 B）：随机挑一条文本合成并播放，播完返回 True。
+        """唤醒确认回应：优先本地缓存随机播一条 WAV，缓存缺失回退云端 TTS。
+
+        TASK-029 改造逻辑：
+
+        1. **懒加载** ``self._wake_audio_cache``：为 None 时扫描
+           ``wake_replies_dir`` 下所有 ``wake_*.wav`` 文件（排序后读 bytes），
+           存入 ``self._wake_audio_cache``；目录不存在 / 无匹配文件 → ``[]``。
+           仅首次调用扫描，之后复用缓存。
+        2. **缓存非空**（``len > 0``）→ ``random.choice`` 取一条 bytes 直接
+           ``play_audio`` 播放（media_type=``audio/wav``），**不调 tts_service**；
+           播放失败 → 降级尝试云端合成（走现有 tts 路径）；tts 也失败/None →
+           跳过（返回 False）。
+        3. **缓存为空** → 走现有 ``tts.synthesize`` + ``play_audio`` 路径
+           （完全向后兼容，不改原有逻辑）。
 
         - ``tts_service`` 为 None 或 ``wake_replies`` 为空/非 list → 跳过回应
-          直接录音（返回 False，向后兼容 TASK-025 既有行为）；
-        - 合成/播放任一步失败（TTSError / KwsError / 其它异常）→ 降级跳过回应
-          （``_emit`` 一条轻提示），不阻塞唤醒流程。
+          直接录音（返回 False，向后兼容 TASK-025 既有行为）——仅在缓存为空
+          且需回退云端时检查。
+        - 合成/播放任一步失败 → 降级跳过回应（``_emit`` 一条轻提示），
+          不阻塞唤醒流程。
         - 返回 True 表示回应已**完整播完**，调用方此时才应进入连续对讲。
         """
+        # —— 懓加载本地缓存音频 ——
+        if self._wake_audio_cache is None:
+            self._wake_audio_cache = self._load_wake_audio_cache()
+        # —— 缓存非空：直接播放，不调 TTS ——
+        if self._wake_audio_cache:
+            audio_bytes = random.choice(self._wake_audio_cache)
+            try:
+                await play_audio(
+                    audio_bytes,
+                    "audio/wav",
+                    playback_params=self._playback_params,
+                )
+                return True
+            except Exception as exc:  # noqa: BLE001 - 缓存播放失败降级云端
+                # 缓存播放失败 → 尝试云端合成（如果可用），否则跳过
+                tts = self._tts_service
+                replies = self._wake_replies
+                if tts is None or not isinstance(replies, list) or not replies:
+                    self._emit(
+                        f"🔇 回应播放失败，继续听你说（{getattr(exc, 'message', exc)}）"
+                    )
+                    return False
+                try:
+                    text = random.choice(replies)
+                    result = await tts.synthesize(text)
+                    await play_audio(
+                        result.audio,
+                        result.media_type,
+                        playback_params=self._playback_params,
+                    )
+                except Exception as exc2:  # noqa: BLE001 - 云端也失败则跳过
+                    self._emit(
+                        f"🔇 回应播放失败，继续听你说（{getattr(exc2, 'message', exc2)}）"
+                    )
+                    return False
+                return True
+        # —— 缓存为空：走现有云端合成路径（向后兼容）——
         tts = self._tts_service
         replies = self._wake_replies
         if tts is None or not isinstance(replies, list) or not replies:
@@ -708,6 +771,29 @@ class VoiceChannel(Channel):
             )
             return False
         return True
+
+    def _load_wake_audio_cache(self) -> list[bytes]:
+        """扫描 ``wake_replies_dir`` 下所有 ``wake_*.wav`` 文件，读 bytes 存列表。
+
+        目录不存在 / 无匹配文件 → 返回空列表 ``[]``（表示已加载但无缓存音频，
+        不再重复扫描）。文件按文件名排序后依次读取；单个文件读取失败跳过
+        （不阻塞整体加载）。
+        """
+        d = self._wake_replies_dir
+        if not d or not os.path.isdir(d):
+            return []
+        files = sorted(
+            f for f in os.listdir(d) if f.startswith("wake_") and f.endswith(".wav")
+        )
+        cache: list[bytes] = []
+        for fname in files:
+            fpath = os.path.join(d, fname)
+            try:
+                with open(fpath, "rb") as fp:
+                    cache.append(fp.read())
+            except OSError:
+                continue  # 单文件读取失败跳过，不影响其余
+        return cache
 
     async def _handle_wake(self) -> None:
         """唤醒处理：播甘雨回应（方案 B）→ 进入连续对讲 → 启动首轮录音监听。

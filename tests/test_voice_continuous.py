@@ -137,6 +137,7 @@ class VoiceContinuousTests(unittest.IsolatedAsyncioTestCase):
             record_delay_sec=0.0,
             tts_service=tts,
             wake_replies=["哎，我在呢，你说吧"],
+            wake_replies_dir="/nonexistent/",
         )
         emitted: list = []
         channel._reply_sink = emitted.append
@@ -317,6 +318,7 @@ class VoiceContinuousTests(unittest.IsolatedAsyncioTestCase):
             silence_timeout_sec=3.0,  # 1s×3 = 3 ≥ 3 才退出
             tts_service=tts,
             wake_replies=["哎，我在呢，你说吧"],
+            wake_replies_dir="/nonexistent/",
         )
         emitted: list = []
         channel._reply_sink = emitted.append

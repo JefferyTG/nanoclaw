@@ -225,6 +225,7 @@ class VoiceWakeReplyTests(unittest.IsolatedAsyncioTestCase):
             record_sec=2.0, record_delay_sec=0.0,
             tts_service=_TTS(),
             wake_replies=["哎，我在呢，你说吧"],
+            wake_replies_dir="/nonexistent/",
         )
         await self._run_wake(channel, events)
         self.assertEqual(events, ["synthesize", "play", "record"])
@@ -252,6 +253,7 @@ class VoiceWakeReplyTests(unittest.IsolatedAsyncioTestCase):
             record_sec=2.0, record_delay_sec=0.0,
             tts_service=_TTS(),
             wake_replies=["第一句", "第二句"],
+            wake_replies_dir="/nonexistent/",
         )
         with patch(
             "channels.voice.random.choice",
@@ -269,7 +271,8 @@ class VoiceWakeReplyTests(unittest.IsolatedAsyncioTestCase):
         detector = _FakeDetector()
         events: list = []
         channel = VoiceChannel(
-            bus, kws_detector=detector, asr_service=_FakeASR(), record_sec=2.0, record_delay_sec=0.0
+            bus, kws_detector=detector, asr_service=_FakeASR(), record_sec=2.0, record_delay_sec=0.0,
+            wake_replies_dir="/nonexistent/",
         )
         await self._run_wake(channel, events)
         self.assertEqual(events, ["record"])  # 无 synthesize / play
@@ -291,6 +294,7 @@ class VoiceWakeReplyTests(unittest.IsolatedAsyncioTestCase):
             record_sec=2.0, record_delay_sec=0.0,
             tts_service=_TTS(),
             wake_replies=[],
+            wake_replies_dir="/nonexistent/",
         )
         await self._run_wake(channel, events)
         self.assertEqual(events, ["record"])
@@ -312,6 +316,7 @@ class VoiceWakeReplyTests(unittest.IsolatedAsyncioTestCase):
             record_sec=2.0, record_delay_sec=0.0,
             tts_service=_TTS(),
             wake_replies="not-a-list",  # 非法配置：渠道侧容错
+            wake_replies_dir="/nonexistent/",
         )
         await self._run_wake(channel, events)
         self.assertEqual(events, ["record"])
@@ -335,6 +340,7 @@ class VoiceWakeReplyTests(unittest.IsolatedAsyncioTestCase):
             record_sec=2.0, record_delay_sec=0.0,
             tts_service=_TTS(),
             wake_replies=["哎，我在呢，你说吧"],
+            wake_replies_dir="/nonexistent/",
         )
         channel._reply_sink = emitted.append
         await self._run_wake(channel, events)
@@ -370,6 +376,7 @@ class VoiceWakeReplyTests(unittest.IsolatedAsyncioTestCase):
             record_sec=2.0, record_delay_sec=0.0,
             tts_service=_TTS(),
             wake_replies=["哎，我在呢，你说吧"],
+            wake_replies_dir="/nonexistent/",
         )
         channel._reply_sink = emitted.append
         start_task = asyncio.create_task(channel.start())

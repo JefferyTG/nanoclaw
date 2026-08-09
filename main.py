@@ -1619,6 +1619,10 @@ async def amain() -> None:
             # TASK-028 播放防炸麦：透传 voice.playback（渠道内按白名单清洗，
             # 空 dict → DSP 内置默认 target_peak=0.89 / 只压不抬 / soft_clip）。
             playback_params=voice_playback_cfg,
+            wake_replies_dir=str(
+                voice_settings.get("wake_replies_dir")
+                or "workspace/voice/wake_replies/"
+            ),
             session_pruner=prune_voice_session,
         )
         voice_channel._clear_callback = clear_callback  # 复用同一清空回调

@@ -51,3 +51,4 @@ Camera_*.jpg
 
 # 个人知识库测试资产（独立项目 kb 的评测资产，不纳入本仓库）
 kb-testset/
+!scripts/synthesize_wake_replies.py
