@@ -15,6 +15,9 @@ config.json
 *.env
 *.env.*
 
+# 语音 KWS 模型（大文件，可重新下载，不提交）
+voice/kws/models/
+
 # 个人数据 / 运行产物
 .workbuddy/
 workspace/

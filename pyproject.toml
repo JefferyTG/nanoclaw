@@ -11,7 +11,12 @@ dependencies = [
     "httpx>=0.28.1",
     "lark-oapi>=1.7.1",
     "mcp>=1.28.1",
+    "onnxruntime==1.24.4",
     "openai>=2.46.0",
+    "pypinyin>=0.55.0",
     "python-dateutil>=2.9.0.post0",
     "pyyaml>=6.0.3",
+    "sentencepiece>=0.2.2",
+    "sherpa-onnx==1.12.40",
+    "sounddevice>=0.5.5",
 ]

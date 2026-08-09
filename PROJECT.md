@@ -36,6 +36,7 @@
 | 视频生成 | ✅ | 异步任务式，多服务商适配 |
 | 技能系统 | ✅ | SKILL.md 扫描、摘要注入、ListSkills/LoadSkill |
 | 邮箱检查 | ✅ | `email-check` 技能：IMAP 只读查新邮件/列邮件/看正文/标已读，网易/QQ/Gmail 通用；授权码存 gitignore 目录；配合 reminders 定时任务做每日新邮件提醒（TASK-022） |
+| 本地语音唤醒 KWS | 🔶 | sherpa-onnx 本地 KWS 验证通过（TASK-023）：内置麦克风监听「小奈小奈」实测触发；离线 TTS 合成命中；RSS≈53MB/空闲 CPU 9~14%；**未接入主链路**——TASK-024 起做 voice 渠道（demo: `voice/kws/demo_kws.py`） |
 | Prompt Cache 友好 | ✅ | System 无墙钟、按需时间工具、工具 Schema 冻结、隐私安全观测 |
 | 会话持久化 | ✅ | 一会话一 JSONL、重启接回、图片只存引用；中断回合落盘即同步内存、任意中断路径不丢上下文（TASK-010） |
 | Linux 后台管理 | ✅ | `bin/nanoclawctl`（setsid 独立进程组） |
@@ -122,6 +123,6 @@ Web 附加：AgentLoop 流事件 → Bus.stream → WebChannel → WebSocket（t
 
 > **唯一事实源是 git 本身**（`git log` / `git status` / `git diff`）。本段只留指针与稳定约定，**不复制任何瞬时状态**——hash 列表、领先/落后数量、未跟踪清单都会过期，一律不写，需要时直接查 git。
 
-- 当前里程碑：TASK-001~022 已完成并归档（任务卡见 `docs/tasks/completed/`）；active：暂无。
+- 当前里程碑：TASK-001~023 已完成并归档（任务卡见 `docs/tasks/completed/`）；active：TASK-024~026（voice 渠道系列，任务卡已建待开工）。
 - 最新提交、分支、领先/落后、工作区状态：`git log` / `git status`。
 - 稳定约定：`kb-testset/`（个人知识库测试资产）已在 `.gitignore` 中不追踪；存在 codex 外部 worktree → 多会话并行开发时严格遵守 AGENTS.md 文件所有权规则。
