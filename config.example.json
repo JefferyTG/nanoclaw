@@ -107,7 +107,20 @@
     "merge_max_messages": 10
   },
   "voice": {
-    "enabled": false
+    "enabled": false,
+    "record_sec": 8.0,
+    "wake_replies": [
+      "哎，我在呢，你说吧"
+    ],
+    "kws": {
+      "model_dir": "voice/kws/models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01",
+      "keywords_file": "",
+      "device": null,
+      "sample_rate": 16000,
+      "cooldown_sec": 2.0,
+      "confirm_hits": 1,
+      "int8": false
+    }
   },
   "video_gen_model": {
     "api_key": "",

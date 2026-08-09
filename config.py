@@ -51,6 +51,24 @@ _WEIXIN_FIELDS = (
     "max_inbound_image_bytes",
     "max_outbound_image_bytes",
 )
+# 本地语音渠道（TASK-025 起）白名单：旧 config.json 只有 voice.enabled 时保留，
+# 新字段（record_sec / kws.*）按默认补全；未知字段丢弃（与 weixin 同模式）。
+_VOICE_FIELDS = (
+    "enabled",
+    "record_sec",
+    "kws",
+    "wake_replies",
+)
+_VOICE_KWS_FIELDS = (
+    "model_dir",
+    "keywords_file",
+    "device",
+    "sample_rate",
+    "cooldown_sec",
+    "confirm_hits",
+    "int8",
+)
+
 
 # 参与序列化/反序列化的字段清单（用于从 JSON 安全填充，避免读到无关键）
 _CONFIG_FIELDS = (
@@ -285,8 +303,26 @@ class NanoClawConfig:
             "max_outbound_image_bytes": 20 * 1024 * 1024,
         }
     )
-    # 本地语音渠道：无音频骨架默认关闭（TASK-024）；TASK-025/026 将扩展字段。
-    voice: dict = field(default_factory=lambda: {"enabled": False})
+    # 本地语音渠道：默认关闭（TASK-024）。TASK-025 起支持唤醒录音 ASR 闭环：
+    # record_sec 为唤醒后录音秒数；kws.* 为 KWS 检测器参数（model_dir 指向
+    # 已下载模型目录，keywords_file 空则默认 <model_dir>/keywords_xiaonai.txt，
+    # device=None 用系统默认输入）；wake_replies 为唤醒确认回应文本列表
+    # （TASK-025 方案 B：唤醒后先合成并播放甘雨回应、播完再录音，列表 +
+    # random.choice，加条目即自动随机）。修改后需重启实例。
+    voice: dict = field(default_factory=lambda: {
+        "enabled": False,
+        "record_sec": 8.0,
+        "wake_replies": ["哎，我在呢，你说吧"],
+        "kws": {
+            "model_dir": "voice/kws/models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01",
+            "keywords_file": "",
+            "device": None,
+            "sample_rate": 16000,
+            "cooldown_sec": 2.0,
+            "confirm_hits": 1,
+            "int8": False,
+        },
+    })
 
 
 def load_config(config_path: str = "config.json") -> NanoClawConfig:
@@ -311,7 +347,7 @@ def load_config(config_path: str = "config.json") -> NanoClawConfig:
             if key in data and data[key] is not None:
                 # ASR/TTS 配置允许只覆盖少数字段；其余继续使用当前代码默认值，
                 # 方便未来新增可选参数而不要求用户立刻重写旧 config.json。
-                if key in ("asr_model", "tts_model", "reminders", "weixin") and isinstance(data[key], dict):
+                if key in ("asr_model", "tts_model", "reminders", "weixin", "voice") and isinstance(data[key], dict):
                     merged = dict(getattr(cfg, key))
                     if key == "weixin":
                         weixin_data = data[key]
@@ -325,6 +361,20 @@ def load_config(config_path: str = "config.json") -> NanoClawConfig:
                         # 兼容镜像：main.py 等组合根仍读取 image_merge_window_sec，
                         # 保留该键为当前生效的合并窗口值；save_config 会按 _WEIXIN_FIELDS 过滤丢弃。
                         merged["image_merge_window_sec"] = merged.get("merge_window_sec", 8.0)
+                    elif key == "voice":
+                        voice_data = data[key]
+                        merged.update(
+                            {name: voice_data[name] for name in _VOICE_FIELDS if name in voice_data}
+                        )
+                        # kws 子字段白名单合并：以默认 kws 为基底，只接受已知键，
+                        # 未知字段丢弃（先 update 会让未知键残留，故从默认重建）
+                        if isinstance(voice_data.get("kws"), dict):
+                            kws = dict((getattr(cfg, key) or {}).get("kws") or {})
+                            kws_data = voice_data["kws"]
+                            kws.update(
+                                {name: kws_data[name] for name in _VOICE_KWS_FIELDS if name in kws_data}
+                            )
+                            merged["kws"] = kws
                     else:
                         merged.update(data[key])
                     setattr(cfg, key, merged)
@@ -407,5 +457,17 @@ def save_config(cfg: NanoClawConfig, config_path: str = "config.json") -> None:
             for name in _WEIXIN_FIELDS
             if name in data["weixin"]
         }
+    if isinstance(data.get("voice"), dict):
+        data["voice"] = {
+            name: data["voice"][name]
+            for name in _VOICE_FIELDS
+            if name in data["voice"]
+        }
+        if isinstance(data["voice"].get("kws"), dict):
+            data["voice"]["kws"] = {
+                name: data["voice"]["kws"][name]
+                for name in _VOICE_KWS_FIELDS
+                if name in data["voice"]["kws"]
+            }
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)

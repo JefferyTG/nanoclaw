@@ -20,6 +20,7 @@ import json
 import os
 import signal
 import sys
+from pathlib import Path
 from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -85,6 +86,8 @@ from gateway import Gateway
 from channels.cli import CLIChannel
 from channels.feishu import FeishuChannel
 from channels.voice import VoiceChannel
+from voice.kws.detector import KwsWakeDetector
+from voice.kws.errors import KwsError
 from channels.weixin import WeixinChannel
 from channels.web import WebChannel
 from reminders.models import DeliveryResult
@@ -1498,15 +1501,74 @@ async def amain() -> None:
     else:
         print("（网页渠道：未配置 web_port 或未启用）")
 
-    # 语音渠道：本地对讲机（TASK-024 无音频骨架）。默认关闭；启用后仅注册
-    # 空转渠道实例，inject_text() 为唯一入站口（TASK-025 接入录音/ASR 回调）。
+    # 语音渠道：本地对讲机（TASK-024 骨架 + TASK-025 唤醒录音 ASR 闭环）。
+    # 默认关闭。启用后若 KWS 模型目录与 ASR 服务齐备 → 装配唤醒闭环
+    # （喊「小奈小奈」→ 播甘雨确认回应 → 录音 → 转写 → inject_text）；
+    # 任一缺失 → 渠道仍注册、唤醒链路降级为仅 inject_text 可用（空转），
+    # 不影响其他渠道。TTS 服务（shared["tts_service"]）与 wake_replies 就绪时
+    # 才启用唤醒确认回应（方案 B）。
     voice_settings = cfg.voice if isinstance(cfg.voice, dict) else {}
     if voice_settings.get("enabled", False):
-        voice_channel = VoiceChannel(bus)
+        voice_kws_cfg = (
+            voice_settings.get("kws")
+            if isinstance(voice_settings.get("kws"), dict)
+            else {}
+        )
+        asr_service = shared["asr_service"]  # 未配 asr_model 时为 None → 降级
+        kws_detector = None
+        kws_model_dir = Path(str(voice_kws_cfg.get("model_dir") or "").strip())
+        kws_degrade_reason = None
+        if kws_model_dir and kws_model_dir.is_dir() and asr_service is not None:
+            try:
+                kws_detector = KwsWakeDetector(
+                    model_dir=kws_model_dir,
+                    keywords_file=(
+                        str(voice_kws_cfg.get("keywords_file") or "").strip()
+                        or None
+                    ),
+                    device=voice_kws_cfg.get("device"),
+                    sample_rate=int(voice_kws_cfg.get("sample_rate", 16000)),
+                    cooldown_sec=float(voice_kws_cfg.get("cooldown_sec", 2.0)),
+                    confirm_hits=int(voice_kws_cfg.get("confirm_hits", 1)),
+                    int8=bool(voice_kws_cfg.get("int8", False)),
+                )
+            except (TypeError, ValueError, KwsError) as exc:
+                kws_degrade_reason = f"KWS 配置无效：{exc}"
+        elif asr_service is None:
+            kws_degrade_reason = "缺 ASR 配置（asr_model.enabled/api_key/base_url/model）"
+        else:
+            kws_degrade_reason = f"缺 KWS 模型（{kws_model_dir}）"
+
+        # TASK-025 方案 B：唤醒确认回应文本列表（非 list[str] 时回退 None，
+        # 渠道内跳过回应直接录音，向后兼容）。
+        voice_wake_replies = voice_settings.get("wake_replies")
+        if not (
+            isinstance(voice_wake_replies, list)
+            and all(isinstance(item, str) and item.strip() for item in voice_wake_replies)
+        ):
+            voice_wake_replies = None
+
+        voice_channel = VoiceChannel(
+            bus,
+            kws_detector=kws_detector,
+            asr_service=asr_service,
+            record_sec=float(voice_settings.get("record_sec", 8.0) or 8.0),
+            kws_device=voice_kws_cfg.get("device"),
+            tts_service=shared["tts_service"],
+            wake_replies=voice_wake_replies,
+        )
         voice_channel._clear_callback = clear_callback  # 复用同一清空回调
         voice_channel._context_callback = context_callback  # /context 占用查询
         channels.append(voice_channel)
-        print("（语音渠道：已启用·本地对讲机·无音频骨架）")
+        if kws_detector is not None:
+            wake_reply_note = (
+                "·甘雨回应"
+                if (shared["tts_service"] is not None and voice_wake_replies)
+                else ""
+            )
+            print(f"（语音渠道：已启用·唤醒词「小奈小奈」·ASR 就绪{wake_reply_note}）")
+        else:
+            print(f"（语音渠道：已启用·唤醒未就绪（{kws_degrade_reason}），仅 inject_text 可用）")
     else:
         print("（语音渠道：未启用）")
 
