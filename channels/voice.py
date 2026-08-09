@@ -81,6 +81,7 @@ from voice.kws.errors import KwsError
 from voice.kws.player import play_audio
 from voice.kws.vad import record_audio_vad
 from voice.media import MediaError
+from voice.segments import segment_text
 
 
 # —— TASK-027 补充：TTS 前文本清洗正则（剥 markdown / 删 emoji 与装饰符号 /
@@ -814,6 +815,108 @@ class VoiceChannel(Channel):
         self._enter_continuous()
         self._schedule_next_listen()
 
+    async def _play_segments(self, segments: list[str]) -> None:
+        """TASK-030 分段流式播放：切句后逐段合成+播放，预合成并发上限 2。
+
+        - 第 1 段合成完成 → 立即 ``play_audio`` 开播；播放期间后台预合成剩余
+          段（``asyncio.Semaphore(2)`` 限制并发合成数）；
+        - 段播放完成 → 从已合成缓存取下一段播放；未合成完则等待；
+        - 段合成失败 → 该段降级为文字输出（``_emit``），后续段不受影响；
+        - 段播放失败 → 当前及后续段全部降级为文字输出；
+        - 每段仍过 TASK-028 DSP（``play_audio`` 内
+          ``normalize_playback_pcm``），``playback_params`` 透传。
+        """
+        n = len(segments)
+        tts = self._tts_service
+
+        # 已合成音频缓存：index -> TTSResult
+        cache: dict[int, object] = {}
+        # 合成失败的段序号（已降级文字，播放时跳过）
+        synth_failed: set[int] = set()
+        # 播放失败标志：True 时后续段全部降级文字
+        play_failed = False
+
+        sem = asyncio.Semaphore(2)
+        synth_tasks: dict[int, asyncio.Task] = {}
+
+        async def _synth(idx: int) -> None:
+            """合成单段音频并存入缓存；失败则降级文字。"""
+            async with sem:
+                try:
+                    cache[idx] = await tts.synthesize(segments[idx])
+                except Exception as exc:  # noqa: BLE001 - 合成失败降级文字
+                    synth_failed.add(idx)
+                    self._emit(
+                        f"🔇 第{idx + 1}段语音合成失败，改文字"
+                        f"（{getattr(exc, 'message', exc)}）"
+                    )
+                    self._emit(segments[idx])
+
+        def _ensure_synth(idx: int) -> None:
+            """确保 idx 段的合成任务已启动（不重复启动、不越界）。"""
+            if idx >= n or idx in synth_tasks or idx in synth_failed:
+                return
+            synth_tasks[idx] = asyncio.create_task(_synth(idx))
+
+        # 预合成前 2 段（并发上限 2，实际并发由 Semaphore 控制）
+        for idx in range(min(2, n)):
+            _ensure_synth(idx)
+
+        for play_idx in range(n):
+            if play_failed:
+                # 后续段全部降级文字（未被合成失败覆盖的）
+                for r in range(play_idx, n):
+                    if r not in synth_failed:
+                        self._emit(segments[r])
+                break
+
+            # 等待当前段合成完成
+            task = synth_tasks.get(play_idx)
+            if task is not None:
+                await task
+
+            if play_idx in synth_failed:
+                # 该段已降级文字，预合成下下段后跳到下一段
+                _ensure_synth(play_idx + 2)
+                continue
+
+            result = cache.get(play_idx)
+            if result is None:
+                # 不应发生（合成完成但缓存无结果），防御性降级
+                self._emit(segments[play_idx])
+                _ensure_synth(play_idx + 2)
+                continue
+
+            # 预合成下下段（播放当前段期间后台合成，降低句间停顿）
+            _ensure_synth(play_idx + 2)
+
+            # 分段打印：每段播放前同步打屏幕，让用户看到分段输出与音频同步。
+            print(
+                f"[voice] 🎀 小奈说（第{play_idx + 1}/{n}段）：{segments[play_idx]}"
+            )
+            try:
+                await play_audio(
+                    result.audio,
+                    result.media_type,
+                    playback_params=self._playback_params,
+                )
+            except Exception as exc:  # noqa: BLE001 - 播放失败降级文字
+                play_failed = True
+                self._emit(
+                    f"🔇 语音播放失败，改文字回复"
+                    f"（{getattr(exc, 'message', exc)}）"
+                )
+                self._emit(segments[play_idx])
+
+        # 清理：取消仍在运行的合成任务
+        for task in synth_tasks.values():
+            if not task.done():
+                task.cancel()
+        if synth_tasks:
+            await asyncio.gather(
+                *synth_tasks.values(), return_exceptions=True
+            )
+
     async def send(self, message: OutboundMessage) -> None:
         """把出站回复下发到本渠道（Agent 回复 → 甘雨 TTS → 播放默认输出）。
 
@@ -829,6 +932,9 @@ class VoiceChannel(Channel):
           后为空 → 不播任何东西直接退出；
         - TASK-027 连续对讲续听：未收到 ``[END]`` 且处于连续对讲模式
           （``_continuous``）时，播放完成（成功或降级）后调度下一轮录音任务。
+        - TASK-030 分段流式播放：文本切句后逐段合成+播放，首段合成完成即开播，
+          播放期间后台预合成下一段（并发上限 2），降低句间停顿；单段文本走
+          原路径（行为不变）。``[END]`` 已在合成前剥离，切句器不处理标记。
         ``_emit`` 仍是文字兜底单一出口，语义与签名不变。
         """
         text = message.content
@@ -840,10 +946,6 @@ class VoiceChannel(Channel):
         # 随后做 TTS 前清洗（剥 markdown/emoji/装饰符号），保证合成听感干净。
         text, end_marker = self._strip_end_marker(text)
         text = self._sanitize_for_tts(text)
-        print(
-            f"[voice] 🎀 小奈说：{text}"
-            + ("（含 [END] 结束语）" if end_marker else "")
-        )
         if not text:
             # 剥离后为空：不播放任何东西，直接退出连续对讲。
             if end_marker:
@@ -854,22 +956,46 @@ class VoiceChannel(Channel):
         limit = self._max_voice_chars
         if tts is None or (limit > 0 and len(text) > limit):
             # 纯文字兜底路径（tts 未配置 / 文本超长）：同样剥离标记并退出。
+            print(
+                f"[voice] 🎀 小奈说：{text}"
+                + ("（含 [END] 结束语）" if end_marker else "")
+            )
             self._emit(text)
             if end_marker:
                 self._exit_continuous()
             return
-        try:
-            result = await tts.synthesize(text)
-            await play_audio(
-                result.audio,
-                result.media_type,
-                playback_params=self._playback_params,
+
+        # TASK-030 分段流式播放：切句后逐段合成+播放，预合成并发上限 2。
+        # 单段走原路径（行为完全不变），多段走 _play_segments。
+        segments = segment_text(text)
+        print(
+            f"[voice] 📋 切句：{len(segments)} 段 "
+            + "|".join(
+                (s[:20] + "…") if len(s) > 20 else s
+                for s in segments
             )
-        except Exception as exc:  # noqa: BLE001 - 合成/播放失败降级文字，不静默不崩溃
-            self._emit(
-                f"🔇 语音播放失败，改文字回复（{getattr(exc, 'message', exc)}）"
+        )
+        if len(segments) <= 1:
+            # 单段或不切段：与改前行为完全一致（合成 → 播放 → 失败降级文字）。
+            print(
+                f"[voice] 🎀 小奈说：{text}"
+                + ("（含 [END] 结束语）" if end_marker else "")
             )
-            self._emit(text)
+            try:
+                result = await tts.synthesize(text)
+                await play_audio(
+                    result.audio,
+                    result.media_type,
+                    playback_params=self._playback_params,
+                )
+            except Exception as exc:  # noqa: BLE001 - 合成/播放失败降级文字，不静默不崩溃
+                self._emit(
+                    f"🔇 语音播放失败，改文字回复（{getattr(exc, 'message', exc)}）"
+                )
+                self._emit(text)
+        else:
+            await self._play_segments(segments)
+
         # 播完（或降级文字）后统一处理：含 [END] → 退出连续对讲；否则连续对讲
         # 模式下调度下一轮录音（防重入由 _schedule_next_listen 内部保证）。
         if end_marker:

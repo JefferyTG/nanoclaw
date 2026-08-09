@@ -130,16 +130,24 @@ class VoiceTTSReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(emitted, [])
 
     async def test_unlimited_chars_synthesizes_long_text(self):
-        """max_voice_chars ≤ 0 → 不截断，长文本仍走合成分支（播放 mock）。"""
+        """max_voice_chars <= 0 -> 不截断，长文本仍走合成分支（播放 mock）。
+
+        TASK-030：长文本现在分段合成+播放（首段 64、后续各 120 硬上限），
+        每段单独 synthesize -> play_audio，拼接还原原文，不 _emit 文字。
+        """
         tts = _FakeTTS(audio=b"long-audio", media_type="audio/wav")
         voice, emitted = self._make_channel(tts=tts, max_voice_chars=0)
         long_text = "很" * 500
         with patch("channels.voice.play_audio", new_callable=AsyncMock) as play:
             await voice.send(_outbound(long_text))
-        self.assertEqual(tts.synthesized, [long_text])
-        play.assert_awaited_once_with(
-            b"long-audio", "audio/wav", playback_params={}
-        )
+        # 分段合成：每段单独调 synthesize，拼接还原原文
+        self.assertTrue(len(tts.synthesized) > 1)
+        self.assertEqual("".join(tts.synthesized), long_text)
+        # 每段都播放了
+        self.assertEqual(play.await_count, len(tts.synthesized))
+        for call in play.call_args_list:
+            self.assertEqual(call.kwargs.get("playback_params"), {})
+        # 不 _emit 文字（全部合成+播放成功）
         self.assertEqual(emitted, [])
 
     async def test_empty_text_keeps_emit_semantics(self):
