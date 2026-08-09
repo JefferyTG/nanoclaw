@@ -31,6 +31,8 @@ identity_oldsis.md
 # 环境相关脚手架（含本机绝对路径，不可移植）
 deploy/
 scripts/
+# 但技能目录内的脚本属于技能资产，必须入库
+!skills/*/scripts/
 
 # 编辑器 / 系统
 .DS_Store
