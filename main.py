@@ -84,6 +84,7 @@ from bus.queue import MessageBus, OutboundMessage
 from gateway import Gateway
 from channels.cli import CLIChannel
 from channels.feishu import FeishuChannel
+from channels.voice import VoiceChannel
 from channels.weixin import WeixinChannel
 from channels.web import WebChannel
 from reminders.models import DeliveryResult
@@ -1496,6 +1497,18 @@ async def amain() -> None:
         print(f"（网页渠道：已启用·监听 http://{cfg.web_host}:{cfg.web_port}）")
     else:
         print("（网页渠道：未配置 web_port 或未启用）")
+
+    # 语音渠道：本地对讲机（TASK-024 无音频骨架）。默认关闭；启用后仅注册
+    # 空转渠道实例，inject_text() 为唯一入站口（TASK-025 接入录音/ASR 回调）。
+    voice_settings = cfg.voice if isinstance(cfg.voice, dict) else {}
+    if voice_settings.get("enabled", False):
+        voice_channel = VoiceChannel(bus)
+        voice_channel._clear_callback = clear_callback  # 复用同一清空回调
+        voice_channel._context_callback = context_callback  # /context 占用查询
+        channels.append(voice_channel)
+        print("（语音渠道：已启用·本地对讲机·无音频骨架）")
+    else:
+        print("（语音渠道：未启用）")
 
     if not channels:
         print("错误：没有任何启用渠道（CLI 需终端，网页/飞书/微信需显式配置），退出。")

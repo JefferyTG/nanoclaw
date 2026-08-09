@@ -90,6 +90,7 @@
 
 这些约定来自 `.workbuddy/memory/MEMORY.md` 和 2026-07-22 至 2026-07-26 的开发日志；原日志被 Git 忽略，因此本表是跨会话的正式摘录。
 
+| voice 本地语音渠道骨架（TASK-024 决策） | 有效 | 第五个渠道 voice（本地对讲机属性：短平快、无外部服务器依赖）。会话 key `voice:local:<seq>`（sender_id=`local:<seq>`，Gateway `f"{channel}:{sender_id}"` 推导，与 CLI 多会话同构）；`inject_text()` 为唯一程序化入站口（TASK-025 录音/ASR 回调接入点，命令 /new /switch /sessions /clear /context 语义与 CLI 一致），出站统一 `_emit` 单一出口（优先注入 `_reply_sink`，None 打印 `[voice]` 兜底，回调异常降级打印不抛，TASK-026 换 TTS 播放）；`start()` 空转等 stop 事件（TASK-025 换 KWS 监听循环）；config `voice.enabled` 默认关闭（避免影响现有渠道）；`voice` 未入 config 深度合并名单（TASK-025/026 扩展字段时需评估并入）；main.py 仅装配区注册（13 行）。验证：16 项专项测试 + 全量 576 过；遗留：真实 main.py 全实例启动未端到端验证（链路由测试体系覆盖）、无真实音频源（TASK-025 接入） |
 | sherpa-onnx KWS 版本锁定 1.12.40（TASK-023 决策） | 有效 | 本地语音唤醒 KWS（sherpa-onnx + sounddevice）技术栈验证通过（2026-08-09）：中文 3.3M 模型「小奈小奈」内置麦克风实测触发。**1.13.4 有 KWS 回归 bug（decode 零命中，test_wavs 全 miss、keywords_score 调大无效）→ 固定 1.12.40**；依赖 sherpa-onnx==1.12.40 + onnxruntime==1.24.4 + sounddevice + sentencepiece + pypinyin（`uv add` 管理）。macOS arm64 wheel 缺 onnxruntime dylib，需软链 `onnxruntime/capi/libonnxruntime.1.24.4.dylib` → `sherpa_onnx/lib/`（重建 venv 需重做，属环境补丁不入 lock）。KWS 喂入姿势：流式分块 0.1s 或离线一次性 + 0.66s tail padding + `input_finished()`，命中后 `reset_stream`。资源：RSS≈53MB、空闲 CPU 9~14%（可 int8+单线程优化）。遗留：长时间误触发未系统验证、蓝牙耳机输入未测、dylib 软链依赖 venv 路径。demo: `voice/kws/demo_kws.py`（未接入主链路，TASK-024 起做 voice 渠道） |
 ## 3. 演进时间线
 

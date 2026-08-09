@@ -16,6 +16,7 @@
 | 能力 | 状态 | 说明 |
 |---|---|---|
 | 多渠道 | ✅ | CLI / 飞书 WS / 微信 iLink(Node Bridge) / 网页 WS |
+| 本地语音渠道（骨架） | ✅ | `voice` 渠道：`voice:local:<seq>` 多会话分片，`inject_text()` 唯一程序化入站口（TASK-025 接录音/ASR），出站 `_emit` 单一出口（TASK-026 接 TTS 播放）；`config.voice.enabled` 开关默认关闭（TASK-024） |
 | 渠道感知 | ✅ | Agent 经 System Prompt 会话级快照感知渠道（feishu/weixin/web/cli）与用户标识（sender_id），会话内恒定，可做渠道专属行为；weixin 渠道含「微信日常对话模式」指令（短句口语碎碎念 / 甜度不变 / 连发消息自然接住，TASK-019） |
 | 微信深度集成 | ✅ | 扫码登录、图文收发、断线恢复、原生 typing、`/bind-reminders`、图片等待窗口合并 |
 | 微信语音转写 | ✅ | 语音经腾讯 STT 转写（`voice_item.text`）进入 Agent，不落地本地 ASR |
@@ -53,7 +54,7 @@
 | `gateway.py` | 入站调度、同会话锁/跨会话并发、出站/流事件路由、停止控制 | gateway.py |
 | `bus/queue.py` | 三队列消息总线 + DTO（Inbound/Outbound/Stream/ImageRef） | bus/queue.py |
 | `config.py` | 配置：默认值 < config.json < 环境变量，白名单读写 | config.py |
-| `channels/` | 渠道适配器（仅收发，不含业务） | base/cli/feishu/web/weixin.py |
+| `channels/` | 渠道适配器（仅收发，不含业务） | base/cli/feishu/web/weixin/voice.py |
 | `agent/loop.py` | AgentLoop：ReAct 循环、流式事件、持久化、取消补历史 | agent/loop.py |
 | `agent/tools/` | Tool 抽象、Registry、内置工具、MCP 包装 | registry.py、mcp.py、各工具 |
 | `agent/daily.py` | 每日记忆：/clear 摘要 append + 每日做梦整理（固定分类/去重/合并更新） | agent/daily.py |
@@ -123,6 +124,6 @@ Web 附加：AgentLoop 流事件 → Bus.stream → WebChannel → WebSocket（t
 
 > **唯一事实源是 git 本身**（`git log` / `git status` / `git diff`）。本段只留指针与稳定约定，**不复制任何瞬时状态**——hash 列表、领先/落后数量、未跟踪清单都会过期，一律不写，需要时直接查 git。
 
-- 当前里程碑：TASK-001~023 已完成并归档（任务卡见 `docs/tasks/completed/`）；active：TASK-024~026（voice 渠道系列，任务卡已建待开工）。
+- 当前里程碑：TASK-001~024 已完成并归档（任务卡见 `docs/tasks/completed/`）；active：TASK-025~026（voice 渠道系列续：唤醒录音 ASR 闭环 / 语音回复与空闲分片）。
 - 最新提交、分支、领先/落后、工作区状态：`git log` / `git status`。
 - 稳定约定：`kb-testset/`（个人知识库测试资产）已在 `.gitignore` 中不追踪；存在 codex 外部 worktree → 多会话并行开发时严格遵守 AGENTS.md 文件所有权规则。

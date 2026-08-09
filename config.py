@@ -100,6 +100,8 @@ _CONFIG_FIELDS = (
     "reminders",
     # 微信 iLink：Node Bridge、持久状态目录、显式访问控制和 IPC 生命周期参数。
     "weixin",
+    # 本地语音渠道：无音频骨架默认关闭，TASK-024。
+    "voice",
 )
 
 
@@ -283,6 +285,8 @@ class NanoClawConfig:
             "max_outbound_image_bytes": 20 * 1024 * 1024,
         }
     )
+    # 本地语音渠道：无音频骨架默认关闭（TASK-024）；TASK-025/026 将扩展字段。
+    voice: dict = field(default_factory=lambda: {"enabled": False})
 
 
 def load_config(config_path: str = "config.json") -> NanoClawConfig:
