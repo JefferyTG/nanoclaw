@@ -125,6 +125,21 @@ def _normalize_float(value, default: float) -> float:
     return v
 
 
+def _normalize_bool(value, default: bool) -> bool:
+    """参数归一化为布尔；None / 无法识别的值一律回退默认，保证不崩。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        low = value.strip().lower()
+        if low in ("1", "true", "yes", "on"):
+            return True
+        if low in ("0", "false", "no", "off"):
+            return False
+    return default
+
+
 class VoiceChannel(Channel):
     """本地语音渠道（name 固定为 "voice"，bus 由构造参数传入）。
 
@@ -137,6 +152,12 @@ class VoiceChannel(Channel):
     下一轮 VAD 录音监听；``[END]`` 结束语 / 静默超时退出回待唤醒。构造参数
     新增 ``record_delay_sec``（回复播完到开录的间隔）、``silence_timeout_sec``
     （静默退出阈值）与可选 ``vad_params``（传给 record_audio_vad 的覆盖参数）。
+
+    TASK-028 播放防炸麦：构造参数新增可选 ``playback_params``（传给
+    ``voice/kws/player.play_audio`` 的 DSP 覆盖参数，键名与
+    ``normalize_playback_pcm`` 一致：target_peak / max_gain_db / soft_clip）。
+    ``send()`` 与唤醒回应播放都把它透传给 ``play_audio``；渠道内按白名单
+    清洗（类型归一、非法回退默认），None / 非 dict 用 DSP 内置默认。
     """
 
     # 连续对讲结束语标记：模型回复带此标记 → 剥离后播告别语并退出连续对讲
@@ -160,6 +181,7 @@ class VoiceChannel(Channel):
         record_delay_sec: float = 0.5,
         silence_timeout_sec: float = 5.0,
         vad_params: dict | None = None,
+        playback_params: dict | None = None,
     ) -> None:
         super().__init__(name="voice", bus=bus)
         # 停止事件：start() 的监听/空转循环等待它，stop() 置位唤醒
@@ -203,6 +225,10 @@ class VoiceChannel(Channel):
         # vad_params：传给 record_audio_vad 的覆盖参数白名单（渠道级参数
         # max_duration_sec / device 由渠道统一传入，避免冲突）。
         self._vad_params = self._sanitize_vad_params(vad_params)
+        # playback_params：传给 play_audio 的播放 DSP 覆盖参数白名单
+        # （TASK-028 播放防炸麦，键名与 normalize_playback_pcm 一致；
+        # 渠道级参数由渠道统一传入，避免冲突）。None/非 dict → {}（DSP 默认）。
+        self._playback_params = self._sanitize_playback_params(playback_params)
 
         # 以下属性由 main.py 或测试注入，VoiceChannel 自身不依赖 Agent
         self._clear_callback = None   # 清空历史回调（/clear 命令调用）
@@ -250,6 +276,28 @@ class VoiceChannel(Channel):
             for key, value in vad_params.items()
             if key not in ("max_duration_sec", "device")
         }
+
+    @staticmethod
+    def _sanitize_playback_params(playback_params) -> dict:
+        """清洗 playback_params：只透传 normalize_playback_pcm 认识的三个键
+        （target_peak / max_gain_db / soft_clip），值做基本类型归一
+        （float / float / bool，非法回退默认），未知键丢弃；非 dict 输入返回
+        {}（DSP 用内置默认）。"""
+        if not isinstance(playback_params, dict):
+            return {}
+        out: dict = {}
+        tp = playback_params.get("target_peak")
+        if tp is not None:
+            tp = _normalize_float(tp, 0.89)
+            if tp > 0:  # 目标峰值必须为正（≤0 视为非法，回退默认不传）
+                out["target_peak"] = tp
+        mg = playback_params.get("max_gain_db")
+        if mg is not None:
+            out["max_gain_db"] = _normalize_float(mg, 0.0)
+        sc = playback_params.get("soft_clip")
+        if sc is not None:
+            out["soft_clip"] = _normalize_bool(sc, True)
+        return out
 
     @staticmethod
     def _strip_end_marker(text: str) -> tuple[str, bool]:
@@ -649,7 +697,11 @@ class VoiceChannel(Channel):
         try:
             text = random.choice(replies)
             result = await tts.synthesize(text)
-            await play_audio(result.audio, result.media_type)
+            await play_audio(
+                result.audio,
+                result.media_type,
+                playback_params=self._playback_params,
+            )
         except Exception as exc:  # noqa: BLE001 - 回应失败只降级，不阻塞唤醒
             self._emit(
                 f"🔇 回应播放失败，继续听你说（{getattr(exc, 'message', exc)}）"
@@ -722,7 +774,11 @@ class VoiceChannel(Channel):
             return
         try:
             result = await tts.synthesize(text)
-            await play_audio(result.audio, result.media_type)
+            await play_audio(
+                result.audio,
+                result.media_type,
+                playback_params=self._playback_params,
+            )
         except Exception as exc:  # noqa: BLE001 - 合成/播放失败降级文字，不静默不崩溃
             self._emit(
                 f"🔇 语音播放失败，改文字回复（{getattr(exc, 'message', exc)}）"

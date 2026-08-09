@@ -66,6 +66,7 @@ _VOICE_FIELDS = (
     "record_delay_sec",
     "silence_timeout_sec",
     "vad",
+    "playback",
 )
 _VOICE_KWS_FIELDS = (
     "model_dir",
@@ -85,6 +86,17 @@ _VOICE_VAD_FIELDS = (
     "silence_end_sec",
     "min_voice_sec",
     "block_sec",
+)
+
+
+# voice.playback 子字典白名单（TASK-028）：播放防炸麦 DSP 覆盖参数，键名与
+# voice/kws/normalize.py 的 normalize_playback_pcm 参数名一致
+# （target_peak 目标峰值比例 / max_gain_db 最大抬升增益 dB / soft_clip 软限幅
+# 开关）。未知字段丢弃（与 kws / vad 同模式）。
+_VOICE_PLAYBACK_FIELDS = (
+    "target_peak",
+    "max_gain_db",
+    "soft_clip",
 )
 
 
@@ -353,6 +365,17 @@ class NanoClawConfig:
             "min_voice_sec": 0.3,
             "block_sec": 0.05,
         },
+        # TASK-028 播放防炸麦：voice.playback.* 为播放前 DSP 覆盖参数（键名与
+        # voice/kws/normalize.py 的 normalize_playback_pcm 一致）。target_peak
+        # 为目标峰值相对 int16 满幅的比例（0.89 ≈ -1dBFS，给设备输出留余量防
+        # 削波）；max_gain_db 为允许的最大抬升增益（dB，默认 0 只压不抬——
+        # 低响度不放大，避免底噪被抬起来；>0 时低响度最多抬升该 dB 到目标）；
+        # soft_clip=True 启用 tanh 软限幅兜底（不硬削波、不刺耳）。
+        "playback": {
+            "target_peak": 0.89,
+            "max_gain_db": 0.0,
+            "soft_clip": True,
+        },
         "kws": {
             "model_dir": "voice/kws/models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01",
             "keywords_file": "",
@@ -425,6 +448,16 @@ def load_config(config_path: str = "config.json") -> NanoClawConfig:
                                 {name: vad_data[name] for name in _VOICE_VAD_FIELDS if name in vad_data}
                             )
                             merged["vad"] = vad
+                        # playback 子字典白名单合并（TASK-028）：与 vad 同模式——
+                        # 从默认 playback 重建，只接受 _VOICE_PLAYBACK_FIELDS 中
+                        # 的键，未知丢弃；voice_data 未含 playback 时保持默认不动。
+                        if isinstance(voice_data.get("playback"), dict):
+                            playback = dict((getattr(cfg, key) or {}).get("playback") or {})
+                            playback_data = voice_data["playback"]
+                            playback.update(
+                                {name: playback_data[name] for name in _VOICE_PLAYBACK_FIELDS if name in playback_data}
+                            )
+                            merged["playback"] = playback
                     else:
                         merged.update(data[key])
                     setattr(cfg, key, merged)
@@ -524,6 +557,12 @@ def save_config(cfg: NanoClawConfig, config_path: str = "config.json") -> None:
                 name: data["voice"]["vad"][name]
                 for name in _VOICE_VAD_FIELDS
                 if name in data["voice"]["vad"]
+            }
+        if isinstance(data["voice"].get("playback"), dict):
+            data["voice"]["playback"] = {
+                name: data["voice"]["playback"][name]
+                for name in _VOICE_PLAYBACK_FIELDS
+                if name in data["voice"]["playback"]
             }
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)

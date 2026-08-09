@@ -12,5 +12,8 @@
   解码为 24kHz 单声道 int16 PCM（TemporaryDirectory 即用即删、纯内存不落盘），
   ``sd.play`` + ``sd.wait`` 走 ``asyncio.to_thread``，**播完才返回**；输出/解码
   失败统一转 :class:`KwsError`。
+- ``normalize``：播放防炸麦 DSP（TASK-028）：int16 PCM 播放前音量归一化 + 软
+  限幅（峰值压回目标内、低响度只压不抬），由 ``player.play_audio`` 在
+  ``sd.play`` 前调用，纯 numpy 无新依赖。
 - ``errors``：KWS 专用可读错误类型。
 """

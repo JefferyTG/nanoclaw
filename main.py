@@ -1523,6 +1523,12 @@ async def amain() -> None:
             if isinstance(voice_settings.get("vad"), dict)
             else None
         )
+        # TASK-028 播放防炸麦参数：voice.playback 子字典键名即
+        # voice/kws/normalize.normalize_playback_pcm 的参数名
+        # （target_peak/max_gain_db/soft_clip），直接透传整个 playback dict，
+        # 渠道内部会按白名单清洗（类型归一、非法回退默认）；缺失 → 空 dict
+        # （DSP 用内置默认，只压不抬）。
+        voice_playback_cfg = voice_settings.get("playback") or {}
         asr_service = shared["asr_service"]  # 未配 asr_model 时为 None → 降级
         kws_detector = None
         kws_model_dir = Path(str(voice_kws_cfg.get("model_dir") or "").strip())
@@ -1608,6 +1614,9 @@ async def amain() -> None:
                 voice_settings.get("silence_timeout_sec", 5.0) or 5.0
             ),
             vad_params=voice_vad_cfg,
+            # TASK-028 播放防炸麦：透传 voice.playback（渠道内按白名单清洗，
+            # 空 dict → DSP 内置默认 target_peak=0.89 / 只压不抬 / soft_clip）。
+            playback_params=voice_playback_cfg,
             session_pruner=prune_voice_session,
         )
         voice_channel._clear_callback = clear_callback  # 复用同一清空回调

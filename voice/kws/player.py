@@ -9,6 +9,12 @@ PCM，再经 sounddevice 播放到输出设备；**播完才返回**，保证「
   事件循环；
 - 输出失败（``sd.PortAudioError``）与解码失败（ffmpeg）统一转
   :class:`KwsError`（含可读提示），由调用方降级为跳过回应继续录音。
+
+TASK-028 播放防炸麦：解码出 int16 PCM 后、``sd.play`` 前先过
+``voice/kws/normalize.normalize_playback_pcm`` 做音量归一化 + 限幅——
+把满幅/近满幅音频压回目标峰值（默认 0.89 ≈ -1dBFS）内，消除削波爆音；
+低响度音频默认只压不抬（不放大底噪）。参数经 ``playback_params`` 传入
+（键名与 normalize 关键字参数一致，None 用默认值），向后兼容既有调用。
 """
 
 from __future__ import annotations
@@ -21,6 +27,7 @@ import numpy as np
 import sounddevice as sd
 
 from voice.kws.errors import KwsError
+from voice.kws.normalize import normalize_playback_pcm
 
 # 统一播放采样率：甘雨音色原生 24k（dashscope_realtime 输出 audio/wav），
 # edge-tts（audio/mpeg）也统一重采样到 24k，保证保真与一致性（TASK-024 非
@@ -43,6 +50,13 @@ _MEDIA_TYPE_SUFFIX = {
 }
 
 _FFMPEG_DECODE_TIMEOUT_SEC = 30.0
+
+# 播放缓冲延迟（秒）：sounddevice 默认用设备 low latency（~12ms），在 KWS/
+# ASR/TTS 同机负载下容易缓冲区欠载（underrun）导致偶发「噼里啪啦」爆音
+# （TASK-028 实测：网页端正常、voice 播放噼啪 → 源音频没问题，问题在播放
+# 链路缓冲）。显式加大缓冲（0.15s）扛住 CPU 抖动；对讲机场景播完才继续，
+# 延迟无感。
+_PLAYBACK_LATENCY_SEC = 0.15
 
 
 async def _stop_process(process) -> None:
@@ -148,6 +162,7 @@ async def play_audio(
     media_type: str,
     sample_rate: int = DEFAULT_PLAYBACK_SAMPLE_RATE,
     device=None,
+    playback_params: dict | None = None,
 ) -> None:
     """把一段已合成音频解码后播放到输出设备，**播完才返回**。
 
@@ -155,7 +170,11 @@ async def play_audio(
     - ``media_type``：音频 MIME（如 ``audio/wav`` / ``audio/mpeg``），决定
       ffmpeg 输入文件扩展名；
     - ``sample_rate``：统一输出采样率（默认 24000，甘雨原生 24k 保真）；
-    - ``device``：sounddevice 输出设备索引；None 用系统默认输出设备。
+    - ``device``：sounddevice 输出设备索引；None 用系统默认输出设备；
+    - ``playback_params``：播放前 DSP 覆盖参数（键名与
+      ``voice/kws/normalize.normalize_playback_pcm`` 的关键字参数一致：
+      ``target_peak`` / ``max_gain_db`` / ``soft_clip``）；None（默认）用
+      DSP 内置默认（target_peak=0.89 只压不抬 + soft_clip=True）。
     - 播放失败抛 :class:`KwsError`（含可读提示），由调用方降级。
     """
     if int(sample_rate) <= 0:
@@ -171,9 +190,18 @@ async def play_audio(
         data = np.frombuffer(pcm, dtype="<i2")
         if data.size == 0:
             raise KwsError("audio_invalid", "回应音频解码为空。")
+        # TASK-028 播放防炸麦：解码出的 int16 PCM 在 sd.play 前先过
+        # 音量归一化 + 软限幅（满幅音频压回目标峰值内；低响度只压不抬，
+        # 不放大底噪）。normalize 返回原数组副本或新数组，sd.play 接受
+        # array_like，直接传即可。playback_params=None 用 DSP 默认值。
+        data = normalize_playback_pcm(data, **(playback_params or {}))
         try:
             await asyncio.to_thread(
-                sd.play, data, samplerate=int(sample_rate), device=device
+                sd.play,
+                data,
+                samplerate=int(sample_rate),
+                device=device,
+                latency=_PLAYBACK_LATENCY_SEC,
             )
             await asyncio.to_thread(sd.wait)
         except sd.PortAudioError as exc:

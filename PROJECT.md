@@ -16,7 +16,7 @@
 | 能力 | 状态 | 说明 |
 |---|---|---|
 | 多渠道 | ✅ | CLI / 飞书 WS / 微信 iLink(Node Bridge) / 网页 WS |
-| 本地语音渠道（唤醒+ASR 入站闭环） | ✅ | `voice` 渠道：`voice:local:<seq>` 多会话分片，`inject_text()` 唯一入站口，出站 `_emit` 单一出口；TASK-025 起唤醒闭环就绪——喊「小奈小奈」→ KWS 命中 → 播甘雨确认回应（`voice.wake_replies` 列表+random，默认「哎，我在呢，你说吧」，方案 B 播完再录音）→ 自动录音 N 秒 → ASR 转写 → 进 Agent 对话，音频内存流转不落盘，KWS 模型或 ASR 缺失自动降级为仅 `inject_text`（TASK-025）；TASK-026 接 Agent 回复 TTS 播放；`config.voice.enabled` 默认关闭（TASK-024）；TASK-026 起出站升级为「Agent 回复 → 甘雨 TTS → 播放到系统默认输出」（失败/超长 `voice.max_voice_chars`=300/未配置回文字不静默），并支持空闲自动分片（`voice.idle_ttl_sec` 默认 1800s，超时自动开新会话 seq+1 旧会话保留）+ 会话保留上限（`voice.max_sessions` 默认 50，超限清最老 voice 会话，仅本渠道）。TASK-027 起升级「连续对讲机」：回复播完等 `voice.record_delay_sec`(默认 0.5s) 自动续听下一句（不用每次喊唤醒词）+ 静音检测（`voice.vad.*`：RMS 能量流式 VAD，说完话停顿 `silence_end_sec` 1.2s 提前结束录音不等满 8s）+ 静默退出（`voice.silence_timeout_sec`=5s 没人声自动回待唤醒）+ [END] 结束语退出（voice Prompt 约定告别/结束话题时回复末尾带 [END]，渠道 TTS 合成前剥离标记、播完告别语即退出连续对话）+ voice 渠道专属 Prompt（简短俏皮口语化，知识类问题可适当多讲）；连续对讲进行中不触发空闲分片（`_maybe_split_session` 短路），退出后分片逻辑照旧 |
+| 本地语音渠道（唤醒+ASR 入站闭环） | ✅ | `voice` 渠道：`voice:local:<seq>` 多会话分片，`inject_text()` 唯一入站口，出站 `_emit` 单一出口；TASK-025 起唤醒闭环就绪——喊「小奈小奈」→ KWS 命中 → 播甘雨确认回应（`voice.wake_replies` 列表+random，默认「哎，我在呢，你说吧」，方案 B 播完再录音）→ 自动录音 N 秒 → ASR 转写 → 进 Agent 对话，音频内存流转不落盘，KWS 模型或 ASR 缺失自动降级为仅 `inject_text`（TASK-025）；TASK-026 接 Agent 回复 TTS 播放；`config.voice.enabled` 默认关闭（TASK-024）；TASK-026 起出站升级为「Agent 回复 → 甘雨 TTS → 播放到系统默认输出」（失败/超长 `voice.max_voice_chars`=300/未配置回文字不静默），并支持空闲自动分片（`voice.idle_ttl_sec` 默认 1800s，超时自动开新会话 seq+1 旧会话保留）+ 会话保留上限（`voice.max_sessions` 默认 50，超限清最老 voice 会话，仅本渠道）。TASK-027 起升级「连续对讲机」：回复播完等 `voice.record_delay_sec`(默认 0.5s) 自动续听下一句（不用每次喊唤醒词）+ 静音检测（`voice.vad.*`：RMS 能量流式 VAD，说完话停顿 `silence_end_sec` 1.2s 提前结束录音不等满 8s）+ 静默退出（`voice.silence_timeout_sec`=5s 没人声自动回待唤醒）+ [END] 结束语退出（voice Prompt 约定告别/结束话题时回复末尾带 [END]，渠道 TTS 合成前剥离标记、播完告别语即退出连续对话）+ voice 渠道专属 Prompt（简短俏皮口语化，知识类问题可适当多讲）；连续对讲进行中不触发空闲分片（`_maybe_split_session` 短路），退出后分片逻辑照旧。TASK-028 起播放防炸麦：`player.py` 在 `sd.play` 前过 DSP（`voice/kws/normalize.py` `normalize_playback_pcm`：峰值归一化 + tanh 软限幅，满幅音频压回 `voice.playback.target_peak` 默认 0.89≈-1dBFS，`max_gain_db=0` 只压不抬不炸底噪，`soft_clip=True` 软限幅兜底；int32 安全 abs 规避 -32768 回绕误判静音）；`sd.play` 显式 `latency=0.15` 抗缓冲区欠载（underrun）偶发噼啪（乖宝实测修复：网页端正常、voice 噼啪 → 播放缓冲问题）；`voice.playback.*` 经 config 可配（白名单+深度合并，旧配置回退默认） |
 | 渠道感知 | ✅ | Agent 经 System Prompt 会话级快照感知渠道（feishu/weixin/web/cli）与用户标识（sender_id），会话内恒定，可做渠道专属行为；weixin 渠道含「微信日常对话模式」指令（短句口语碎碎念 / 甜度不变 / 连发消息自然接住，TASK-019） |
 | 微信深度集成 | ✅ | 扫码登录、图文收发、断线恢复、原生 typing、`/bind-reminders`、图片等待窗口合并 |
 | 微信语音转写 | ✅ | 语音经腾讯 STT 转写（`voice_item.text`）进入 Agent，不落地本地 ASR |
@@ -124,6 +124,6 @@ Web 附加：AgentLoop 流事件 → Bus.stream → WebChannel → WebSocket（t
 
 > **唯一事实源是 git 本身**（`git log` / `git status` / `git diff`）。本段只留指针与稳定约定，**不复制任何瞬时状态**——hash 列表、领先/落后数量、未跟踪清单都会过期，一律不写，需要时直接查 git。
 
-- 当前里程碑：TASK-001~027 已完成并归档（任务卡见 `docs/tasks/completed/`）；active：无；TASK-028（播放防炸麦：音量归一化/限幅）已规划待建卡——2026-08-09 乖宝验收拆分。
+- 当前里程碑：TASK-001~028 已完成并归档（任务卡见 `docs/tasks/completed/`）；active：无；TASK-029（TTS 流式播放，豆包级体验一期）已规划待建卡——2026-08-09 乖宝提出目标。
 - 最新提交、分支、领先/落后、工作区状态：`git log` / `git status`。
 - 稳定约定：`kb-testset/`（个人知识库测试资产）已在 `.gitignore` 中不追踪；存在 codex 外部 worktree → 多会话并行开发时严格遵守 AGENTS.md 文件所有权规则。

@@ -73,7 +73,9 @@ class VoiceTTSReplyTests(unittest.IsolatedAsyncioTestCase):
         with patch("channels.voice.play_audio", new_callable=AsyncMock) as play:
             await voice.send(_outbound("你好"))
         self.assertEqual(tts.synthesized, ["你好"])
-        play.assert_awaited_once_with(b"RIFF....", "audio/wav")
+        play.assert_awaited_once_with(
+            b"RIFF....", "audio/wav", playback_params={}
+        )
         self.assertEqual(emitted, [])
 
     async def test_synthesize_failure_degrades_to_text(self):
@@ -99,7 +101,9 @@ class VoiceTTSReplyTests(unittest.IsolatedAsyncioTestCase):
         ) as play:
             await voice.send(_outbound("回复文字"))
         self.assertEqual(tts.synthesized, ["回复文字"])
-        play.assert_awaited_once_with(b"audio", "audio/wav")
+        play.assert_awaited_once_with(
+            b"audio", "audio/wav", playback_params={}
+        )
         self.assertEqual(len(emitted), 2)
         self.assertIn("🔇 语音播放失败", emitted[0])
         self.assertEqual(emitted[1], "回复文字")
@@ -133,7 +137,9 @@ class VoiceTTSReplyTests(unittest.IsolatedAsyncioTestCase):
         with patch("channels.voice.play_audio", new_callable=AsyncMock) as play:
             await voice.send(_outbound(long_text))
         self.assertEqual(tts.synthesized, [long_text])
-        play.assert_awaited_once_with(b"long-audio", "audio/wav")
+        play.assert_awaited_once_with(
+            b"long-audio", "audio/wav", playback_params={}
+        )
         self.assertEqual(emitted, [])
 
     async def test_empty_text_keeps_emit_semantics(self):

@@ -180,7 +180,9 @@ class VoiceContinuousTests(unittest.IsolatedAsyncioTestCase):
         ) as mock_play:
             await channel.send(_outbound("拜拜啦，下次聊 [END]"))
         self.assertEqual(tts.synthesized, ["拜拜啦，下次聊"])  # 剥离标记后合成
-        mock_play.assert_awaited_once_with(b"audio", "audio/wav")
+        mock_play.assert_awaited_once_with(
+            b"audio", "audio/wav", playback_params={}
+        )
         self.assertFalse(channel._continuous)  # 播完退出连续对讲回待唤醒
         self.assertEqual(mock_vad.await_count, 0)  # 不再触发下一轮录音
         self.assertEqual(emitted, [])  # 音频路径不 _emit 文字
