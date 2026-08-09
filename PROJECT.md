@@ -16,7 +16,7 @@
 | 能力 | 状态 | 说明 |
 |---|---|---|
 | 多渠道 | ✅ | CLI / 飞书 WS / 微信 iLink(Node Bridge) / 网页 WS |
-| 本地语音渠道（唤醒+ASR 入站闭环） | ✅ | `voice` 渠道：`voice:local:<seq>` 多会话分片，`inject_text()` 唯一入站口，出站 `_emit` 单一出口；TASK-025 起唤醒闭环就绪——喊「小奈小奈」→ KWS 命中 → 播甘雨确认回应（`voice.wake_replies` 列表+random，默认「哎，我在呢，你说吧」，方案 B 播完再录音）→ 自动录音 N 秒 → ASR 转写 → 进 Agent 对话，音频内存流转不落盘，KWS 模型或 ASR 缺失自动降级为仅 `inject_text`（TASK-025）；TASK-026 接 Agent 回复 TTS 播放；`config.voice.enabled` 默认关闭（TASK-024） |
+| 本地语音渠道（唤醒+ASR 入站闭环） | ✅ | `voice` 渠道：`voice:local:<seq>` 多会话分片，`inject_text()` 唯一入站口，出站 `_emit` 单一出口；TASK-025 起唤醒闭环就绪——喊「小奈小奈」→ KWS 命中 → 播甘雨确认回应（`voice.wake_replies` 列表+random，默认「哎，我在呢，你说吧」，方案 B 播完再录音）→ 自动录音 N 秒 → ASR 转写 → 进 Agent 对话，音频内存流转不落盘，KWS 模型或 ASR 缺失自动降级为仅 `inject_text`（TASK-025）；TASK-026 接 Agent 回复 TTS 播放；`config.voice.enabled` 默认关闭（TASK-024）；TASK-026 起出站升级为「Agent 回复 → 甘雨 TTS → 播放到系统默认输出」（失败/超长 `voice.max_voice_chars`=300/未配置回文字不静默），并支持空闲自动分片（`voice.idle_ttl_sec` 默认 1800s，超时自动开新会话 seq+1 旧会话保留）+ 会话保留上限（`voice.max_sessions` 默认 50，超限清最老 voice 会话，仅本渠道） |
 | 渠道感知 | ✅ | Agent 经 System Prompt 会话级快照感知渠道（feishu/weixin/web/cli）与用户标识（sender_id），会话内恒定，可做渠道专属行为；weixin 渠道含「微信日常对话模式」指令（短句口语碎碎念 / 甜度不变 / 连发消息自然接住，TASK-019） |
 | 微信深度集成 | ✅ | 扫码登录、图文收发、断线恢复、原生 typing、`/bind-reminders`、图片等待窗口合并 |
 | 微信语音转写 | ✅ | 语音经腾讯 STT 转写（`voice_item.text`）进入 Agent，不落地本地 ASR |
@@ -124,6 +124,6 @@ Web 附加：AgentLoop 流事件 → Bus.stream → WebChannel → WebSocket（t
 
 > **唯一事实源是 git 本身**（`git log` / `git status` / `git diff`）。本段只留指针与稳定约定，**不复制任何瞬时状态**——hash 列表、领先/落后数量、未跟踪清单都会过期，一律不写，需要时直接查 git。
 
-- 当前里程碑：TASK-001~025 已完成并归档（任务卡见 `docs/tasks/completed/`）；active：TASK-026（语音回复与空闲分片）。
+- 当前里程碑：TASK-001~026 已完成并归档（任务卡见 `docs/tasks/completed/`）；已规划待建卡：TASK-027（连续对讲：回复播完自动续听）/ TASK-028（播放防炸麦：音量归一化/限幅）——2026-08-09 乖宝验收拆分。
 - 最新提交、分支、领先/落后、工作区状态：`git log` / `git status`。
 - 稳定约定：`kb-testset/`（个人知识库测试资产）已在 `.gitignore` 中不追踪；存在 codex 外部 worktree → 多会话并行开发时严格遵守 AGENTS.md 文件所有权规则。

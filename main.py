@@ -1548,6 +1548,28 @@ async def amain() -> None:
         ):
             voice_wake_replies = None
 
+        def prune_voice_session(seq: int) -> None:
+            """清理 voice 渠道第 seq 个会话的全部落盘（TASK-026 保留上限）。
+
+            复用会话清空的统一能力：``SessionManager.clear`` 删 JSONL + meta
+            侧车、``ImageStore.clear`` 删 ``_images`` 目录、``VideoStore.clear``
+            删 ``_videos`` 目录——与 ``clear_callback`` / 定时任务清空同一套
+            删除逻辑，避免重复手写路径。只清 voice 渠道
+            （``voice_local_<seq>``）会话，绝不动其他渠道；文件/目录不存在时
+            各 clear 本身静默忽略；任一步删除失败只打印警告，不阻断分片/新建
+            流程。
+            """
+            session_key = f"voice_local_{seq}"
+            for label, clear in (
+                ("会话历史", shared["session_manager"].clear),
+                ("图片目录", shared["image_store"].clear),
+                ("视频目录", shared["video_store"].clear),
+            ):
+                try:
+                    clear(session_key)
+                except OSError as exc:  # noqa: BLE001 - 删除失败不阻断
+                    print(f"[voice] 清理{label}失败（{session_key}）：{exc}")
+
         voice_channel = VoiceChannel(
             bus,
             kws_detector=kws_detector,
@@ -1556,6 +1578,18 @@ async def amain() -> None:
             kws_device=voice_kws_cfg.get("device"),
             tts_service=shared["tts_service"],
             wake_replies=voice_wake_replies,
+            max_voice_chars=int(
+                voice_settings.get("max_voice_chars", 300) or 300
+            ),
+            # TASK-026 空闲自动分片 + 会话保留上限（默认 30 分钟 / 50 段，
+            # 与 config.py 默认一致；≤0 分别表示禁用/不限制）。
+            idle_ttl_sec=float(
+                voice_settings.get("idle_ttl_sec", 1800) or 1800
+            ),
+            max_sessions=int(
+                voice_settings.get("max_sessions", 50) or 50
+            ),
+            session_pruner=prune_voice_session,
         )
         voice_channel._clear_callback = clear_callback  # 复用同一清空回调
         voice_channel._context_callback = context_callback  # /context 占用查询

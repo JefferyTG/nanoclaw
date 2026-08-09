@@ -52,12 +52,16 @@ _WEIXIN_FIELDS = (
     "max_outbound_image_bytes",
 )
 # 本地语音渠道（TASK-025 起）白名单：旧 config.json 只有 voice.enabled 时保留，
-# 新字段（record_sec / kws.*）按默认补全；未知字段丢弃（与 weixin 同模式）。
+# 新字段（record_sec / kws.* / wake_replies / idle_ttl_sec / max_sessions /
+# max_voice_chars）按默认补全；未知字段丢弃（与 weixin 同模式）。
 _VOICE_FIELDS = (
     "enabled",
     "record_sec",
     "kws",
     "wake_replies",
+    "idle_ttl_sec",
+    "max_sessions",
+    "max_voice_chars",
 )
 _VOICE_KWS_FIELDS = (
     "model_dir",
@@ -308,11 +312,19 @@ class NanoClawConfig:
     # 已下载模型目录，keywords_file 空则默认 <model_dir>/keywords_xiaonai.txt，
     # device=None 用系统默认输入）；wake_replies 为唤醒确认回应文本列表
     # （TASK-025 方案 B：唤醒后先合成并播放甘雨回应、播完再录音，列表 +
-    # random.choice，加条目即自动随机）。修改后需重启实例。
+    # random.choice，加条目即自动随机）。TASK-026 起：idle_ttl_sec 为 voice
+    # 渠道空闲自动分片阈值（秒，默认 30 分钟，超时后下一条入站消息自动开新
+    # 会话、旧会话保留）；max_sessions 为 voice 会话保留上限（默认 50，超出
+    # 清理最老 voice 会话，仅 voice 渠道）；max_voice_chars 为 Agent 回复
+    # TTS 播放文本上限（默认 300，超长直接回文字不合成播放；≤0 不截断）。
+    # 修改后需重启实例。
     voice: dict = field(default_factory=lambda: {
         "enabled": False,
         "record_sec": 8.0,
         "wake_replies": ["哎，我在呢，你说吧"],
+        "idle_ttl_sec": 1800,
+        "max_sessions": 50,
+        "max_voice_chars": 300,
         "kws": {
             "model_dir": "voice/kws/models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01",
             "keywords_file": "",
