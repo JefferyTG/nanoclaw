@@ -40,7 +40,7 @@ class FakeClock:
 
 
 class _ErrorProvider:
-    async def chat(self, messages, tools=None, model=None):
+    async def chat(self, messages, tools=None, model=None, **kwargs):
         raise RuntimeError("boom")
 
 
@@ -50,7 +50,7 @@ class _DreamProvider:
             {"会话总结": ["8-9 已整理"]}, ensure_ascii=False
         )
 
-    async def chat(self, messages, tools=None, model=None):
+    async def chat(self, messages, tools=None, model=None, **kwargs):
         return LLMResponse(self.content)
 
 
@@ -236,7 +236,7 @@ class DreamRetryPipelineTests(unittest.IsolatedAsyncioTestCase):
                 def __init__(self):
                     self.calls = 0
 
-                async def chat(self, messages, tools=None, model=None):
+                async def chat(self, messages, tools=None, model=None, **kwargs):
                     self.calls += 1
                     if self.calls == 1:
                         raise RuntimeError("boom")
@@ -285,7 +285,7 @@ class DreamRetryPipelineTests(unittest.IsolatedAsyncioTestCase):
                 def __init__(self):
                     self.calls = 0
 
-                async def chat(self, messages, tools=None, model=None):
+                async def chat(self, messages, tools=None, model=None, **kwargs):
                     self.calls += 1
                     if self.calls == 1:
                         raise RuntimeError("boom")

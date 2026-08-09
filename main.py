@@ -928,7 +928,7 @@ def build_shared() -> dict:
         sys.exit(1)
 
     # 2) 创建模型 Provider（OpenAI 兼容，默认硅基流动）
-    provider = OpenAICompatProvider(config.api_key, config.base_url, config.model)
+    provider = OpenAICompatProvider(config.api_key, config.base_url, config.model, reasoning_effort=getattr(config, "reasoning_effort", "high"), thinking_budget=getattr(config, "thinking_budget", None))
     asr_service = build_asr_service(config)
     tts_service = build_tts_service(config)
 
@@ -1064,7 +1064,9 @@ def build_shared() -> dict:
     # MCP 工具稍后仍会注入同一个 registry，因此执行时同样可被校验和选用。
     def provider_factory(model=None):
         return OpenAICompatProvider(
-            config.api_key, config.base_url, model or config.model
+            config.api_key, config.base_url, model or config.model,
+            reasoning_effort=getattr(config, "reasoning_effort", "high"),
+            thinking_budget=getattr(config, "thinking_budget", None),
         )
 
     tools.register(
@@ -1128,7 +1130,7 @@ def make_agent_factory(shared: dict, registry: dict) -> callable:
 
     def factory(session_key: str) -> AgentLoop:
         cfg = shared["config"]
-        provider = OpenAICompatProvider(cfg.api_key, cfg.base_url, cfg.model)
+        provider = OpenAICompatProvider(cfg.api_key, cfg.base_url, cfg.model, reasoning_effort=getattr(cfg, "reasoning_effort", "high"), thinking_budget=getattr(cfg, "thinking_budget", None))
         # session_key 由 Gateway 构造为 f"{channel}:{sender_id}"（渠道+用户）。
         # 只用 split(":", 1) 切第一刀，防止 sender_id 本身含冒号（如微信
         # target 可逆编码）导致裂解；解析结果注入 ContextBuilder 作为

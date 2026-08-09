@@ -60,7 +60,7 @@ class _BlockingProvider(LLMProvider):
     def __init__(self):
         self.entered = asyncio.Event()
 
-    async def chat(self, messages, tools=None, model=None):
+    async def chat(self, messages, tools=None, model=None, reasoning_effort=None, thinking_budget=None):
         self.entered.set()
         await asyncio.Event().wait()
         raise AssertionError("任务已取消后不应继续执行")

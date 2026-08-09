@@ -166,7 +166,7 @@ class _SimpleProvider(LLMProvider):
     def __init__(self):
         self.requests = []
 
-    async def chat(self, messages, tools=None, model=None):
+    async def chat(self, messages, tools=None, model=None, **kwargs):
         self.requests.append(messages)
         return LLMResponse("最终回复")
 

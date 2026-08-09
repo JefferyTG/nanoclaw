@@ -17,7 +17,7 @@ class _ScriptedProvider(LLMProvider):
     def __init__(self, responses):
         self.responses = list(responses)
 
-    async def chat(self, messages, tools=None, model=None):
+    async def chat(self, messages, tools=None, model=None, **kwargs):
         return self.responses.pop(0)
 
 
@@ -270,7 +270,7 @@ class SubagentStreamTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_agent_loop_marks_model_timeout_and_iteration_limit(self):
         class _SlowProvider(LLMProvider):
-            async def chat(self, messages, tools=None, model=None):
+            async def chat(self, messages, tools=None, model=None, **kwargs):
                 await asyncio.sleep(0.05)
                 return LLMResponse("too late")
 

@@ -90,6 +90,8 @@ class LLMProvider(ABC):
         messages: List[Dict],
         tools: Optional[List[Dict]] = None,
         model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+        thinking_budget: Optional[int] = None,
     ) -> LLMResponse:
         """发起一次对话并返回统一结构的响应。
 
@@ -99,6 +101,8 @@ class LLMProvider(ABC):
             tools: 可选，OpenAI function-calling 格式的工具定义列表，
                 由 ``Tool.to_function_definition()`` 产出后透传。
             model: 可选，指定使用的模型名；未指定时由 Provider 决定默认模型。
+            reasoning_effort: 可选，思考强度（none / minimal / low / medium / high / xhigh / max）。
+            thinking_budget: 可选，思考 token 预算（整数）。
 
         返回：
             ``LLMResponse``：统一封装的文本内容与工具调用。
@@ -110,6 +114,8 @@ class LLMProvider(ABC):
         messages: List[Dict],
         tools: Optional[List[Dict]] = None,
         model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+        thinking_budget: Optional[int] = None,
     ):
         """流式对话（可选能力）。
 
@@ -123,8 +129,15 @@ class LLMProvider(ABC):
         最后 yield ``{"type": "done", "response": <完整 LLMResponse>}``。
 
         yield 的事件字典约定见 ``bus.queue.StreamEvent``。
+
+        参数：
+            messages: 对话历史。
+            tools: 可选，工具定义列表。
+            model: 可选，指定模型名。
+            reasoning_effort: 可选，思考强度。
+            thinking_budget: 可选，思考 token 预算。
         """
-        resp = await self.chat(messages, tools, model)
+        resp = await self.chat(messages, tools=tools, model=model, reasoning_effort=reasoning_effort, thinking_budget=thinking_budget)
         if resp.reasoning_content:
             yield {"type": "reasoning", "content": resp.reasoning_content}
         if resp.content:

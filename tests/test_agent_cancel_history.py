@@ -43,7 +43,7 @@ class _BlockingProvider(LLMProvider):
     def __init__(self):
         self.entered = asyncio.Event()
 
-    async def chat(self, messages, tools=None, model=None):
+    async def chat(self, messages, tools=None, model=None, reasoning_effort=None, thinking_budget=None):
         self.entered.set()
         await asyncio.Event().wait()
         raise AssertionError("任务已取消后不应继续执行")
@@ -62,7 +62,7 @@ class _BlockThenRespondProvider(LLMProvider):
         self.calls = 0
         self.entered = asyncio.Event()
 
-    async def chat(self, messages, tools=None, model=None):
+    async def chat(self, messages, tools=None, model=None, reasoning_effort=None, thinking_budget=None):
         self.calls += 1
         self.requests.append(deepcopy(messages))
         if self.calls == 1:
@@ -77,10 +77,10 @@ class _PartialStreamProvider(LLMProvider):
     def __init__(self):
         self.entered = asyncio.Event()
 
-    async def chat(self, messages, tools=None, model=None):
+    async def chat(self, messages, tools=None, model=None, reasoning_effort=None, thinking_budget=None):
         raise AssertionError("流式路径不应调用 chat()")
 
-    async def chat_stream(self, messages, tools=None, model=None):
+    async def chat_stream(self, messages, tools=None, model=None, reasoning_effort=None, thinking_budget=None):
         yield {"type": "token", "content": "部分"}
         yield {"type": "token", "content": "回答"}
         self.entered.set()
@@ -108,7 +108,7 @@ class _ScriptedProvider(LLMProvider):
     def __init__(self, responses):
         self.responses = list(responses)
 
-    async def chat(self, messages, tools=None, model=None):
+    async def chat(self, messages, tools=None, model=None, reasoning_effort=None, thinking_budget=None):
         return self.responses.pop(0)
 
 

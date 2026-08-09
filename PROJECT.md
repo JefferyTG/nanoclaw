@@ -25,6 +25,7 @@
 | 语音输入 ASR | ✅ | OpenAI-compatible，FFmpeg 归一化；Web 录音即时转写 + 飞书语音入站自动转写（TASK-020，`asr_model` 配置启用） |
 | 飞书语音对语音 | ✅ | 语音入站→本次出站回语音气泡（TTS 甘雨合成 → ffmpeg 转 OPUS → `CreateFileRequest` 上传 → `msg_type=audio` 发送）；文字入站回文字；TTS/转换/上传/发送失败自动回文字原文不静默，超 `max_voice_chars`（默认 300）只发文字，音频全程内存/临时目录即用即删不落盘（TASK-021） |
 | 语音朗读 TTS | ✅ | edge-tts 分句流水线（默认）或 DashScope 甘雨音色流式 TTS（`provider=dashscope_realtime`，QwenTtsRealtime WebSocket 流式合成 WAV，支持录音复刻换音色 `create_voice_by_clone`，支持情绪指令 `instructions`（可爱基调，TASK-018）），可取消，默认关（`tts_model` 配置启用） |
+| 思考强度参数 | ✅ | `reasoning_effort`（默认 `"high"`，枚举值 none/minimal/low/medium/high/xhigh/max）和 `thinking_budget`（可选整数）通过 `config.json` 配置，透传至 `chat/completions` 请求；空字符串 `""` 不传 `reasoning_effort`（兼容无思考模型）（TASK-031） |
 | ReAct 工具循环 | ✅ | `max_iterations`、`turn_timeout_sec` 墙钟、重复工具防爆、180s 工具兜底 / Shell 60s |
 | 内置工具 | ✅ | 26 个（含 AskImage 条件注册）+ MCP 扩展（`{server}__{tool}`） |
 | 网络搜索/抓取 | ✅ | `web_search`：Tavily 主通道（结构化正文，中文友好）+ DuckDuckGo 降级兜底；`web_fetch`：httpx 静态 → Jina Reader → 本机 Chrome 无头渲染 → Tavily Extract 四级降级链，解决 JS 动态页/反爬/iframe（TASK-016） |
@@ -87,12 +88,14 @@
 
 - 优先级：代码默认值 < `config.json` < 对应环境变量。
 - Web 配置页热更新**只对新会话生效**；MCP/workspace/技能/工具注册等启动期对象需重启。
-- `base_model_multimodal`、`timezone`、`asr_model`、`tts_model`、`reminders`、`weixin`、`context_budget_tokens`、`dream_time` 均属启动期配置，修改后需重启。
+- `base_model_multimodal`、`timezone`、`asr_model`、`tts_model`、`reminders`、`weixin`、`context_budget_tokens`、`dream_time`、`reasoning_effort`、`thinking_budget` 均属启动期配置，修改后需重启。
 - `context_budget_tokens`：ContextCompactor 压缩阈值（默认 524288=512k），旧配置缺字段回退默认值不报错；`/context` 命令与 Web 进度条展示当前会话占用。
 - `dream_time`：每日做梦整理时刻（"HH:MM"，默认 "02:00"），旧配置缺字段回退默认值不报错。
+- `reasoning_effort`：思考强度，枚举值 `none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`；默认 `"high"`；空字符串 `""` 不传该参数。
+- `thinking_budget`：思考 token 预算（整数，可选）；默认 `null` 不传。
 - 敏感字段（weixin 状态、API Key 等）不进 `config.json` 或受白名单过滤。
 
-## 消息流转（简述）
+## 消息流转
 
 ```
 Channel(start) → Bus.inbound → Gateway(会话锁) → AgentLoop.run
@@ -124,6 +127,6 @@ Web 附加：AgentLoop 流事件 → Bus.stream → WebChannel → WebSocket（t
 
 > **唯一事实源是 git 本身**（`git log` / `git status` / `git diff`）。本段只留指针与稳定约定，**不复制任何瞬时状态**——hash 列表、领先/落后数量、未跟踪清单都会过期，一律不写，需要时直接查 git。
 
-- 当前里程碑：TASK-001~028 已完成并归档（任务卡见 `docs/tasks/completed/`）；active：无；TASK-029（TTS 流式播放，豆包级体验一期）已规划待建卡——2026-08-09 乖宝提出目标。
+- 当前里程碑：TASK-001~031 已完成并归档（任务卡见 `docs/tasks/completed/`）；active：无；TASK-029（TTS 流式播放，豆包级体验一期）已规划待建卡——2026-08-09 乖宝提出目标。
 - 最新提交、分支、领先/落后、工作区状态：`git log` / `git status`。
 - 稳定约定：`kb-testset/`（个人知识库测试资产）已在 `.gitignore` 中不追踪；存在 codex 外部 worktree → 多会话并行开发时严格遵守 AGENTS.md 文件所有权规则。

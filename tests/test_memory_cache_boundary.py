@@ -18,13 +18,13 @@ class _SummaryProvider:
     def __init__(self):
         self.requests = []
 
-    async def chat(self, messages, tools=None, model=None):
+    async def chat(self, messages, tools=None, model=None, **kwargs):
         self.requests.append(messages)
         return LLMResponse("stable summary")
 
 
 class _FailingSummaryProvider:
-    async def chat(self, messages, tools=None, model=None):
+    async def chat(self, messages, tools=None, model=None, **kwargs):
         return LLMResponse(None, finish_reason="error")
 
 

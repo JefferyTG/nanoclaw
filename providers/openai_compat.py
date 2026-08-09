@@ -24,6 +24,13 @@
    对于会自行恢复的瞬时错误（5xx / 429 限流 / 连接超时），会做最多 3 次
    指数退避重试（1s / 2s / 4s）；401 / 400 / 404 等不可恢复错误直接失败，
    不做无谓重试。
+
+4. reasoning_effort / thinking_budget 参数传递
+   在 ``__init__`` 中接收 ``reasoning_effort`` 和 ``thinking_budget`` 并保存为
+   实例属性。``chat()`` 和 ``chat_stream()`` 的 ``request_kwargs`` 中条件性地
+   加入这两个参数：
+   - ``reasoning_effort`` 默认为 "high"；只有显式配成空字符串 ``""`` 时才不传。
+   - ``thinking_budget`` 默认为 None（不传）；只有配了具体整数才传。
 """
 
 import asyncio
@@ -71,17 +78,47 @@ class OpenAICompatProvider(LLMProvider):
             model="deepseek-ai/DeepSeek-V3",
         )
         resp = await provider.chat(messages, tools=registry.get_definitions())
+
+    参数：
+        api_key: API 密钥。
+        base_url: OpenAI 兼容接口的 base_url。
+        model: 默认模型名。
+        reasoning_effort: 思考强度（none / minimal / low / medium / high / xhigh / max）。
+            默认 "high"；显式传空字符串 "" 时不传该参数。
+        thinking_budget: 思考 token 预算（整数）。默认 None 不传。
     """
 
-    def __init__(self, api_key: str, base_url: str, model: str):
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str,
+        model: str,
+        reasoning_effort: Optional[str] = "high",
+        thinking_budget: Optional[int] = None,
+    ):
         self.model = model
+        self.reasoning_effort = reasoning_effort
+        self.thinking_budget = thinking_budget
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+
+    def _add_reasoning_params(self, kwargs: Dict) -> None:
+        """条件性地向 request_kwargs 添加 reasoning_effort 和 thinking_budget。
+
+        - reasoning_effort 默认为 "high"；只有显式配成空字符串 "" 时才不传。
+        - thinking_budget 默认 None（不传）；只有配了具体整数才传。
+        """
+        if self.reasoning_effort and self.reasoning_effort.strip():
+            kwargs["reasoning_effort"] = self.reasoning_effort
+        if self.thinking_budget is not None:
+            kwargs["thinking_budget"] = self.thinking_budget
 
     async def chat(
         self,
         messages: List[Dict],
         tools: Optional[List[Dict]] = None,
         model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+        thinking_budget: Optional[int] = None,
     ) -> LLMResponse:
         # 动态拼装请求参数：仅在有工具时才带 tools / tool_choice，
         # 避免无工具场景下传 tool_choice 触发兼容实现报错。
@@ -92,6 +129,14 @@ class OpenAICompatProvider(LLMProvider):
         if tools:
             request_kwargs["tools"] = tools
             request_kwargs["tool_choice"] = "auto"
+
+        # 推理参数：优先使用方法级参数，回退到实例属性
+        re = reasoning_effort if reasoning_effort is not None else getattr(self, "reasoning_effort", "high")
+        tb = thinking_budget if thinking_budget is not None else getattr(self, "thinking_budget", None)
+        if re and re.strip():
+            request_kwargs["reasoning_effort"] = re
+        if tb is not None:
+            request_kwargs["thinking_budget"] = tb
 
         # 对瞬时错误（5xx / 429 / 连接超时）做有限次重试 + 指数退避；
         # 不可恢复的错（401 / 400 / 404 等）直接失败，不浪费重试。
@@ -171,6 +216,8 @@ class OpenAICompatProvider(LLMProvider):
         messages: List[Dict],
         tools: Optional[List[Dict]] = None,
         model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+        thinking_budget: Optional[int] = None,
     ):
         """逐字流式对话（``stream=True``）。
 
@@ -199,6 +246,14 @@ class OpenAICompatProvider(LLMProvider):
         if tools:
             request_kwargs["tools"] = tools
             request_kwargs["tool_choice"] = "auto"
+
+        # 推理参数：优先使用方法级参数，回退到实例属性
+        re = reasoning_effort if reasoning_effort is not None else getattr(self, "reasoning_effort", "high")
+        tb = thinking_budget if thinking_budget is not None else getattr(self, "thinking_budget", None)
+        if re and re.strip():
+            request_kwargs["reasoning_effort"] = re
+        if tb is not None:
+            request_kwargs["thinking_budget"] = tb
 
         # —— 建立连接（带瞬时错误重试）——
         stream = None

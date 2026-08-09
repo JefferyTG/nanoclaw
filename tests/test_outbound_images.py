@@ -20,7 +20,7 @@ class _Provider(LLMProvider):
     def __init__(self, responses):
         self.responses = list(responses)
 
-    async def chat(self, messages, tools=None, model=None):
+    async def chat(self, messages, tools=None, model=None, **kwargs):
         return self.responses.pop(0)
 
 

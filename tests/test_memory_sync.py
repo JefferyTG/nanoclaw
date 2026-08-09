@@ -38,7 +38,7 @@ class _RecordingProvider(LLMProvider):
         self.responses = list(responses)
         self.requests = []
 
-    async def chat(self, messages, tools=None, model=None):
+    async def chat(self, messages, tools=None, model=None, **kwargs):
         self.requests.append({
             "messages": deepcopy(messages),
             "tools": deepcopy(tools),

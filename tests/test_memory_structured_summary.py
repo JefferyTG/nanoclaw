@@ -121,7 +121,7 @@ class _ChunkMergeProvider(LLMProvider):
         self.merge_json = merge_json
         self.requests = []
 
-    async def chat(self, messages, tools=None, model=None):
+    async def chat(self, messages, tools=None, model=None, **kwargs):
         self.requests.append(deepcopy(messages))
         prompt = messages[-1]["content"]
         if _MERGE_MARKER in prompt:
@@ -136,7 +136,7 @@ class _FailFirstThenProvider(LLMProvider):
         self.second_text = second_text
         self.requests = []
 
-    async def chat(self, messages, tools=None, model=None):
+    async def chat(self, messages, tools=None, model=None, **kwargs):
         self.requests.append(deepcopy(messages))
         if len(self.requests) == 1:
             return LLMResponse(None, finish_reason="error")
@@ -144,7 +144,7 @@ class _FailFirstThenProvider(LLMProvider):
 
 
 class _AlwaysFailProvider(LLMProvider):
-    async def chat(self, messages, tools=None, model=None):
+    async def chat(self, messages, tools=None, model=None, **kwargs):
         return LLMResponse(None, finish_reason="error")
 
 
@@ -154,7 +154,7 @@ class _CountingProvider(LLMProvider):
         self.calls = 0
         self.requests = []
 
-    async def chat(self, messages, tools=None, model=None):
+    async def chat(self, messages, tools=None, model=None, **kwargs):
         self.calls += 1
         self.requests.append(deepcopy(messages))
         return LLMResponse(content=self.text)
@@ -173,7 +173,7 @@ class _ScenarioProvider(LLMProvider):
         self.legacy_error = legacy_error
         self.requests = []
 
-    async def chat(self, messages, tools=None, model=None):
+    async def chat(self, messages, tools=None, model=None, **kwargs):
         self.requests.append(deepcopy(messages))
         prompt = messages[-1]["content"]
         if "3-5 句话" in prompt:

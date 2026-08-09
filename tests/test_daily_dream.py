@@ -37,18 +37,18 @@ class _DreamProvider:
             "会话总结": ["和用户聊了周末计划"],
         }, ensure_ascii=False)
 
-    async def chat(self, messages, tools=None, model=None):
+    async def chat(self, messages, tools=None, model=None, **kwargs):
         self.requests.append(messages)
         return LLMResponse(self.content)
 
 
 class _ErrorProvider:
-    async def chat(self, messages, tools=None, model=None):
+    async def chat(self, messages, tools=None, model=None, **kwargs):
         raise RuntimeError("boom")
 
 
 class _EmptyProvider:
-    async def chat(self, messages, tools=None, model=None):
+    async def chat(self, messages, tools=None, model=None, **kwargs):
         return LLMResponse(None, finish_reason="error")
 
 

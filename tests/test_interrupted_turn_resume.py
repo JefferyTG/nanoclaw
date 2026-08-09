@@ -89,7 +89,7 @@ class _HangThenRespondProvider(LLMProvider):
         self.calls = 0
         self.requests = []
 
-    async def chat(self, messages, tools=None, model=None):
+    async def chat(self, messages, tools=None, model=None, reasoning_effort=None, thinking_budget=None):
         self.calls += 1
         self.requests.append(deepcopy(messages))
         if self.calls == 1:
@@ -113,7 +113,7 @@ class _ScriptedResponsesProvider(LLMProvider):
         self.calls = 0
         self.requests = []
 
-    async def chat(self, messages, tools=None, model=None):
+    async def chat(self, messages, tools=None, model=None, reasoning_effort=None, thinking_budget=None):
         self.calls += 1
         self.requests.append(deepcopy(messages))
         return self.responses.pop(0)
@@ -125,7 +125,7 @@ class _BlockingProvider(LLMProvider):
     def __init__(self):
         self.entered = asyncio.Event()
 
-    async def chat(self, messages, tools=None, model=None):
+    async def chat(self, messages, tools=None, model=None, reasoning_effort=None, thinking_budget=None):
         self.entered.set()
         await asyncio.Event().wait()
         raise AssertionError("任务取消后不应继续执行")
@@ -134,7 +134,7 @@ class _BlockingProvider(LLMProvider):
 class _SummaryProvider:
     """压缩摘要用的固定输出 Provider（结构化摘要失败时降级为散文）。"""
 
-    async def chat(self, messages, tools=None, model=None):
+    async def chat(self, messages, tools=None, model=None, reasoning_effort=None, thinking_budget=None):
         return LLMResponse("stable summary")
 
 

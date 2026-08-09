@@ -150,6 +150,10 @@ _CONFIG_FIELDS = (
     "weixin",
     # 本地语音渠道：无音频骨架默认关闭，TASK-024。
     "voice",
+    # 思考强度参数：控制模型推理深度（none / minimal / low / medium / high / xhigh / max）。
+    "reasoning_effort",
+    # 思考 token 预算：控制模型推理时的 token 消耗上限（整数，可选）。
+    "thinking_budget",
 )
 
 
@@ -166,6 +170,9 @@ class NanoClawConfig:
         timezone: 实例默认 IANA 时区，供当前时间与提醒相关工具使用。
         max_iterations: Agent 主循环单轮最大迭代次数。
         identity_file: 人设文件名（位于 workspace 下）。
+        reasoning_effort: 思考强度，控制模型推理深度，
+            枚举值 none / minimal / low / medium / high / xhigh / max。
+        thinking_budget: 思考 token 预算（整数，可选）。
     """
 
     api_key: str = ""
@@ -386,6 +393,12 @@ class NanoClawConfig:
             "int8": False,
         },
     })
+    # 思考强度参数：控制模型推理深度（none / minimal / low / medium / high / xhigh / max）。
+    # 默认 "high" 开启思考；配成空字符串 "" 则不传该参数，兼容不支持思考的模型。
+    reasoning_effort: str = "high"
+    # 思考 token 预算（整数，可选）：控制模型推理时的 token 消耗上限。
+    # 默认 None 表示不传该参数；配具体整数时才发送。
+    thinking_budget: Optional[int] = None
 
 
 def load_config(config_path: str = "config.json") -> NanoClawConfig:
