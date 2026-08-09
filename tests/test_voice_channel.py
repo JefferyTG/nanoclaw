@@ -26,7 +26,13 @@ from gateway import Gateway
 
 
 class _FakeAgent:
-    """同步返回固定文本的假 Agent：不触发任何模型/网络。"""
+    """同步返回固定文本的假 Agent：不触发任何模型/网络。
+
+    TASK-032 起 voice 渠道也挂 stream_sink，假 Agent 需模拟真实 Agent 的
+    ``done`` 事件推送（真实 AgentLoop 在回合结束时总是向 sink 补发 done），
+    否则流式 sink 的 on_done 不会被调用、文本不会被 _emit，send() 也会因
+    streamed=True 而 no-op，导致回复静默。
+    """
 
     def __init__(self, session_key: str) -> None:
         self.session_key = session_key
@@ -34,6 +40,8 @@ class _FakeAgent:
 
     async def run(self, content, images=None, stream_sink=None):
         self.contents.append(content)
+        if stream_sink is not None:
+            await stream_sink({"type": "done", "content": "固定回复"})
         return "固定回复"
 
 

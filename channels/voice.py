@@ -81,7 +81,9 @@ from voice.kws.errors import KwsError
 from voice.kws.player import play_audio
 from voice.kws.vad import record_audio_vad
 from voice.media import MediaError
-from voice.segments import segment_text
+from voice.segments import segment_text, IncrementalSegmenter
+
+from collections.abc import Awaitable, Callable
 
 
 # —— TASK-027 补充：TTS 前文本清洗正则（剥 markdown / 删 emoji 与装饰符号 /
@@ -140,6 +142,235 @@ def _normalize_bool(value, default: bool) -> bool:
         if low in ("0", "false", "no", "off"):
             return False
     return default
+
+
+
+
+class _StreamingVoiceSink:
+    """TASK-032 voice 渠道流式 token sink：边攒边切边合成边播放。
+
+    由 :meth: `VoiceChannel.make_token_sink` 构造，作为 `async def sink(event: dict)`
+    回调注入 `AgentLoop.run(stream_sink=...)`。Agent 逐 token 推来时：
+
+    1. **token 事件**：追加到增量切句器 (:class:`IncrementalSegmenter`)，攒够
+        一句就切出去 → 立即送 TTS 合成 → 排入播放队列；首段合成完成即开播，
+        后台并发预合成下一段（`Semaphore(2)` 上限，对齐 web 端）；
+    2. **done 事件**：flush 切句器（强制切出剩余文本）→ 等播放队列播完 →
+        处理 [END] + 连续对讲续听；
+    3. **thinking / tool_call / tool_result**：忽略（voice 不展示思考/工具）。
+
+    [END] 实时检测：token 流中检测到 `[END]` 即标记 `_end_detected`；每段
+    合成前也 `_strip_end_marker`，标记绝不出现在播报里。
+
+    失败降级：单段合成失败 → 该段 `_emit` 文字；播放失败 → 当前及后续段
+    全部 `_emit` 文字；不静默不崩溃。
+
+    "播完"判定点 = 最后一段播放完成（非 `send()` 收到全文时），连续对讲
+    续听由 `_post_playback` 在播放完毕后调度。
+    """
+
+    def __init__(self, channel: "VoiceChannel") -> None:
+        self._channel = channel
+        self._tts = channel._tts_service
+        self._segmenter = IncrementalSegmenter()
+        self._end_detected: bool = False
+        self._full_text: list[str] = []  # [END] 实时检测用
+
+        # 段管理
+        self._segments: list[str] = []
+        self._synth_cache: dict[int, object] = {}
+        self._synth_tasks: dict[int, asyncio.Task] = {}
+        self._synth_failed: set[int] = set()
+        self._play_failed: bool = False
+        self._sem = asyncio.Semaphore(2)
+
+        # 播放协调
+        self._all_collected: bool = False
+        self._playback_done: asyncio.Event = asyncio.Event()
+        self._play_task: asyncio.Task | None = None
+
+    async def __call__(self, event: dict) -> None:
+        """sink 回调入口——AgentLoop 逐事件调。"""
+        etype = event.get("type")
+        if etype == "token":
+            await self._on_token(event.get("content", ""))
+        elif etype == "done":
+            await self._on_done(event.get("content", ""))
+        # thinking / tool_call / tool_result / usage_turn：voice 不消费
+
+    # —— token 处理 ——
+
+    async def _on_token(self, content: str) -> None:
+        """收到一个 LLM token：追加 [END] 检测缓冲 + 喂增量切句器。"""
+        if not content:
+            return
+        self._full_text.append(content)
+        if VoiceChannel._END_MARKER in "".join(self._full_text):
+            self._end_detected = True
+
+        if self._tts is None:
+            return  # 无 TTS：全文攒好 on_done 时 _emit
+
+        new_segs = self._segmenter.feed(content)
+        for seg in new_segs:
+            self._add_segment(seg)
+
+    # —— done 处理 ——
+
+    async def _on_done(self, full_content: str) -> None:
+        """Agent 回合结束：flush 切句器 → 播完剩余 → [END]+续听收尾。"""
+        # flush 剩余段（含 [END] 剥离）
+        remaining = self._segmenter.flush()
+        for seg in remaining:
+            seg, had_end = self._channel._strip_end_marker(seg)
+            if had_end:
+                self._end_detected = True
+            if seg.strip():
+                self._add_segment(seg)
+
+        self._all_collected = True
+
+        if self._tts is None:
+            # 无 TTS 降级：全文 _emit（[END] 剥离 + 清洗）
+            text = full_content or "".join(self._full_text)
+            text, had_end = self._channel._strip_end_marker(text)
+            if had_end:
+                self._end_detected = True
+            text = self._channel._sanitize_for_tts(text)
+            if text:
+                print(f"[voice] 🎀 小奈说：{text}")
+                self._channel._emit(text)
+            self._post_playback()
+            return
+
+        if not self._segments:
+            # 无段（空回复 / 全 [END]）
+            self._post_playback()
+            return
+
+        # 启动播放循环（若尚未启动——首段到达时即启动，此处补兜底）
+        if self._play_task is None:
+            self._play_task = asyncio.create_task(self._play_all())
+
+        # 等播放完毕
+        await self._playback_done.wait()
+        self._post_playback()
+
+    # —— 段入队 + 合成 ——
+
+    def _add_segment(self, text: str) -> None:
+        """入队一段并启动其合成；首段到达时即启动播放循环。"""
+        idx = len(self._segments)
+        self._segments.append(text)
+        if idx not in self._synth_tasks and idx not in self._synth_failed:
+            self._synth_tasks[idx] = asyncio.create_task(self._synth(idx))
+        # 首段到达 → 立即启动播放循环（不等 done，实现 2-3 秒首句出声）
+        if self._play_task is None and idx == 0:
+            self._play_task = asyncio.create_task(self._play_all())
+
+    async def _synth(self, idx: int) -> None:
+        """合成单段；失败降级 _emit 文字。"""
+        async with self._sem:
+            text = self._segments[idx]
+            clean = self._channel._sanitize_for_tts(text)
+            clean, had_end = self._channel._strip_end_marker(clean)
+            if had_end:
+                self._end_detected = True
+            if not clean:
+                self._synth_failed.add(idx)
+                return
+            try:
+                self._synth_cache[idx] = await self._tts.synthesize(clean)
+            except Exception as exc:  # noqa: BLE001 - 合成失败降级文字
+                self._synth_failed.add(idx)
+                self._channel._emit(
+                    f"🔇 第{idx + 1}段语音合成失败，改文字"
+                    f"（{getattr(exc, 'message', exc)}）"
+                )
+                self._channel._emit(text)
+
+    def _ensure_synth(self, idx: int) -> None:
+        """确保 idx 段合成任务已启动（段存在、未启动、未失败时启动）。"""
+        if idx >= len(self._segments) or idx in self._synth_tasks or idx in self._synth_failed:
+            return
+        self._synth_tasks[idx] = asyncio.create_task(self._synth(idx))
+
+    # —— 播放循环 ——
+
+    async def _play_all(self) -> None:
+        """按序播放所有段：等合成完 → 播 → 预合成下下段；段不足等更多。"""
+        play_idx = 0
+        try:
+            while True:
+                # 终止判定
+                if self._all_collected and play_idx >= len(self._segments):
+                    break
+                if not self._all_collected and play_idx >= len(self._segments):
+                    await asyncio.sleep(0.01)  # 等更多段到达
+                    continue
+
+                # 等当前段合成完成
+                task = self._synth_tasks.get(play_idx)
+                if task is not None and not task.done():
+                    await task
+
+                if self._play_failed:
+                    for r in range(play_idx, len(self._segments)):
+                        if r not in self._synth_failed:
+                            self._channel._emit(self._segments[r])
+                    break
+
+                if play_idx in self._synth_failed:
+                    self._ensure_synth(play_idx + 2)
+                    play_idx += 1
+                    continue
+
+                result = self._synth_cache.get(play_idx)
+                if result is None:
+                    self._channel._emit(self._segments[play_idx])
+                    self._ensure_synth(play_idx + 2)
+                    play_idx += 1
+                    continue
+
+                # 预合成下下段（播放当前段期间后台合成）
+                self._ensure_synth(play_idx + 2)
+
+                print(
+                    f"[voice] 🎀 小奈说（第{play_idx + 1}段）"
+                    f"：{self._segments[play_idx]}"
+                )
+                try:
+                    await play_audio(
+                        result.audio,
+                        result.media_type,
+                        playback_params=self._channel._playback_params,
+                    )
+                except Exception as exc:  # noqa: BLE001 - 播放失败降级文字
+                    self._play_failed = True
+                    self._channel._emit(
+                        f"🔇 语音播放失败，改文字回复"
+                        f"（{getattr(exc, 'message', exc)}）"
+                    )
+                    self._channel._emit(self._segments[play_idx])
+
+                play_idx += 1
+        finally:
+            # 清理未完成合成任务
+            for task in self._synth_tasks.values():
+                if not task.done():
+                    task.cancel()
+            if self._synth_tasks:
+                await asyncio.gather(
+                    *self._synth_tasks.values(), return_exceptions=True
+                )
+            self._playback_done.set()
+
+    def _post_playback(self) -> None:
+        """播放完毕收尾：[END] → 退出连续对讲；否则续听。"""
+        if self._end_detected:
+            self._channel._exit_continuous()
+        elif self._channel._continuous:
+            self._channel._schedule_next_listen()
 
 
 class VoiceChannel(Channel):
@@ -917,6 +1148,24 @@ class VoiceChannel(Channel):
                 *synth_tasks.values(), return_exceptions=True
             )
 
+    def make_token_sink(self):
+        """TASK-032 构造流式 token sink：返回 async callback 供 AgentLoop.stream_sink。
+
+        返回的 sink 是一个 ``async def sink(event: dict)`` 回调，内部维护
+        ``_StreamingVoiceSink`` 独态：token -> 增量切句 -> 边合成边播放。
+        每次调用创建新实例（回合级隔离，不跨回合复用状态）。
+
+        返回 None 表示不启用流式（降级为 ``send()`` 全文切句路径）。
+        目前不返回 None（即使 ``_tts_service`` 为 None 也返回 sink，
+        sink 内部降级为文字 ``_emit``）；保留 None 分支供未来策略。
+
+        Gateway 在 ``_handle_one`` 中调用 ``voice_channel.make_token_sink()``
+        获取 sink，传入 ``agent.run(stream_sink=sink)``。sink 不走
+        ``bus.stream_queue``（区别于 web 渠道的 ``_make_stream_sink``），
+        直接由 voice 渠道内部消费。
+        """
+        return _StreamingVoiceSink(self)
+
     async def send(self, message: OutboundMessage) -> None:
         """把出站回复下发到本渠道（Agent 回复 → 甘雨 TTS → 播放默认输出）。
 
@@ -938,6 +1187,12 @@ class VoiceChannel(Channel):
         ``_emit`` 仍是文字兜底单一出口，语义与签名不变。
         """
         text = message.content
+        if message.streamed:
+            # TASK-032：流式路径已由 _StreamingVoiceSink 处理完毕
+            #（token -> 增量切句 -> 边合成边播放 -> [END]+续听），
+            # send() 不再重复播放/调度，直接返回。
+            return
+
         if not text:
             # 空内容不触发 TTS（合成会因空文本报错），保持原 _emit 语义。
             self._emit(text)

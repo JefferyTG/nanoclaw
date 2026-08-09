@@ -127,6 +127,6 @@ Web 附加：AgentLoop 流事件 → Bus.stream → WebChannel → WebSocket（t
 
 > **唯一事实源是 git 本身**（`git log` / `git status` / `git diff`）。本段只留指针与稳定约定，**不复制任何瞬时状态**——hash 列表、领先/落后数量、未跟踪清单都会过期，一律不写，需要时直接查 git。
 
-- 当前里程碑：TASK-001~031 已完成并归档（任务卡见 `docs/tasks/completed/`）；active：无；TASK-030（TTS 流式播放/豆包级体验）已规划待建卡——2026-08-09 乖宝提出目标。
+- 当前里程碑：TASK-001~032 已完成并归档（任务卡见 `docs/tasks/completed/`）；active：无。
 - 最新提交、分支、领先/落后、工作区状态：`git log` / `git status`。
 - 稳定约定：`kb-testset/`（个人知识库测试资产）已在 `.gitignore` 中不追踪；存在 codex 外部 worktree → 多会话并行开发时严格遵守 AGENTS.md 文件所有权规则。

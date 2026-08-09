@@ -176,8 +176,19 @@ class Gateway:
                     # 和其它渠道保持原有行为。句柄只包含本地 activity 标识，不含凭据。
                     outbound_lifecycle = self._begin_outbound_lifecycle(msg)
 
-                    # 仅网页渠道挂载流式事件接收方：把 Agent 的逐步事件实时推给网页端。
-                    stream_sink = self._make_stream_sink(msg) if msg.channel == "web" else None
+                    # 流式事件接收方：网页渠道走 bus.stream_queue（_make_stream_sink），
+                    # voice 渠道走渠道内部 token sink（make_token_sink，TASK-032 真·流式
+                    # 播放）；其他渠道不挂载 sink。
+                    if msg.channel == "web":
+                        stream_sink = self._make_stream_sink(msg)
+                    elif msg.channel == "voice":
+                        voice_ch = self._channel_map.get("voice")
+                        if voice_ch is not None and hasattr(voice_ch, "make_token_sink"):
+                            stream_sink = voice_ch.make_token_sink()
+                        else:
+                            stream_sink = None
+                    else:
+                        stream_sink = None
                     try:
                         # 把随消息附带的图片引用一并交给 Agent；纯文本消息 images 为 None
                         reply = await agent.run(
