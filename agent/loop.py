@@ -29,7 +29,8 @@ B. 工具调用防爆（循环熔断）
 import asyncio
 import base64
 import json
-import logging
+from loguru import logger
+
 import os
 import time
 from typing import List, Optional
@@ -57,7 +58,6 @@ from agent.memory_sync import (
 )
 from providers.usage import PromptCacheUsage
 
-logger = logging.getLogger("nanoclaw.agent.loop")
 
 
 class AgentLoop:
@@ -161,7 +161,7 @@ class AgentLoop:
             )
         except Exception:  # noqa: BLE001 - 元数据写失败不阻断会话创建
             logger.exception(
-                "持久化会话 memory_revision 失败，session_key=%s", self.session_key
+                "持久化会话 memory_revision 失败，session_key={}", self.session_key
             )
 
     @staticmethod
@@ -174,15 +174,15 @@ class AgentLoop:
         if not reasoning:
             return
         # ANSI: 2=暗淡, 3=斜体；90=灰色。终端不支持时也只是多几个可见字符，无害。
-        print("\033[2;3;90m┌─ 💭 思考过程 " + "─" * 30 + "\033[0m")
+        logger.debug("\033[2;3;90m┌─ 💭 思考过程 " + "─" * 30 + "\033[0m")
         for line in reasoning.strip().splitlines():
-            print("\033[2;3;90m│ " + line + "\033[0m")
-        print("\033[2;3;90m└" + "─" * 44 + "\033[0m")
+            logger.debug("\033[2;3;90m│ " + line + "\033[0m")
+        logger.debug("\033[2;3;90m└" + "─" * 44 + "\033[0m")
 
     @staticmethod
     def _print_tool_call(name: str, args_json: str) -> None:
         """打印模型选择调用的工具及参数，与思考过程、正常回复区分。"""
-        print("\033[36m🔧 调用工具 → " + name + "(" + args_json + ")\033[0m")
+        logger.debug("\033[36m🔧 调用工具 → " + name + "(" + args_json + ")\033[0m")
 
     @staticmethod
     def _print_tool_result(name: str, result: str) -> None:
@@ -201,11 +201,11 @@ class AgentLoop:
                 f"实际共 {len(result)} 字符)"
             )
         # ANSI: 32=绿色，对应「执行产出」，与青色(调用)/灰色(思考)区分
-        print("\033[32m📤 工具结果 " + name + ":\033[0m")
+        logger.debug("\033[32m📤 工具结果 " + name + ":\033[0m")
         for line in (preview.splitlines() or [""]):
-            print("\033[32m  " + line + "\033[0m")
+            logger.debug("\033[32m  " + line + "\033[0m")
         if tail:
-            print("\033[2;32m  " + tail + "\033[0m")
+            logger.debug("\033[2;32m  " + tail + "\033[0m")
 
     # —— 图片消息装配（多模态直传 vs 占位符，由 base_model_multimodal 决定）——
     @staticmethod
@@ -313,7 +313,7 @@ class AgentLoop:
             try:
                 self._record_cancelled_turn()
             except Exception:  # noqa: BLE001 - 补历史失败不能影响取消语义本身
-                logger.exception("AgentLoop 取消时补历史失败，session_key=%s", self.session_key)
+                logger.exception("AgentLoop 取消时补历史失败，session_key={}", self.session_key)
             if stream_sink is not None:
                 try:
                     await stream_sink({"type": "done", "content": "⏹ 已停止"})
@@ -333,7 +333,7 @@ class AgentLoop:
                     metric = turn.finish()
                 except Exception:  # noqa: BLE001 - 观测收尾失败不影响回合语义
                     logger.exception(
-                        "回合缓存指标收尾失败，session_key=%s", self.session_key
+                        "回合缓存指标收尾失败，session_key={}", self.session_key
                     )
                 self.last_cache_metrics = metric
                 if stream_sink is not None and metric is not None:
@@ -374,7 +374,7 @@ class AgentLoop:
             ]
             history_tokens = self._estimate_tokens_for(history_clean)
         except Exception:  # noqa: BLE001 - 估算失败只降级为 None，不阻断查询
-            logger.exception("上下文占用估算失败，session_key=%s", self.session_key)
+            logger.exception("上下文占用估算失败，session_key={}", self.session_key)
 
         estimate_total = (
             (system_tokens or 0) + (history_tokens or 0)
@@ -426,7 +426,7 @@ class AgentLoop:
             if event is not None:
                 await stream_sink(event)
         except Exception:  # noqa: BLE001 - 观测事件失败不能影响对话主流程
-            logger.exception("推送 usage 事件失败，session_key=%s", self.session_key)
+            logger.exception("推送 usage 事件失败，session_key={}", self.session_key)
 
     def _build_usage_event(self, usage, messages, tools) -> Optional[dict]:
         """构造 ``{type: "usage", ...}`` 事件；真实 usage 缺失时回退估算。"""
@@ -594,7 +594,7 @@ class AgentLoop:
             self.session_manager.set_memory_revision(self.session_key, revision)
         except Exception:  # noqa: BLE001
             logger.exception(
-                "持久化会话 memory_revision 失败，session_key=%s", self.session_key
+                "持久化会话 memory_revision 失败，session_key={}", self.session_key
             )
 
     def _should_rebuild_memory(self, entries: list, consolidated: bool) -> bool:
@@ -645,7 +645,7 @@ class AgentLoop:
         try:
             self.session_manager.save_message(self.session_key, patch_msg)
         except Exception:  # noqa: BLE001 - 持久化失败不阻断本轮
-            logger.exception("持久化记忆补丁到会话 JSONL 失败，session_key=%s", self.session_key)
+            logger.exception("持久化记忆补丁到会话 JSONL 失败，session_key={}", self.session_key)
         self._advance_memory_revision(latest)
 
     def _rebuild_memory_snapshot(self, messages: list, global_rev: int) -> None:
@@ -681,7 +681,7 @@ class AgentLoop:
                 self.session_key, history, preserve_timestamps=True
             )
         except Exception:  # noqa: BLE001 - 重建后落盘失败不阻断本轮
-            logger.exception("重建快照后持久化会话历史失败，session_key=%s", self.session_key)
+            logger.exception("重建快照后持久化会话历史失败，session_key={}", self.session_key)
         self._advance_memory_revision(global_rev)
         # 用新历史重建本轮 messages（保留首条 system 与末条本轮 user）
         if len(messages) >= 2 and messages[-1].get("role") == "user":
@@ -759,10 +759,10 @@ class AgentLoop:
                 self.session_manager.save_messages(
                     self.session_key, new_history, preserve_timestamps=True
                 )
-                print(
-                    f"\033[2;35m🗜️  会话历史已压缩：{len(messages)} 条 → "
+                logger.info(
+                    f"会话历史已压缩：{len(messages)} 条 → "
                     f"{len(compaction.messages)} 条；估算 {compaction.estimated_tokens} / "
-                    f"预算 {compaction.token_budget} token\033[0m"
+                    f"预算 {compaction.token_budget} token"
                 )
             messages = compaction.messages
         # 1.6 记忆跨会话同步（TASK-004）：全局 revision 落后时插入
@@ -880,7 +880,7 @@ class AgentLoop:
                     )
                     self._print_thinking(reasoning or "")
                     if response.content:
-                        print("\033[2;3;90m  " + response.content.strip() + "\033[0m")
+                        logger.debug("\033[2;3;90m  " + response.content.strip() + "\033[0m")
 
                 # —— 构造 assistant 消息（严格 OpenAI 格式）——
                 assistant_msg = {
@@ -981,7 +981,7 @@ class AgentLoop:
             if getattr(response, "reasoning_content", None):
                 self._print_thinking(response.reasoning_content)
             if getattr(response, "content", None):
-                print("\033[2;3;90m  " + response.content.strip() + "\033[0m")
+                logger.debug("\033[2;3;90m  " + response.content.strip() + "\033[0m")
             return response, final_content
         finally:
             # 取消 / 超时 / 异常时也要把已生成的文本留在 self（try/finally 保证
@@ -1137,7 +1137,7 @@ class AgentLoop:
                     )
                 except Exception:  # noqa: BLE001 - 基线持久化失败不影响本轮
                     logger.exception(
-                        "持久化自写基线失败，session_key=%s", self.session_key
+                        "持久化自写基线失败，session_key={}", self.session_key
                     )
             duration_ms = int((time.monotonic() - t_start) * 1000)
             self._print_tool_result(tc.name, result)
@@ -1274,5 +1274,5 @@ class AgentLoop:
             )
         except Exception:  # noqa: BLE001 - 元数据写失败不阻断清空
             logger.exception(
-                "持久化清空后 memory_revision 失败，session_key=%s", self.session_key
+                "持久化清空后 memory_revision 失败，session_key={}", self.session_key
             )

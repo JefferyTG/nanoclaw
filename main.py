@@ -95,9 +95,72 @@ from reminders.repository import ReminderRepository
 from reminders.scheduler import ReminderScheduler, SystemClock
 from reminders.service import AsyncReminderRepository, ReminderService
 
+from loguru import logger
+
 
 # 配置文件路径（网页渠道配置页也写回同一文件）
 CONFIG_PATH = "config.json"
+
+# 统一日志格式（TASK-034）
+_LOG_FORMAT = "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{line} | {message}"
+
+
+def _resolve_log_path(path: str, config) -> str:
+    """把相对日志路径解析到 workspace 下。"""
+    if os.path.isabs(path):
+        return path
+    workspace = getattr(config, "workspace", ".")
+    return os.path.join(workspace, path)
+
+
+def setup_logging(config) -> None:
+    """按配置初始化 loguru 日志：console / info_file / error_file。
+
+    在 main.py 装配早期调用（config 加载之后、其他服务装配之前）。
+    配置缺失字段由本函数回退默认值，确保旧 config.json 无 logging 段时
+    也能正常输出日志。
+    """
+    log_cfg = getattr(config, "logging", {}) or {}
+    logger.remove()
+
+    console_cfg = log_cfg.get("console", {})
+    if console_cfg.get("enabled", True):
+        logger.add(
+            sys.stderr,
+            level=console_cfg.get("level", "INFO"),
+            format=_LOG_FORMAT,
+            colorize=True,
+        )
+
+    info_cfg = log_cfg.get("info_file", {})
+    if info_cfg.get("enabled", True):
+        info_path = _resolve_log_path(
+            info_cfg.get("path", "workspace/logs/nanoclaw.log"), config
+        )
+        os.makedirs(os.path.dirname(info_path), exist_ok=True)
+        logger.add(
+            info_path,
+            level=info_cfg.get("level", "DEBUG"),
+            rotation=info_cfg.get("rotation", "10 MB"),
+            retention=info_cfg.get("retention", "7 days"),
+            encoding="utf-8",
+            format=_LOG_FORMAT,
+        )
+
+    error_cfg = log_cfg.get("error_file", {})
+    if error_cfg.get("enabled", True):
+        error_path = _resolve_log_path(
+            error_cfg.get("path", "workspace/logs/nanoclaw.error.log"), config
+        )
+        os.makedirs(os.path.dirname(error_path), exist_ok=True)
+        logger.add(
+            error_path,
+            level=error_cfg.get("level", "ERROR"),
+            rotation=error_cfg.get("rotation", "10 MB"),
+            retention=error_cfg.get("retention", "30 days"),
+            encoding="utf-8",
+            format=_LOG_FORMAT,
+        )
 
 
 def build_asr_service(config):
@@ -107,14 +170,14 @@ def build_asr_service(config):
     if not settings.get("enabled", False):
         return None
     if settings.get("provider", "openai_compatible") != "openai_compatible":
-        print("[!] ASR 未启用：当前仅支持 provider=openai_compatible")
+        logger.warning("ASR 未启用：当前仅支持 provider=openai_compatible")
         return None
 
     api_key = str(settings.get("api_key") or "").strip()
     base_url = str(settings.get("base_url") or "").strip()
     model = str(settings.get("model") or "").strip()
     if not api_key or not base_url or not model:
-        print("[!] ASR 未启用：请配置 asr_model 的 api_key/base_url/model（密钥可用 ASR_API_KEY）")
+        logger.warning("ASR 未启用：请配置 asr_model 的 api_key/base_url/model（密钥可用 ASR_API_KEY）")
         return None
 
     try:
@@ -136,10 +199,10 @@ def build_asr_service(config):
             prompt=str(settings.get("prompt") or "").strip() or None,
         )
     except (TypeError, ValueError) as exc:
-        print(f"[!] ASR 未启用：配置值无效（{exc}）")
+        logger.warning(f"ASR 未启用：配置值无效（{exc}）")
         return None
 
-    print(f"（网页语音识别：已启用·模型 {model}）")
+    logger.info(f"网页语音识别已启用·模型 {model}")
     return service
 
 
@@ -153,13 +216,13 @@ def build_tts_service(config):
     if provider_name == "dashscope_realtime":
         return _build_dashscope_realtime_tts_service(settings)
     if provider_name != "edge_tts":
-        print("[!] TTS 未启用：当前仅支持 provider=edge_tts / dashscope_realtime")
+        logger.warning("TTS 未启用：当前仅支持 provider=edge_tts / dashscope_realtime")
         return None
 
     voice = str(settings.get("voice") or "").strip()
     rate = str(settings.get("rate") or "").strip()
     if not voice or not rate:
-        print("[!] TTS 未启用：请配置 tts_model.voice/rate")
+        logger.warning("TTS 未启用：请配置 tts_model.voice/rate")
         return None
 
     try:
@@ -178,10 +241,10 @@ def build_tts_service(config):
             timeout_sec=float(settings.get("timeout_sec", 60)),
         )
     except (TypeError, ValueError) as exc:
-        print(f"[!] TTS 未启用：配置值无效（{exc}）")
+        logger.warning(f"TTS 未启用：配置值无效（{exc}）")
         return None
 
-    print(f"（网页文字朗读：服务已就绪·音色 {voice}·页面默认关闭）")
+    logger.info(f"网页文字朗读服务已就绪·音色 {voice}·页面默认关闭")
     return service
 
 
@@ -200,14 +263,14 @@ def _build_dashscope_realtime_tts_service(settings):
     voice_id = str(ds.get("voice_id") or "").strip()
     model = str(ds.get("model") or DASHSCOPE_DEFAULT_MODEL).strip()
     if not api_key:
-        print(
-            "[!] TTS 未启用（dashscope_realtime）：请配置 "
+        logger.warning(
+            "TTS 未启用（dashscope_realtime）：请配置 "
             "tts_model.dashscope_realtime.api_key 或环境变量 DASHSCOPE_API_KEY"
         )
         return None
     if not voice_id:
-        print(
-            "[!] TTS 未启用（dashscope_realtime）：请配置 "
+        logger.warning(
+            "TTS 未启用（dashscope_realtime）：请配置 "
             "tts_model.dashscope_realtime.voice_id"
         )
         return None
@@ -238,12 +301,11 @@ def _build_dashscope_realtime_tts_service(settings):
             timeout_sec=float(settings.get("timeout_sec", 60)),
         )
     except (TypeError, ValueError) as exc:
-        print(f"[!] TTS 未启用：配置值无效（{exc}）")
+        logger.warning(f"TTS 未启用：配置值无效（{exc}）")
         return None
 
-    print(
-        "（网页文字朗读：服务已就绪·provider=dashscope_realtime"
-        f"·音色 {voice_id}·页面默认关闭）"
+    logger.info(
+        f"网页文字朗读服务已就绪·provider=dashscope_realtime·音色 {voice_id}·页面默认关闭"
     )
     return service
 
@@ -919,12 +981,15 @@ def build_shared() -> dict:
     """
     config = load_config(CONFIG_PATH)
 
+    # 0) 初始化日志系统（TASK-034）：config 加载之后、其他服务装配之前
+    setup_logging(config)
+
     # 1) 缺少 API Key 直接退出，避免后续调用必然失败
     if not config.api_key:
-        print("错误：未配置 API Key。")
-        print("请二选一：")
-        print("  - 在 config.json 中填入 api_key；或")
-        print("  - 设置环境变量：export NANOCLAW_API_KEY='你的key'")
+        logger.error("未配置 API Key。")
+        logger.error("请二选一：")
+        logger.error("  - 在 config.json 中填入 api_key；或")
+        logger.error("  - 设置环境变量：export NANOCLAW_API_KEY='你的key'")
         sys.exit(1)
 
     # 2) 创建模型 Provider（OpenAI 兼容，默认硅基流动）
@@ -996,7 +1061,7 @@ def build_shared() -> dict:
         skill_count = sum(
             1 for line in skills_summary.splitlines() if line.strip().startswith("- ")
         )
-        print(f"已加载技能：{skill_count} 个")
+        logger.info(f"已加载技能：{skill_count} 个")
 
     # 6) 上下文构建器（稳定规则 + 会话级人设/记忆/技能/Profile 快照；无墙钟）
     agents_summary = profile_loader.build_summary()
@@ -1041,7 +1106,7 @@ def build_shared() -> dict:
         session_manager=session_manager,
     )
     indexed = searcher.rebuild_all()
-    print(f"已索引记忆与会话文档：{indexed} 条")
+    logger.info(f"已索引记忆与会话文档：{indexed} 条")
     tools.register(MemorySearchTool(searcher))
 
     # 视觉工具 ask_image：基础模型为纯文本时注册（无论 multimodal_model 是否配置；
@@ -1228,7 +1293,7 @@ async def amain() -> None:
     shared = build_shared()
     tools = shared["tools"]
 
-    print("已注册工具：", ", ".join(tools.list_tools()))
+    logger.info(f"已注册工具：{", ".join(tools.list_tools())}")
 
     # MCP 接入：按配置启动外部 MCP Server，把它们的工具注入同一注册表。
     # connect_all 是「尽力而为」的——连不上的 Server 会被跳过并打印告警，
@@ -1239,13 +1304,13 @@ async def amain() -> None:
         for mt in mcp_manager.get_tools():
             tools.register(mt)
         if mcp_manager.get_tools():
-            print("已加载 MCP 工具：", ", ".join(t.name for t in mcp_manager.get_tools()))
+            logger.info(f"已加载 MCP 工具：{", ".join(t.name for t in mcp_manager.get_tools())}")
     except Exception as exc:  # noqa: BLE001 - MCP 连接失败不应阻断整体启动
-        print(f"[!] MCP 初始化异常，已跳过所有 MCP 工具：{exc}")
+        logger.warning(f"MCP 初始化异常，已跳过所有 MCP 工具：{exc}")
     # 内置与成功连接的 MCP 条件工具至此全部确定。冻结排序后的 schema，
     # 后续所有会话复用同一个明确 cache boundary。
     tools_hash = tools.freeze()
-    print(f"工具 Schema 已冻结：{tools_hash[:16]}（{len(tools.list_tools())} 个）")
+    logger.info(f"工具 Schema 已冻结：{tools_hash[:16]}（{len(tools.list_tools())} 个）")
     shared["mcp_manager"] = mcp_manager
 
     # 消息总线：渠道与 Gateway 之间的运行时解耦层
@@ -1453,9 +1518,9 @@ async def amain() -> None:
         feishu_channel._clear_callback = clear_callback  # 复用同一清空回调
         feishu_channel._context_callback = context_callback  # /context 占用查询
         channels.append(feishu_channel)
-        print("（飞书渠道：已启用·常开）")
+        logger.info("飞书渠道已启用·常开")
     else:
-        print("（飞书渠道：未配置 App ID/Secret，未启用）")
+        logger.info("飞书渠道未配置 App ID/Secret，未启用")
 
     # 微信渠道：启用后由 Python 维护一个薄 Node Bridge 子进程。Bridge 独占
     # 登录凭据、cursor 和 context token；普通消息只携带稳定账号/用户 target。
@@ -1477,15 +1542,15 @@ async def amain() -> None:
             context_callback=context_callback,
         )
     except (TypeError, ValueError) as exc:
-        print(f"[!] 微信渠道未启用：配置值无效（{exc}）")
+        logger.warning(f"微信渠道未启用：配置值无效（{exc}）")
         weixin_channel = None
     if weixin_channel is not None:
         channels.append(weixin_channel)
         if not weixin_channel.allowed_user_ids:
-            print("[!] 微信渠道 allowlist 为空：将拒绝所有入站与出站用户")
-        print("（微信渠道：已启用·Node Bridge·仅私聊）")
+            logger.warning("微信渠道 allowlist 为空：将拒绝所有入站与出站用户")
+        logger.info("微信渠道已启用·Node Bridge·仅私聊")
     else:
-        print("（微信渠道：未启用）")
+        logger.info("微信渠道未启用")
 
     # 网页渠道：配置了端口且 >0 时启用（同局域网内网页访问）
     if cfg.web_port and cfg.web_port > 0:
@@ -1499,9 +1564,9 @@ async def amain() -> None:
         web_channel._clear_callback = clear_callback  # 复用同一清空回调
         web_channel._context_callback = context_callback  # /context 占用查询
         channels.append(web_channel)
-        print(f"（网页渠道：已启用·监听 http://{cfg.web_host}:{cfg.web_port}）")
+        logger.info(f"网页渠道已启用·监听 http://{cfg.web_host}:{cfg.web_port}")
     else:
-        print("（网页渠道：未配置 web_port 或未启用）")
+        logger.info("网页渠道未配置 web_port 或未启用")
 
     # 语音渠道：本地对讲机（TASK-024 骨架 + TASK-025 唤醒录音 ASR 闭环）。
     # 默认关闭。启用后若 KWS 模型目录与 ASR 服务齐备 → 装配唤醒闭环
@@ -1585,7 +1650,7 @@ async def amain() -> None:
                 try:
                     clear(session_key)
                 except OSError as exc:  # noqa: BLE001 - 删除失败不阻断
-                    print(f"[voice] 清理{label}失败（{session_key}）：{exc}")
+                    logger.warning(f"清理{label}失败（{session_key}）：{exc}")
 
         voice_channel = VoiceChannel(
             bus,
@@ -1634,14 +1699,14 @@ async def amain() -> None:
                 if (shared["tts_service"] is not None and voice_wake_replies)
                 else ""
             )
-            print(f"（语音渠道：已启用·唤醒词「小奈小奈」·ASR 就绪{wake_reply_note}）")
+            logger.info(f"语音渠道已启用·唤醒词「小奈小奈」·ASR 就绪{wake_reply_note}")
         else:
-            print(f"（语音渠道：已启用·唤醒未就绪（{kws_degrade_reason}），仅 inject_text 可用）")
+            logger.warning(f"语音渠道已启用·唤醒未就绪（{kws_degrade_reason}），仅 inject_text 可用")
     else:
-        print("（语音渠道：未启用）")
+        logger.info("语音渠道未启用")
 
     if not channels:
-        print("错误：没有任何启用渠道（CLI 需终端，网页/飞书/微信需显式配置），退出。")
+        logger.error("没有任何启用渠道（CLI 需终端，网页/飞书/微信需显式配置），退出。")
         return
 
     gateway = Gateway(
@@ -1692,12 +1757,12 @@ async def amain() -> None:
     await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
 
     if shutdown_event.is_set():
-        print("\n收到停止信号，正在释放资源……")
+        logger.info("收到停止信号，正在释放资源……")
     elif start_failure_task.done() and not start_failure_task.cancelled():
         try:
             start_failure_task.result()
         except Exception as exc:  # noqa: BLE001 - already normalized above
-            print(f"[!] 渠道启动失败，正在停止实例：{exc}")
+            logger.error(f"渠道启动失败，正在停止实例：{exc}")
     for i, task in enumerate(start_tasks):
         if cli_task_index is None or i != cli_task_index or not task.done():
             task.cancel()

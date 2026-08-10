@@ -22,6 +22,7 @@ import unittest
 from config import NanoClawConfig, load_config
 from bus.queue import InboundMessage, MessageBus, OutboundMessage
 from channels.voice import VoiceChannel
+from loguru import logger
 from gateway import Gateway
 
 
@@ -251,15 +252,18 @@ class VoiceChannelTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(received, ["你好呀"])
 
-    async def test_send_without_sink_falls_back_to_print_without_raise(self):
+    async def test_send_without_sink_falls_back_to_log_without_raise(self):
         bus = MessageBus()
         voice = VoiceChannel(bus)  # _reply_sink 保持 None
         buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
+        handler_id = logger.add(buf, level="INFO")
+        try:
             await voice.send(
                 OutboundMessage(channel="voice", chat_id="direct", content="兜底回复")
             )
-        self.assertIn("[voice] 兜底回复", buf.getvalue())
+        finally:
+            logger.remove(handler_id)
+        self.assertIn("兜底回复", buf.getvalue())
 
     async def test_start_idles_until_stop_event(self):
         bus = MessageBus()

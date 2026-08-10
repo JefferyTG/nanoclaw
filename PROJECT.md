@@ -38,6 +38,7 @@
 | 视频生成 | ✅ | 异步任务式，多服务商适配 |
 | 技能系统 | ✅ | SKILL.md 扫描、摘要注入、ListSkills/LoadSkill |
 | 邮箱检查 | ✅ | `email-check` 技能：IMAP 只读查新邮件/列邮件/看正文/标已读，网易/QQ/Gmail 通用；授权码存 gitignore 目录；配合 reminders 定时任务做每日新邮件提醒（TASK-022） |
+| 日志系统 | ✅ | 基于 Loguru 的分级/分文件日志：console + info_file + error_file 独立开关与级别，统一格式带时间戳/级别/模块名/行号，文件按大小轮转/按天保留，核心链路 print 已替换（TASK-034） |
 | 本地语音唤醒 KWS | ✅ | sherpa-onnx 本地 KWS 验证通过（TASK-023）并已接入 voice 渠道（TASK-025）：`voice/kws/detector.py` 模块化监听（PortAudio 回调→有界队列→worker→冷却/连续命中→asyncio 唤醒事件），唤醒即录即转写入站；demo 保留 `voice/kws/demo_kws.py`；RSS≈53MB/空闲 CPU 9~14% |
 | Prompt Cache 友好 | ✅ | System 无墙钟、按需时间工具、工具 Schema 冻结、隐私安全观测 |
 | 会话持久化 | ✅ | 一会话一 JSONL、重启接回、图片只存引用；中断回合落盘即同步内存、任意中断路径不丢上下文（TASK-010） |
@@ -77,7 +78,7 @@
 | 启动 | `uv run python main.py`（无终端时 `web_port>0` 可纯 Web 跑） |
 | 测试（Python） | `.venv/bin/python -m unittest discover -s tests`（**unittest，非 pytest**） |
 | 微信 Bridge 回归 | `cd integrations/weixin_bridge && npm test && npm run build` |
-| 语法检查 | `uv run python -m compileall -q agent bus channels providers session` |
+| 语法检查 | `uv run python -m compileall -q agent bus channels providers session reminders voice` |
 | 导入冒烟 | `uv run python -c "import main"` |
 | 协作最低检查 | `git diff --check` |
 | Linux 控制 | `./bin/nanoclawctl {start\|stop\|restart\|status\|logs}` |

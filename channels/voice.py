@@ -76,6 +76,7 @@ import wave
 
 from channels.base import Channel
 from bus.queue import InboundMessage, OutboundMessage
+from loguru import logger
 from voice.asr.base import ASRError
 from voice.kws.errors import KwsError
 from voice.kws.player import play_audio
@@ -238,7 +239,7 @@ class _StreamingVoiceSink:
                 self._end_detected = True
             text = self._channel._sanitize_for_tts(text)
             if text:
-                print(f"[voice] 🎀 小奈说：{text}")
+                logger.info(f"🎀 小奈说：{text}")
                 self._channel._emit(text)
             self._post_playback()
             return
@@ -335,9 +336,8 @@ class _StreamingVoiceSink:
                 # 预合成下下段（播放当前段期间后台合成）
                 self._ensure_synth(play_idx + 2)
 
-                print(
-                    f"[voice] 🎀 小奈说（第{play_idx + 1}段）"
-                    f"：{self._segments[play_idx]}"
+                logger.info(
+                    f"🎀 小奈说（第{play_idx + 1}段）：{self._segments[play_idx]}"
                 )
                 try:
                     await play_audio(
@@ -606,7 +606,7 @@ class VoiceChannel(Channel):
             return
         self._continuous = False
         self._silence_accum_sec = 0.0
-        print("[voice] 🔌 退出连续对讲，回待唤醒")
+        logger.info("🔌 退出连续对讲，回待唤醒")
         task = self._listen_task
         self._listen_task = None
         if (
@@ -694,7 +694,7 @@ class VoiceChannel(Channel):
                 self._listen_task = None  # 先清引用再自调度，避免防重入误拦
                 self._schedule_next_listen()
                 return
-            print(f"[voice] 🗣️ 乖宝说：{text}")
+            logger.info(f"🗣️ 乖宝说：{text}")
             await self.inject_text(text)
         finally:
             if self._listen_task is asyncio.current_task():
@@ -739,8 +739,8 @@ class VoiceChannel(Channel):
                 self._reply_sink(text)
                 return
             except Exception as exc:  # noqa: BLE001 - 注入回调异常只降级打印
-                print(f"[voice] 出站回调异常，降级打印：{exc}")
-        print(f"[voice] {text}")
+                logger.warning(f"出站回调异常，降级打印：{exc}")
+        logger.info(f"{text}")
 
     def _bump_activity(self) -> None:
         """记录一次交互活动：更新最近活动时间戳（供空闲分片判定）。"""
@@ -775,7 +775,7 @@ class VoiceChannel(Channel):
             try:
                 self._session_pruner(seq)
             except Exception as exc:  # noqa: BLE001 - 清理回调异常只降级打印
-                print(f"[voice] 清理老会话 #{seq} 失败：{exc}")
+                logger.warning(f"清理老会话 #{seq} 失败：{exc}")
 
     def _maybe_split_session(self) -> None:
         """空闲自动分片（惰性检查）：距上次活动超过 idle_ttl_sec 时自动开新会话。
@@ -915,10 +915,10 @@ class VoiceChannel(Channel):
         连续对话（全程不用再喊唤醒词）。
         """
         if self._wake_in_progress or self._continuous:
-            print("[voice] 🎤 唤醒词命中（对话进行中，合并计数）")
+            logger.info("🎤 唤醒词命中（对话进行中，合并计数）")
             self._coalesced_wakes += 1
             return
-        print("[voice] 🎤 唤醒词命中，进入对话")
+        logger.info("🎤 唤醒词命中，进入对话")
         self._wake_in_progress = True
         try:
             await self._handle_wake()
@@ -1127,8 +1127,8 @@ class VoiceChannel(Channel):
             _ensure_synth(play_idx + 2)
 
             # 分段打印：每段播放前同步打屏幕，让用户看到分段输出与音频同步。
-            print(
-                f"[voice] 🎀 小奈说（第{play_idx + 1}/{n}段）：{segments[play_idx]}"
+            logger.info(
+                f"🎀 小奈说（第{play_idx + 1}/{n}段）：{segments[play_idx]}"
             )
             try:
                 await play_audio(
@@ -1216,8 +1216,8 @@ class VoiceChannel(Channel):
         limit = self._max_voice_chars
         if tts is None or (limit > 0 and len(text) > limit):
             # 纯文字兜底路径（tts 未配置 / 文本超长）：同样剥离标记并退出。
-            print(
-                f"[voice] 🎀 小奈说：{text}"
+            logger.info(
+                f"🎀 小奈说：{text}"
                 + ("（含 [END] 结束语）" if end_marker else "")
             )
             self._emit(text)
@@ -1228,8 +1228,8 @@ class VoiceChannel(Channel):
         # TASK-030 分段流式播放：切句后逐段合成+播放，预合成并发上限 2。
         # 单段走原路径（行为完全不变），多段走 _play_segments。
         segments = segment_text(text)
-        print(
-            f"[voice] 📋 切句：{len(segments)} 段 "
+        logger.info(
+            f"📋 切句：{len(segments)} 段 "
             + "|".join(
                 (s[:20] + "…") if len(s) > 20 else s
                 for s in segments
@@ -1237,8 +1237,8 @@ class VoiceChannel(Channel):
         )
         if len(segments) <= 1:
             # 单段或不切段：与改前行为完全一致（合成 → 播放 → 失败降级文字）。
-            print(
-                f"[voice] 🎀 小奈说：{text}"
+            logger.info(
+                f"🎀 小奈说：{text}"
                 + ("（含 [END] 结束语）" if end_marker else "")
             )
             try:

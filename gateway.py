@@ -19,6 +19,8 @@ from zoneinfo import ZoneInfo
 
 from config import validate_iana_timezone
 
+from loguru import logger
+
 from bus.queue import MessageBus, InboundMessage, OutboundMessage, StreamEvent
 from channels.base import Channel
 from agent.identity import IdentityBootstrapper
@@ -296,7 +298,7 @@ class Gateway:
             ))
             return True
         except Exception as exc:  # noqa: BLE001
-            print(f"⚠️ 出站投递失败：{exc}")
+            logger.error(f"出站投递失败：{exc}")
             return False
 
     def _make_stream_sink(self, msg: InboundMessage):
@@ -331,7 +333,7 @@ class Gateway:
                 channel = self._channel_map.get(msg.channel)
                 if channel is None:
                     # 找不到对应渠道就告警并丢弃，不阻塞分发循环
-                    print(f"⚠️ 出站消息找不到渠道 '{msg.channel}'，已丢弃")
+                    logger.warning(f"出站消息找不到渠道 '{msg.channel}'，已丢弃")
                     if msg.delivery_future is not None:
                         self._complete_delivery(
                             msg,
@@ -351,7 +353,7 @@ class Gateway:
                         )
                     raise
                 except Exception as exc:  # noqa: BLE001 - one failure must not kill routing
-                    print(f"⚠️ 出站消息发送失败（{msg.channel}）：{exc}")
+                    logger.error(f"出站消息发送失败（{msg.channel}）：{exc}")
                     if msg.delivery_future is not None:
                         self._complete_delivery(
                             msg, _delivery_result(success=False, message=str(exc))

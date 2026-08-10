@@ -155,6 +155,9 @@ _CONFIG_FIELDS = (
     "reasoning_effort",
     # 思考 token 预算：控制模型推理时的 token 消耗上限（整数，可选）。
     "thinking_budget",
+    # 日志系统配置：分级、分文件、轮转与保留策略（TASK-034）。
+    # 默认空 dict，由 main.setup_logging 在初始化时补全默认值。
+    "logging",
 )
 
 
@@ -401,6 +404,9 @@ class NanoClawConfig:
     # 思考 token 预算（整数，可选）：控制模型推理时的 token 消耗上限。
     # 默认 None 表示不传该参数；配具体整数时才发送。
     thinking_budget: Optional[int] = None
+    # 日志系统配置（TASK-034）：默认空 dict，由 setup_logging 在初始化时
+    # 补全 console / info_file / error_file 的默认级别、路径与轮转策略。
+    logging: dict = field(default_factory=dict)
 
 
 def load_config(config_path: str = "config.json") -> NanoClawConfig:
@@ -425,7 +431,7 @@ def load_config(config_path: str = "config.json") -> NanoClawConfig:
             if key in data and data[key] is not None:
                 # ASR/TTS 配置允许只覆盖少数字段；其余继续使用当前代码默认值，
                 # 方便未来新增可选参数而不要求用户立刻重写旧 config.json。
-                if key in ("asr_model", "tts_model", "reminders", "weixin", "voice") and isinstance(data[key], dict):
+                if key in ("asr_model", "tts_model", "reminders", "weixin", "voice", "logging") and isinstance(data[key], dict):
                     merged = dict(getattr(cfg, key))
                     if key == "weixin":
                         weixin_data = data[key]

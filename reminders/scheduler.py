@@ -34,6 +34,8 @@ cancel after this check is still fenced by ``begin_delivery``.
 
 from __future__ import annotations
 
+from loguru import logger
+
 import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
@@ -172,6 +174,7 @@ class ReminderScheduler:
             await asyncio.gather(task, return_exceptions=True)
 
     async def run(self) -> None:
+        logger.info("提醒调度器已启动")
         await self.repository.recover_expired_leases(self.clock.now())
         while not self._stopped:
             await self._drain_due()
@@ -210,8 +213,10 @@ class ReminderScheduler:
                     self._execution_tasks.pop(task_id, None)
 
     async def _run_execution(self, execution: Any) -> None:
-        output = getattr(execution, "output_text", None)
         execution_id = str(getattr(execution, "id"))
+        task_id = str(getattr(execution, "task_id"))
+        logger.info(f"开始执行提醒任务: task_id={task_id}, execution_id={execution_id}")
+        output = getattr(execution, "output_text", None)
         if output is None:
             if await self.repository.is_cancelled(execution_id):
                 # ``is_cancelled`` also covers a target becoming inactive
@@ -258,6 +263,7 @@ class ReminderScheduler:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            logger.warning(f"提醒 Agent 执行失败: execution_id={execution_id}, error={exc}")
             attempts = int(getattr(execution, "agent_attempts", 0)) + 1
             if attempts < self.max_agent_attempts:
                 await self.repository.schedule_agent_retry(
@@ -276,6 +282,7 @@ class ReminderScheduler:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            logger.warning(f"提醒投递异常: execution_id={execution_id}, error={exc}")
             await self._handle_delivery_failure(execution, str(exc), retryable=True)
             return
 
@@ -321,6 +328,7 @@ class ReminderScheduler:
                 execution_id, self.clock.now() + self.retry_delay(attempts), error
             )
         else:
+            logger.error(f"提醒任务最终投递失败: execution_id={execution_id}, error={error}")
             await self.repository.mark_failed(execution_id, error)
 
     async def _handle_temporary_rejection(self, execution: Any, result: Any) -> None:
@@ -340,6 +348,7 @@ class ReminderScheduler:
             or getattr(result, "message", "provider rejected delivery")
         )
         if attempts >= self.max_temporary_retries:
+            logger.error(f"提醒任务临时拒绝达到上限: execution_id={execution_id}, error={error}")
             await self.repository.mark_failed(execution_id, error)
             return
         await self.repository.schedule_retry(

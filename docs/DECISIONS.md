@@ -71,6 +71,7 @@
 | 微信语音直接用腾讯 STT（`voice_item.text`），不落地本地 ASR | 有效 | 腾讯已提供服务端转写，零成本零延迟；实测语音为 silk 编码，本地 ASR 需额外解码器。TEXT 项在前、VOICE 转写追加在后换行合并；腾讯 text 为空时保持忽略，不做本地 fallback |
 | 微信文件按月归档+引用式传递，不按会话分散 | 有效 | 文件是长期资产（非一次性查看），统一按月目录 `workspace/files/YYYY-MM/` 便于用户查找；发模型只带「文件名+路径+大小」引用（不读内容、不花 token），乖宝说「帮我看看」时 Agent 用 `read_file` 按需读取。文件名消毒+重名加后缀+50MB 上限；`/clear` 不删文件 |
 | 微信收到文件 Agent 不主动读内容（行为约束走渠道快照） | 有效 | 代码层只保证「引用式传递」，但模型可能拿到引用后自行 read_file/exec 读取，违背「乖宝说帮我看看再读」的设计。约束入 `agent/context.py::_channel_section`：微信渠道收到 📎 文件引用时只确认收到，不主动读取内容（含 read_file / exec 等任何方式），等用户明确指令后再读。TASK-003 验收实机发现后补充（2026-08-05） |
+| 日志系统使用 Loguru（TASK-034 决策） | 有效 | 个人项目日志首选 Loguru：零配置、自动颜色/时间戳/模块名/行号、内置文件轮转与保留策略、asyncio 友好。配置走 `config.json` 的 `logging` 段（console / info_file / error_file 独立开关与级别），旧配置缺失时回退默认值；相对路径基于 `config.workspace` 解析，目录不存在自动创建；统一格式 `{time} | {level} | {name}:{line} | {message}`。核心链路（main/gateway/voice/loop/reminders）print 已替换为 logger，其余 print 在后续整理代码时逐步替换。`info_file` 默认级别为 `DEBUG`，`console` 默认级别为 `INFO`，实现「终端安静、文件详细」：思考过程、工具调用、工具结果等运行细节用 `logger.debug` 落盘，但不刷屏终端。测试间必须 `logger.remove()` 清理全局 handler 避免累积。未启用 `enqueue=True`，个人助手场景同步写文件足够，后续如需高吞吐可再评估 |
 | 渠道感知走会话级快照（System Prompt）而非每轮前缀注入 | 有效 |
 | 跨会话记忆同步走「快照+版本补丁」机制 | 有效 | 记忆文件（USER.md/MEMORY.md）被其他会话写后，本会话经 <memory_patch> 补丁感知，不靠模型自觉。全局 revision 存 workspace/memory/changelog.jsonl（每写一次 +1），会话 revision 存 <safe_key>.meta.json 侧车；每轮比对，变了才把补丁（system 角色）插在历史之后、本轮 user 之前并持久化进 JSONL；无变化零注入（不破坏前缀缓存）。补丁是认知更新，模型不得将其回写记忆文件（实测 Agent 收到补丁后误以为要同步文件而覆盖写盘，已加行为约束） |
 | 记忆补丁必须持久化进会话历史 | 有效 | 补丁不落盘则下一轮只剩旧快照，等于忘记更新（早期「用完即弃」方案的关键修正） |

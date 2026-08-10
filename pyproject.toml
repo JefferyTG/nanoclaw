@@ -10,6 +10,7 @@ dependencies = [
     "html2text>=2025.4.15",
     "httpx>=0.28.1",
     "lark-oapi>=1.7.1",
+    "loguru>=0.7.3",
     "mcp>=1.28.1",
     "onnxruntime==1.24.4",
     "openai>=2.46.0",
