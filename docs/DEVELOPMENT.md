@@ -111,6 +111,31 @@ flowchart LR
 
 不需要 API Key 的文档/静态审计不应启动真实模型。需要真实外部服务的验证必须说明成本、数据和副作用，并取得授权。
 
+### 5.1 按模块跑测试（TASK-035 起）
+
+`tests/` 已按业务模块拆分为子目录，日常开发可只跑相关模块，不必每次跑全量（全量会包含 voice 相关测试，避免外放声音的诉求靠按模块跑解决）：
+
+```bash
+# 全量（回归基线）
+.venv/bin/python -m unittest discover -s tests -t .
+
+# 常用模块单独跑
+.venv/bin/python -m unittest discover -s tests/agent -t . -v
+.venv/bin/python -m unittest discover -s tests/channels/voice -t . -v
+.venv/bin/python -m unittest discover -s tests/channels/weixin -t . -v
+.venv/bin/python -m unittest discover -s tests/channels/feishu -t . -v
+.venv/bin/python -m unittest discover -s tests/gateway -t . -v
+.venv/bin/python -m unittest discover -s tests/tools -t . -v
+.venv/bin/python -m unittest discover -s tests/config -t . -v
+.venv/bin/python -m unittest discover -s tests/reminders -t . -v
+.venv/bin/python -m unittest discover -s tests/subagents -t . -v
+.venv/bin/python -m unittest discover -s tests/integration -t . -v
+.venv/bin/python -m unittest discover -s tests/system -t . -v
+.venv/bin/python -m unittest discover -s tests/voice -t . -v
+```
+
+说明：测试子目录与生产包/模块同名（如 `tests/channels/voice` 对应 `channels/voice.py`），因此统一用 `-t .` 把项目根作为 top-level，让生产模块总是先被解析，测试模块以 `tests.<dir>.<testfile>` 名义加载、但 import/patch 的都是生产代码，顶层绝对导入（如 `from channels.voice import VoiceChannel`）移动后无需改动。
+
 ## 6. 完成标准（Definition of Done）
 
 只有同时满足下列条件，负责人才能宣布任务完成：

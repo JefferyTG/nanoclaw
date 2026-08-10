@@ -623,7 +623,7 @@ class WebUiJsSyntaxTests(unittest.TestCase):
 
     @staticmethod
     def _script() -> str:
-        page = Path(__file__).resolve().parents[1] / "webui" / "index.html"
+        page = Path(__file__).resolve().parents[2] / "webui" / "index.html"
         html = page.read_text(encoding="utf-8")
         match = re.search(r"<script>\s*(.*?)\s*</script>", html, re.DOTALL)
         assert match, "inline Web UI script is missing"

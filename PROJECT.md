@@ -76,7 +76,7 @@
 | 用途 | 命令 |
 |---|---|
 | 启动 | `uv run python main.py`（无终端时 `web_port>0` 可纯 Web 跑） |
-| 测试（Python） | `.venv/bin/python -m unittest discover -s tests`（**unittest，非 pytest**） |
+| 测试（Python） | `.venv/bin/python -m unittest discover -s tests -t .` 全量；按模块跑见 `docs/DEVELOPMENT.md` §5.1（**unittest，非 pytest**） |
 | 微信 Bridge 回归 | `cd integrations/weixin_bridge && npm test && npm run build` |
 | 语法检查 | `uv run python -m compileall -q agent bus channels providers session reminders voice` |
 | 导入冒烟 | `uv run python -c "import main"` |
@@ -128,6 +128,6 @@ Web 附加：AgentLoop 流事件 → Bus.stream → WebChannel → WebSocket（t
 
 > **唯一事实源是 git 本身**（`git log` / `git status` / `git diff`）。本段只留指针与稳定约定，**不复制任何瞬时状态**——hash 列表、领先/落后数量、未跟踪清单都会过期，一律不写，需要时直接查 git。
 
-- 当前里程碑：TASK-001~034 已完成并归档（任务卡见 `docs/tasks/completed/`）；active：无。
+- 当前里程碑：TASK-001~035 已完成并归档（任务卡见 `docs/tasks/completed/`）；active：无。
 - 最新提交、分支、领先/落后、工作区状态：`git log` / `git status`。
 - 稳定约定：`kb-testset/`（个人知识库测试资产）已在 `.gitignore` 中不追踪；存在 codex 外部 worktree → 多会话并行开发时严格遵守 AGENTS.md 文件所有权规则。
