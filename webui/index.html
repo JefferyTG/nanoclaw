@@ -177,6 +177,7 @@
   <div class="row"><div><label>主模型</label><input id="model" /></div><div><label>子 Agent 模型</label><input id="subagent_model" /></div></div>
   <label>最大迭代次数</label><input id="max_iterations" type="number" />
   <label>单轮超时（秒）</label><input id="turn_timeout_sec" type="number" min="30" step="30" />
+  <label>Shell 命令超时（秒）</label><input id="shell_timeout_sec" type="number" min="1" step="10" />
 
   <h2>工作区与人设</h2>
   <label>工作区目录</label><input id="workspace" />
@@ -229,7 +230,7 @@
   var cfgBtn = document.getElementById('cfgBtn');
   var cfgPanel = document.getElementById('config');
   var cfgMsg = document.getElementById('cfgMsg');
-  var FIELDS = ['api_key','base_url','model','subagent_model','workspace','timezone','max_iterations','turn_timeout_sec','identity_file','feishu_app_id','feishu_app_secret','web_host','web_port'];
+  var FIELDS = ['api_key','base_url','model','subagent_model','workspace','timezone','max_iterations','turn_timeout_sec','shell_timeout_sec','identity_file','feishu_app_id','feishu_app_secret','web_host','web_port'];
 
   // —— 网页 TTS：只消费本页收到的、实时 Agent token；不保存开关状态 ——
   var ttsBtn = document.getElementById('ttsBtn');

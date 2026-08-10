@@ -68,9 +68,11 @@ class ExecTool(Tool):
         r":\(\)\{.*\}",      # Fork 炸弹
     ]
 
-    def __init__(self, workspace: str = ".") -> None:
+    def __init__(self, workspace: str = ".", timeout: int = 300) -> None:
         # 统一转成绝对路径，命令将固定在该目录下执行
         self.workspace = os.path.abspath(workspace)
+        # 单条命令超时（秒）：超时后整组杀进程并返回错误；由 config.shell_timeout_sec 注入
+        self.timeout = max(1, int(timeout))
 
     def _is_dangerous(self, command: str) -> str | None:
         """检查命令是否命中危险模式。
@@ -112,9 +114,9 @@ class ExecTool(Tool):
             )
 
             try:
-                # 3. 60 秒超时保护
+                # 3. 超时保护（config.shell_timeout_sec，默认 300 秒）
                 stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=60
+                    proc.communicate(), timeout=self.timeout
                 )
             except asyncio.TimeoutError:
                 # 超时：杀掉整个进程组（含 npx 拉起的 node 孙进程），再等待回收
@@ -127,7 +129,7 @@ class ExecTool(Tool):
                     await proc.wait()
                 except Exception:
                     pass
-                return "命令执行超时（60秒），已终止"
+                return f"命令执行超时（{self.timeout}秒），已终止"
 
             # 4. 拼接输出：先 stdout，stderr 非空时加“标准错误:”前缀
             out = stdout.decode(errors="replace")

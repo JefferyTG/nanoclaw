@@ -125,7 +125,7 @@
 - “暂不支持多会话”已被 CLI、飞书和 Web 的多会话实现替代。
 - MemoryConsolidation（TASK-006 起改名 `ContextCompactor`）“尚未接入 AgentLoop”和 token 估算 TODO 均已完成。
 - Web 旧页显示 JSON、断线不重连、`web:web:` 双前缀、流式挂起无超时等问题已有对应修复，不能仅凭旧日志当作当前 Bug。
-- 历史日志对统一工具超时互相冲突；当前普通工具由 `ToolRegistry.execute()` 使用 180 秒兜底，Shell 另有 60 秒超时。子 Agent 由自身回合上限管理，生图由单请求超时和整次任务预算管理，避免普通工具上限提前截断长任务和重试。
+- 历史日志对统一工具超时互相冲突；当前普通工具由 `ToolRegistry.execute()` 使用 180 秒兜底，Shell 超时已配置化为 `shell_timeout_sec`（默认 300 秒）。子 Agent 由自身回合上限管理，生图由单请求超时和整次任务预算管理，避免普通工具上限提前截断长任务和重试。
 - 历史日志称最后提交无法 push；当前 Git 实测 `HEAD` 与 `origin/main` 均为 `0daefc4`，领先/落后为 `0/0`，此项已核销。
 - “飞书不支持图片”已核销：当前支持私聊图片入站，以及 Agent/子 Agent 生成图片出站；群聊仍要求事件包含 @ 提醒。
 - NC-BUG-005 已核销（TASK-012 会话索引实时性）：`memory_search(scope=session)` 每次搜索前增量扫 sessions（mtime/size 对比只重索引变化/新增），`/clear` 后同步清索引；重启 `rebuild_all()` 兜底，新会话内容无需重启即可搜到。

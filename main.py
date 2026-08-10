@@ -1012,7 +1012,7 @@ def build_shared() -> dict:
     tools.register(ReadFileTool(config.workspace))
     tools.register(WriteFileTool(config.workspace))
     tools.register(ListDirTool(config.workspace))
-    tools.register(ExecTool(config.workspace))
+    tools.register(ExecTool(config.workspace, timeout=config.shell_timeout_sec))
     tools.register(WebSearchTool())
     tools.register(WebFetchTool())
     # 动态墙钟不再进入 System Prompt；只有相关问题才通过此工具按实例时区查询。

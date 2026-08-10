@@ -189,7 +189,7 @@ Web 是唯一启用细粒度流事件的渠道：`thinking`、`token`、`tool_ca
 2. 加入会话历史和当前 user；图片按基础模型是否多模态选择直传或工具路径。
 3. 估算消息、多模态 content 与工具 Schema；超过 `context_budget_tokens` 预算（默认 512k）时，ContextCompactor 把旧消息总结为一条 system 摘要，并记录稳定 head/tail 压缩边界（预算内原样返回、摘要失败保留原历史）。
 4. Provider 返回最终回答或 tool calls。
-5. ToolRegistry 统一按名调用工具并把异常转成字符串。普通工具默认使用 180 秒兜底超时，Shell 另有 60 秒内部超时；`spawn_subagent` 由子 Agent 自身的回合上限管理，生图使用独立的单请求超时和整次任务预算。
+5. ToolRegistry 统一按名调用工具并把异常转成字符串。普通工具默认使用 180 秒兜底超时，Shell 超时由 `shell_timeout_sec` 配置（默认 300 秒）；`spawn_subagent` 由子 Agent 自身的回合上限管理，生图使用独立的单请求超时和整次任务预算。
 6. 工具结果加入 messages 后继续模型循环，直到最终回答、单轮超时、最大迭代数或熔断。
 
 跨轮历史使用单一 canonical API 形式：`assistant(tool_calls) → tool` 顺序自愈，孤立 tool 丢弃，缺失结果用固定占位补齐；assistant 顶层 `reasoning_content`（若供应商要求工具循环重放）会在同进程、JSONL 与重启恢复中一致保留，但绝不进入单个 `tool_calls` 元素。这样最后一次工具请求能够成为下一用户回合的精确消息前缀。

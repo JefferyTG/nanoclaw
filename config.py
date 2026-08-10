@@ -120,6 +120,7 @@ _CONFIG_FIELDS = (
     "web_host",
     "web_port",
     "turn_timeout_sec",
+    "shell_timeout_sec",  # Shell 工具单条命令超时（秒，默认 300）
     # 上下文 token 预算：ContextCompactor 的压缩阈值（启动期配置，改后需重启）。
     "context_budget_tokens",
     # 每日做梦整理时刻（HH:MM，实例时区；默认 02:00）。到点把当天各会话事件
@@ -200,6 +201,7 @@ class NanoClawConfig:
     web_host: str = "0.0.0.0"        # 网页渠道监听地址（0.0.0.0 同局域网可达）
     web_port: int = 0                # 网页渠道端口；0 表示不启用网页渠道
     turn_timeout_sec: int = 600      # 单轮对话墙钟超时（秒）；超时强制终止，防卡死
+    shell_timeout_sec: int = 300      # ExecTool（Shell）单条命令超时（秒）；超时整组杀进程
     context_budget_tokens: int = 524288  # 上下文 token 预算（ContextCompactor 压缩阈值；默认 512k）
     dream_time: str = "02:00"            # 每日做梦整理时刻（HH:MM，实例时区；缺省 02:00，同款容错）
     mcp_servers: dict = field(default_factory=dict)  # MCP Server 配置：{server_name: {command, args, env?, cwd?}}
