@@ -1043,6 +1043,11 @@ class VoiceChannel(Channel):
 
         # 方案 B：先播甘雨确认回应（播完才返回），再进入连续对讲。
         await self._play_wake_reply()
+        # TASK-033：唤醒前检查空闲分片（此时 _continuous 还是 False，不会
+        # 被 _maybe_split_session 的连续对讲短路）；随后更新活动时间，让本
+        # 次唤醒计入「最近交互」，避免紧接着的 inject_text 再次分片。
+        self._maybe_split_session()
+        self._bump_activity()
         self._enter_continuous()
         self._schedule_next_listen()
 
