@@ -1,7 +1,7 @@
 # TASK-037-实时通话渠道
 
-> 状态：实现中
-> 创建：2026-08-11 ｜ 负责人：小奈 + code-master ｜ 基线 commit：8c8992d（TASK-036 完成时 HEAD）
+> 状态：✅ 已完成（2026-08-11 归档，commit 0cd324d 已推送 main）
+> 创建：2026-08-11 ｜ 负责人：小奈 + code-master + codex ｜ 基线 commit：8c8992d（TASK-036 完成时 HEAD）
 
 ## 目标
 
@@ -53,16 +53,16 @@
 
 ## 验收标准
 
-- [ ] `config` 新增 `realtime` 段；与 `voice` 互斥校验生效（同时 enable 报错或强制二选一）。
-- [ ] 启动后 KWS 待命；唤醒词命中 → 建立豆包连接 → 全双工对话。
-- [ ] 音频上行正确（16k PCM Base64 分包）；下行音频可播放（PCM 24k）。
-- [ ] 对话中可打断；客户端不主动发 `response.cancel`，由服务端动态判停，打断后能继续听。
-- [ ] 退出路径：`[END]` / 静默超时 / 手动关闭 → 先 `session.close` 收到回复再断开 → 回到 KWS 待命（避免 ContextCanceled）。
-- [ ] `fc_bridge` 骨架存在：tools 空数组、下行函数调用事件按 call_id 配对的执行器预留（默认仅日志）。
-- [ ] `realtime_identity.md` 人设与个人记忆生效（豆包回复符合小奈设定、称呼乖宝「洵洵」）；不存在 config 或代码内置的第二份人设。
-- [ ] 默认音色 vivi 生效（`zh_female_vv_jupiter_bigtts`），可配置切换其它 3 个内置音色。
-- [ ] 旧 voice 渠道测试全绿；新增 realtime 测试全绿（`unittest discover -s tests -t .`）。
-- [ ] `pyproject.toml` 显式声明 `websockets` 依赖。
+- [x] `config` 新增 `realtime` 段；与 `voice` 互斥校验生效（同时 enable 报错或强制二选一）。
+- [x] 启动后 KWS 待命；唤醒词命中 → 建立豆包连接 → 全双工对话（真机冒烟通过）。
+- [x] 音频上行正确（16k PCM Base64 分包）；下行音频可播放（PCM 24k，真机可听）。
+- [x] 对话中可打断；客户端不主动发 `response.cancel`，由服务端动态判停，打断后能继续听（codex 修复）。
+- [x] 退出路径：静默超时 / 手动关闭 → 先 `session.close` 收到回复再断开 → 回到 KWS 待命（避免 ContextCanceled；`[END]` 标记已按设计移除）。
+- [x] `fc_bridge` 骨架存在：tools 空数组、下行函数调用事件按 call_id 配对的执行器预留（默认仅日志）。
+- [x] `realtime_identity.md` 人设与个人记忆生效（豆包回复符合小奈设定、称呼乖宝「洵洵」）；不存在 config 或代码内置的第二份人设。
+- [x] 默认音色 vivi 生效（`zh_female_vv_jupiter_bigtts`），可配置切换其它 3 个内置音色。
+- [x] 旧 voice 渠道测试全绿；新增 realtime 测试全绿（`unittest discover -s tests -t .` → 全量 938 OK）。
+- [x] `pyproject.toml` 显式声明 `websockets` 依赖。
 
 ## 相关模块
 
@@ -127,12 +127,21 @@
 - **打断时机**：本地 VAD 判定打断的灵敏度需实测调参，避免误打断。
 - **SC 2.0 / 甘雨复刻**：不在本任务范围，后续评估 SC 版本接入方式与声音复刻可行性。
 
-## 下一步
+## 归档摘要（2026-08-11）
 
-1. 验证 ark key 是否可用于语音接口（语音控制台 API Key 管理）；不可用则请乖宝从语音控制台获取语音专用 key。
-2. 乖宝确认「开始」后，派 code-master 按本卡实现。
-3. 实现完成后冒烟：真实唤醒对话，验证 vivi 音色/延迟/打断。
-4. 后续任务候选：SC 2.0 版本探索（陪伴人设）、甘雨复刻音色、FC 工具接入、联网搜索开启。
+- **提交**：`0cd324d`（28 文件 +3513 行）已推送 origin/main；工作区干净。
+- **最终实现**：realtime 渠道完整闭环可用（KWS 唤醒→豆包 S2S 全双工→静默超时/手动关闭优雅退出）。
+- **外放掐断根因与修复（codex）**：客户端 `feed_delta` 曾用 `_playing` 状态过滤，服务端回声误判发
+  `response.canceled` 后 `_playing=False` → 后续 delta 全被丢弃 → 听感「话说到一半被掐」。
+  修复=delta 收到即入队播放（对齐 py demo）+ 下行队列无上限不丢帧 + 移除本地 VAD 打断整条路径
+  （`interrupt_energy_threshold`/`_on_mic_voice`/`response.cancel` 全删），打断完全由服务端动态判停。
+- **TASK-038 AEC 实验**：speexdsp 客户端回声消除多轮失败后已整体回退（代码移除 + `brew uninstall speexdsp`），
+  任务卡 `TASK-038-回声消除AEC-已回退.md` 归档 completed/。
+- **人设单源**：`realtime_identity.md`（根目录，.gitignore 排除）为唯一人设/个人记忆源，每轮会话重读；
+  缺失/为空本轮通话报错回待命。
+- **验证**：全量 938 OK；`compileall` / `import main` / `git diff --check` 全通过。
+- **遗留（后续候选任务）**：SC 2.0 saturn 系音色探索（甘雨复刻潜在路线）、FC 工具接入、联网搜索开启、
+  macOS VoiceProcessingIO（外放回声的更优解，当前客户端播放方案已够用）。
 
 ## 冒烟问题与修复记录（2026-08-11）
 

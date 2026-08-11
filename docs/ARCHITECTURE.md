@@ -150,8 +150,10 @@ ASR 在启动期按 `asr_model` 配置装配并只注入 WebChannel。浏览器�
 start/stop 生命周期由 main.py 统一管理。数据流为「KWS 待命 → 唤醒 → 建会话
 → 播唤醒回应（复用本地 WAV 缓存）→ 全双工（上行 16k/20ms/640B Base64、
 下行 PCM 24k 直通播放）→ 静默超时 / stop → `session.close` 优雅退出 → 回 KWS
-待命」（客户端回声消除 AEC 已于 2026-08-11 实验后回退移除，外放回声问题待
-另行解决）。KWS 待命与对话**串行**：
+待命」（客户端回声消除 AEC 已于 2026-08-11 实验后回退移除；外放被
+`response.canceled` 掐断的问题已由客户端修复：`output_audio.delta` 收到即入队
+播放、下行队列不设丢帧上限、打断完全交给豆包服务端动态判停，客户端不发
+`response.cancel`，见 TASK-037 归档摘要）。KWS 待命与对话**串行**：
 唤醒命中先停 KWS 释放麦克风，对话结束再重启 KWS；与旧 voice 渠道共用麦克风，
 二者同时 enable 在启动期直接报错（`_validate_voice_realtime_exclusive`）。
 鉴权用语音控制台 API Key（`realtime.api_key`，UUID 格式），只进请求头
