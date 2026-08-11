@@ -981,6 +981,7 @@ dependencies = [
     { name = "sentencepiece" },
     { name = "sherpa-onnx" },
     { name = "sounddevice" },
+    { name = "websockets" },
 ]
 
 [package.metadata]
@@ -1002,6 +1003,7 @@ requires-dist = [
     { name = "sentencepiece", specifier = ">=0.2.2" },
     { name = "sherpa-onnx", specifier = "==1.12.40" },
     { name = "sounddevice", specifier = ">=0.5.5" },
+    { name = "websockets", specifier = ">=15.0.1" },
 ]
 
 [[package]]

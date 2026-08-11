@@ -100,6 +100,22 @@ _VOICE_PLAYBACK_FIELDS = (
     "soft_clip",
 )
 
+# 实时通话渠道（TASK-037）白名单：与 voice 同模式，未知字段丢弃。
+# api_key 为语音控制台 API Key（UUID 格式），由用户写入 config.json；
+# 与 voice 共用麦克风，二者不可同时 enable（main.py 校验）。
+_REALTIME_FIELDS = (
+    "enabled",
+    "api_key",
+    "voice",
+    "model",
+    "wake_replies_dir",
+    "silence_timeout_sec",
+    "enable_websearch",
+    "kws",
+)
+# realtime.kws 子字典白名单：结构与 voice.kws 完全相同，直接复用。
+_REALTIME_KWS_FIELDS = _VOICE_KWS_FIELDS
+
 
 # 参与序列化/反序列化的字段清单（用于从 JSON 安全填充，避免读到无关键）
 _CONFIG_FIELDS = (
@@ -152,6 +168,8 @@ _CONFIG_FIELDS = (
     "weixin",
     # 本地语音渠道：无音频骨架默认关闭，TASK-024。
     "voice",
+    # 实时通话渠道：豆包端到端全双工，默认关闭，TASK-037。
+    "realtime",
     # 思考强度参数：控制模型推理深度（none / minimal / low / medium / high / xhigh / max）。
     "reasoning_effort",
     # 思考 token 预算：控制模型推理时的 token 消耗上限（整数，可选）。
@@ -400,6 +418,31 @@ class NanoClawConfig:
             "int8": False,
         },
     })
+    # 实时通话渠道（TASK-037）：豆包端到端全双工（Seeduplex 1.2.6.1），
+    # 独立闭环不走消息总线，默认关闭。api_key 为语音控制台 API Key（UUID
+    # 格式；ark- 前缀的火山方舟 key 不可用于语音接口），用户自行填入
+    # config.json，key 值绝不落文档/git；voice_type 默认 vivi
+    # （zh_female_vv_jupiter_bigtts），可切换 小何/云舟/小天。
+    # 与 voice 渠道共用麦克风，二者不可同时 enable（main.py 校验）。
+    # 人设与个人记忆只从仓库根目录 realtime_identity.md 读取（该文件不进 Git）。
+    realtime: dict = field(default_factory=lambda: {
+        "enabled": False,
+        "api_key": "",
+        "voice": "zh_female_vv_jupiter_bigtts",
+        "model": "1.2.6.1",
+        "wake_replies_dir": "workspace/voice/wake_replies/",
+        "silence_timeout_sec": 5.0,
+        "enable_websearch": False,
+        "kws": {
+            "model_dir": "voice/kws/models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01",
+            "keywords_file": "",
+            "device": None,
+            "sample_rate": 16000,
+            "cooldown_sec": 2.0,
+            "confirm_hits": 1,
+            "int8": False,
+        },
+    })
     # 思考强度参数：控制模型推理深度（none / minimal / low / medium / high / xhigh / max）。
     # 默认 "high" 开启思考；配成空字符串 "" 则不传该参数，兼容不支持思考的模型。
     reasoning_effort: str = "high"
@@ -433,7 +476,7 @@ def load_config(config_path: str = "config.json") -> NanoClawConfig:
             if key in data and data[key] is not None:
                 # ASR/TTS 配置允许只覆盖少数字段；其余继续使用当前代码默认值，
                 # 方便未来新增可选参数而不要求用户立刻重写旧 config.json。
-                if key in ("asr_model", "tts_model", "reminders", "weixin", "voice", "logging") and isinstance(data[key], dict):
+                if key in ("asr_model", "tts_model", "reminders", "weixin", "voice", "realtime", "logging") and isinstance(data[key], dict):
                     merged = dict(getattr(cfg, key))
                     if key == "weixin":
                         weixin_data = data[key]
@@ -481,6 +524,21 @@ def load_config(config_path: str = "config.json") -> NanoClawConfig:
                                 {name: playback_data[name] for name in _VOICE_PLAYBACK_FIELDS if name in playback_data}
                             )
                             merged["playback"] = playback
+                    elif key == "realtime":
+                        # realtime 白名单合并（TASK-037）：与 voice 同模式，
+                        # 从默认 realtime 重建，只接受 _REALTIME_FIELDS 中的键，
+                        # 未知丢弃；kws 子字典白名单与 voice 一致。
+                        realtime_data = data[key]
+                        merged.update(
+                            {name: realtime_data[name] for name in _REALTIME_FIELDS if name in realtime_data}
+                        )
+                        if isinstance(realtime_data.get("kws"), dict):
+                            kws = dict((getattr(cfg, key) or {}).get("kws") or {})
+                            kws_data = realtime_data["kws"]
+                            kws.update(
+                                {name: kws_data[name] for name in _REALTIME_KWS_FIELDS if name in kws_data}
+                            )
+                            merged["kws"] = kws
                     else:
                         merged.update(data[key])
                     setattr(cfg, key, merged)
@@ -586,6 +644,18 @@ def save_config(cfg: NanoClawConfig, config_path: str = "config.json") -> None:
                 name: data["voice"]["playback"][name]
                 for name in _VOICE_PLAYBACK_FIELDS
                 if name in data["voice"]["playback"]
+            }
+    if isinstance(data.get("realtime"), dict):
+        data["realtime"] = {
+            name: data["realtime"][name]
+            for name in _REALTIME_FIELDS
+            if name in data["realtime"]
+        }
+        if isinstance(data["realtime"].get("kws"), dict):
+            data["realtime"]["kws"] = {
+                name: data["realtime"]["kws"][name]
+                for name in _REALTIME_KWS_FIELDS
+                if name in data["realtime"]["kws"]
             }
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)

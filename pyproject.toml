@@ -20,4 +20,5 @@ dependencies = [
     "sentencepiece>=0.2.2",
     "sherpa-onnx==1.12.40",
     "sounddevice>=0.5.5",
+    "websockets>=15.0.1",
 ]

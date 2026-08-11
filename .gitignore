@@ -28,9 +28,10 @@ run.log
 nanoclaw.launchd.log
 output/
 
-# 人设（个人定制，仓库使用内置默认人设兜底）
+# 人设（个人定制，不进入版本库）
 identity.md
 identity_oldsis.md
+realtime_identity.md
 
 # 环境相关脚手架（含本机绝对路径，不可移植）
 deploy/

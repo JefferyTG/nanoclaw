@@ -19,6 +19,7 @@ NanoClaw 是一个本地优先、单进程、多渠道的个人 AI Agent 网关�
 | 网络工具 | `httpx`、`ddgs`、`html2text`、Tavily Search/Extract（REST） | 网页抓取、多通道搜索（Tavily+ddgs 降级）、抓取降级链（httpx→Jina→Chrome→Tavily）、生图服务请求 |
 | 语音输入 | MediaRecorder、FFmpeg/ffprobe、`httpx` | Web 录音、格式规范化、云端 ASR |
 | 语音输出 | `edge-tts`（默认）、`dashscope`（甘雨音色 `QwenTtsRealtime` 流式，可选）、HTMLAudioElement | Web 新回复分段合成、顺序播放与取消；DashScope 输出 WAV |
+| 实时通话 | `websockets`、sounddevice | 豆包 Seeduplex 全双工 S2S（`realtime` 渠道，**不走消息总线**；人设只读 `realtime_identity.md`；打断交由服务端动态判停，TASK-037） |
 | 技能 | Markdown + YAML frontmatter | 技能发现、摘要注入与按需加载 |
 | 数据 | JSONL、Markdown、图片文件、SQLite | 会话、长期/每日记忆、图片、LIKE 检索索引 |
 
@@ -105,7 +106,7 @@ nanoclaw/
 │   └── weixin_bridge/      # 固定上游源码、Node Bridge、NOTICE 与 Node 测试
 ├── providers/              # 模型抽象和 OpenAI-compatible 实现
 ├── reminders/              # DTO、RFC 5545、SQLite 仓储、调度器和应用服务
-├── voice/                  # 音频校验/规范化、ASR/TTS 抽象与 Provider
+├── voice/                  # 音频校验/规范化、ASR/TTS、KWS、realtime_s2s（豆包全双工）
 ├── bin/nanoclawctl         # Linux 后台进程启动、停止、重启与状态查询
 ├── session/manager.py      # 一会话一 JSONL、恢复和自愈
 ├── skills/                 # 运行时实际扫描的技能目录
@@ -142,6 +143,22 @@ nanoclaw/
 Linux 后台控制脚本通过 `setsid` 建立独立进程组，并用 PID 文件校验 `/proc` 中的工作目录和命令行，避免陈旧 PID 误杀其它进程。`SIGTERM` 在 `main.py` 中转换为 asyncio 停止事件；Gateway 先取消并等待已登记的在途消息任务，再停止渠道并关闭 MCP 连接。
 
 ASR 在启动期按 `asr_model` 配置装配并只注入 WebChannel。浏览器把完整录音上传到独立 HTTP 端点，WebChannel 在主事件循环调用共享转写服务；成功且非空的文本再通过原有 WebSocket 文本入口进入 MessageBus。音频字节、临时路径和 Provider 原始响应均不进入 Bus 或会话持久化。
+
+`realtime` 渠道（TASK-037）是**不走消息总线的特例**：基于豆包端到端全双工
+（Seeduplex 1.2.6.1），语音进→语音出、对话思考发生在豆包服务端内部，因此
+`RealtimeChannel` 继承 `Channel` 但 `bus=None`、`send()` 空实现，只复用
+start/stop 生命周期由 main.py 统一管理。数据流为「KWS 待命 → 唤醒 → 建会话
+→ 播唤醒回应（复用本地 WAV 缓存）→ 全双工（上行 16k/20ms/640B Base64、
+下行 PCM 24k 直通播放）→ 静默超时 / stop → `session.close` 优雅退出 → 回 KWS
+待命」（客户端回声消除 AEC 已于 2026-08-11 实验后回退移除，外放回声问题待
+另行解决）。KWS 待命与对话**串行**：
+唤醒命中先停 KWS 释放麦克风，对话结束再重启 KWS；与旧 voice 渠道共用麦克风，
+二者同时 enable 在启动期直接报错（`_validate_voice_realtime_exclusive`）。
+鉴权用语音控制台 API Key（`realtime.api_key`，UUID 格式），只进请求头
+`X-Api-Key`，key 值不落文档。每次新建会话前，渠道从仓库根目录的私有文件
+`realtime_identity.md` 重读完整人设与个人生活记忆并作为 `instructions` 发送；
+该文件被 Git 忽略，工作记忆不进入实时通话。配置层不再提供另一份 instructions
+覆盖项，避免代码默认值、配置和文件之间发生漂移。
 
 TTS 同样在启动期按 `tts_model` 配置装配并只注入 WebChannel，但不进入 MessageBus。`provider=edge_tts` 合成 MP3；`provider=dashscope_realtime` 走 DashScope `QwenTtsRealtime`（WebSocket 流式，provider 内部收集 PCM 后封装 WAV，commit 模式以服务端 `response.done` 判定完成，不阻塞事件循环），支持录音复刻换音色（`voice/tts/dashscope_realtime.create_voice_by_clone`，TASK-017）。网页仅在用户主动开启朗读后，从实时 Agent `token/done` 事件按标点和长度切分新回复，经独立 HTTP 端点合成短音频；当前片段播放时预合成下一片段。关闭朗读、发送新消息、切换会话或断线会取消请求并清空播放状态，历史回放不会触发 TTS。
 

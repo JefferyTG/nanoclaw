@@ -123,6 +123,24 @@
       "int8": false
     }
   },
+  "realtime": {
+    "enabled": false,
+    "api_key": "<voice-console-api-key>",
+    "voice": "zh_female_vv_jupiter_bigtts",
+    "model": "1.2.6.1",
+    "wake_replies_dir": "workspace/voice/wake_replies/",
+    "silence_timeout_sec": 5.0,
+    "enable_websearch": false,
+    "kws": {
+      "model_dir": "voice/kws/models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01",
+      "keywords_file": "",
+      "device": null,
+      "sample_rate": 16000,
+      "cooldown_sec": 2.0,
+      "confirm_hits": 1,
+      "int8": false
+    }
+  },
   "video_gen_model": {
     "api_key": "",
     "base_url": "",

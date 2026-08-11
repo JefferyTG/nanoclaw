@@ -86,6 +86,7 @@ from gateway import Gateway
 from channels.cli import CLIChannel
 from channels.feishu import FeishuChannel
 from channels.voice import VoiceChannel
+from channels.realtime import DEFAULT_VOICE_TYPE, RealtimeChannel
 from voice.kws.detector import KwsWakeDetector
 from voice.kws.errors import KwsError
 from channels.weixin import WeixinChannel
@@ -442,6 +443,20 @@ def build_weixin_channel(
         ),
         auto_login=True,
     )
+
+
+def _validate_voice_realtime_exclusive(voice_settings: dict, realtime_settings: dict) -> None:
+    """voice 与 realtime 共用麦克风：同时 enable 直接报错（TASK-037）。
+
+    双轨并行必须二选一，避免两个渠道同时抢占麦克风（KWS 流 + 录音流）。
+    """
+    voice_enabled = bool((voice_settings or {}).get("enabled", False))
+    realtime_enabled = bool((realtime_settings or {}).get("enabled", False))
+    if voice_enabled and realtime_enabled:
+        raise ValueError(
+            "voice 与 realtime 渠道共用麦克风，不可同时启用；"
+            "请在 config.json 中二选一（voice.enabled / realtime.enabled）"
+        )
 
 
 async def watch_channel_start_failures(tasks, channels, *, ignore_indices=()):
@@ -1704,6 +1719,72 @@ async def amain() -> None:
             logger.warning(f"语音渠道已启用·唤醒未就绪（{kws_degrade_reason}），仅 inject_text 可用")
     else:
         logger.info("语音渠道未启用")
+
+    # 实时通话渠道：豆包端到端全双工（TASK-037）。独立闭环、不走消息总线；
+    # 与 voice 渠道共用麦克风，二者不可同时 enable（配置期直接报错）。
+    realtime_settings = cfg.realtime if isinstance(cfg.realtime, dict) else {}
+    if realtime_settings.get("enabled", False):
+        _validate_voice_realtime_exclusive(voice_settings, realtime_settings)
+        realtime_api_key = str(realtime_settings.get("api_key") or "").strip()
+        if not realtime_api_key:
+            logger.warning("实时通话渠道未启用：缺 realtime.api_key（语音控制台 UUID Key）")
+        else:
+            realtime_kws_cfg = (
+                realtime_settings.get("kws")
+                if isinstance(realtime_settings.get("kws"), dict)
+                else {}
+            )
+            realtime_kws_dir = Path(
+                str(realtime_kws_cfg.get("model_dir") or "").strip()
+            )
+            realtime_kws_detector = None
+            realtime_kws_reason = None
+            if realtime_kws_dir and realtime_kws_dir.is_dir():
+                try:
+                    realtime_kws_detector = KwsWakeDetector(
+                        model_dir=realtime_kws_dir,
+                        keywords_file=(
+                            str(realtime_kws_cfg.get("keywords_file") or "").strip()
+                            or None
+                        ),
+                        device=realtime_kws_cfg.get("device"),
+                        sample_rate=int(realtime_kws_cfg.get("sample_rate", 16000)),
+                        cooldown_sec=float(realtime_kws_cfg.get("cooldown_sec", 2.0)),
+                        confirm_hits=int(realtime_kws_cfg.get("confirm_hits", 1)),
+                        int8=bool(realtime_kws_cfg.get("int8", False)),
+                    )
+                except (TypeError, ValueError, KwsError) as exc:
+                    realtime_kws_reason = f"KWS 配置无效：{exc}"
+            else:
+                realtime_kws_reason = f"缺 KWS 模型（{realtime_kws_dir}）"
+            realtime_channel = RealtimeChannel(
+                bus,
+                api_key=realtime_api_key,
+                kws_detector=realtime_kws_detector,
+                voice=realtime_settings.get("voice") or DEFAULT_VOICE_TYPE,
+                model=realtime_settings.get("model") or "1.2.6.1",
+                wake_replies_dir=str(
+                    realtime_settings.get("wake_replies_dir")
+                    or "workspace/voice/wake_replies/"
+                ),
+                silence_timeout_sec=float(
+                    realtime_settings.get("silence_timeout_sec", 5.0) or 5.0
+                ),
+                enable_websearch=bool(realtime_settings.get("enable_websearch", False)),
+                device=realtime_kws_cfg.get("device"),
+            )
+            channels.append(realtime_channel)
+            if realtime_kws_detector is not None:
+                logger.info(
+                    f"实时通话渠道已启用·KWS 待命·豆包全双工"
+                    f"（音色 {realtime_settings.get('voice') or DEFAULT_VOICE_TYPE}）"
+                )
+            else:
+                logger.warning(
+                    f"实时通话渠道已启用·唤醒未就绪（{realtime_kws_reason}）"
+                )
+    else:
+        logger.info("实时通话渠道未启用")
 
     if not channels:
         logger.error("没有任何启用渠道（CLI 需终端，网页/飞书/微信需显式配置），退出。")

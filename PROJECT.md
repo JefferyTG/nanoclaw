@@ -17,6 +17,7 @@
 |---|---|---|
 | 多渠道 | ✅ | CLI / 飞书 WS / 微信 iLink(Node Bridge) / 网页 WS |
 | 本地语音渠道（唤醒+ASR 入站闭环） | ✅ | `voice` 渠道：`voice:local:<seq>` 多会话分片，`inject_text()` 唯一入站口，出站 `_emit` 单一出口；TASK-025 起唤醒闭环就绪——喊「小奈小奈」→ KWS 命中 → 播甘雨确认回应（`voice.wake_replies` 列表+random，默认「哎，我在呢，你说吧」，方案 B 播完再录音）→ 自动录音 N 秒 → ASR 转写 → 进 Agent 对话，音频内存流转不落盘，KWS 模型或 ASR 缺失自动降级为仅 `inject_text`（TASK-025）；TASK-026 接 Agent 回复 TTS 播放；`config.voice.enabled` 默认关闭（TASK-024）；TASK-026 起出站升级为「Agent 回复 → 甘雨 TTS → 播放到系统默认输出」（失败/超长 `voice.max_voice_chars`=300/未配置回文字不静默），并支持空闲自动分片（`voice.idle_ttl_sec` 默认 1800s，超时自动开新会话 seq+1 旧会话保留）+ 会话保留上限（`voice.max_sessions` 默认 50，超限清最老 voice 会话，仅本渠道）。TASK-027 起升级「连续对讲机」：回复播完等 `voice.record_delay_sec`(默认 0.5s) 自动续听下一句（不用每次喊唤醒词）+ 静音检测（`voice.vad.*`：RMS 能量流式 VAD，说完话停顿 `silence_end_sec` 1.2s 提前结束录音不等满 8s）+ 静默退出（`voice.silence_timeout_sec`=5s 没人声自动回待唤醒）+ [END] 结束语退出（voice Prompt 约定告别/结束话题时回复末尾带 [END]，渠道 TTS 合成前剥离标记、播完告别语即退出连续对话）+ voice 渠道专属 Prompt（简短俏皮口语化，知识类问题可适当多讲）；连续对讲进行中不触发空闲分片（`_maybe_split_session` 短路），退出后分片逻辑照旧。TASK-028 起播放防炸麦：`player.py` 在 `sd.play` 前过 DSP（`voice/kws/normalize.py` `normalize_playback_pcm`：峰值归一化 + tanh 软限幅，满幅音频压回 `voice.playback.*` 经 config 可配（白名单+深度合并，旧配置回退默认）。TASK-029 起唤醒回应本地预合成随机播放：10 条甘雨音色回应 WAV 预录落盘 `workspace/voice/wake_replies/`（`scripts/synthesize_wake_replies.py` 可复跑），`_play_wake_reply` 懁加载扫描 `wake_*.wav` → `random.choice` 播本地缓存（**不调云端 TTS 省字符费**），缓存缺失/播放失败回退云端合成（向后兼容）；`voice.wake_replies_dir` 可配（默认 `workspace/voice/wake_replies/`）。TASK-030 起分段流式播放（voice/segments.py 切句器+并发预合成分段播放）；TASK-032 起 LLM 流式 token 边攒边切边播（IncrementalSegmenter 增量切句+首段即开播，2-3s 出声）；TASK-033 修复唤醒前空闲分片检查（修 TASK-027 连续对讲导致分片死代码） |
+| 实时通话渠道（豆包 S2S 全双工） | 🚧 POC | `realtime` 渠道：豆包端到端全双工（Seeduplex 1.2.6.1），`Channel` 子类但**不走消息总线**（bus=None、send 空实现），独立闭环：KWS 待命（复用 `voice/kws/detector.py`）→ 唤醒 → `session.create`（`wss://openspeech.bytedance.com/api/v3/duplex/realtime/dialogue`，X-Api-Key；每轮从根目录私有文件 `realtime_identity.md` 重读人设与个人记忆，不读取工作记忆，也没有 config 人设覆盖项）→ 播唤醒回应（复用本地 WAV 缓存）→ 全双工（上行 16k/20ms/640B Base64 `input_audio_buffer.append`，下行 PCM 24k 直通播放，打断由豆包服务端动态判停，客户端不发 `response.cancel`）→ 静默超时/stop → `session.close` 优雅退出回 KWS 待命。KWS 待命与对话串行（唤醒先停 KWS 释放麦克风）；与 voice 麦克风互斥（同时 enable 启动报错）。`fc_bridge` 骨架已搭（tools 空数组 + call_id 配对执行器预留，默认仅日志）。音色默认 vivi `zh_female_vv_jupiter_bigtts` 可切 小何/云舟/小天。鉴权：语音控制台 UUID Key（`realtime.api_key`），key 不落文档。默认关闭（`config.realtime.enabled`）；待冒烟（真实唤醒对话验证音色/延迟/打断） |
 | 渠道感知 | ✅ | Agent 经 System Prompt 会话级快照感知渠道（feishu/weixin/web/cli）与用户标识（sender_id），会话内恒定，可做渠道专属行为；weixin 渠道含「微信日常对话模式」指令（短句口语碎碎念 / 甜度不变 / 连发消息自然接住，TASK-019） |
 | 微信深度集成 | ✅ | 扫码登录、图文收发、断线恢复、原生 typing、`/bind-reminders`、图片等待窗口合并 |
 | 微信语音转写 | ✅ | 语音经腾讯 STT 转写（`voice_item.text`）进入 Agent，不落地本地 ASR |
@@ -56,14 +57,14 @@
 | `gateway.py` | 入站调度、同会话锁/跨会话并发、出站/流事件路由、停止控制 | gateway.py |
 | `bus/queue.py` | 三队列消息总线 + DTO（Inbound/Outbound/Stream/ImageRef） | bus/queue.py |
 | `config.py` | 配置：默认值 < config.json < 环境变量，白名单读写 | config.py |
-| `channels/` | 渠道适配器（仅收发，不含业务） | base/cli/feishu/web/weixin/voice.py |
+| `channels/` | 渠道适配器（仅收发，不含业务） | base/cli/feishu/web/weixin/voice/realtime.py |
 | `agent/loop.py` | AgentLoop：ReAct 循环、流式事件、持久化、取消补历史 | agent/loop.py |
 | `agent/tools/` | Tool 抽象、Registry、内置工具、MCP 包装 | registry.py、mcp.py、各工具 |
 | `agent/daily.py` | 每日记忆：/clear 摘要 append + 每日做梦整理（固定分类/去重/合并更新） | agent/daily.py |
 | `providers/` | LLMProvider 抽象 + OpenAI 兼容实现 | base.py、openai_compat.py |
 | `session/manager.py` | 一会话一 JSONL，恢复与自愈 | session/manager.py |
 | `reminders/` | 提醒 DTO、SQLite 仓储、RRULE、调度器、应用服务 | models/repository/schedule/scheduler/service.py |
-| `voice/` | 音频归一化、ASR/TTS 抽象与 Provider | asr/、tts/、media.py |
+| `voice/` | 音频归一化、ASR/TTS 抽象、KWS 与 Provider；`realtime_s2s/` 豆包全双工客户端 | asr/、tts/、kws/、media.py、realtime_s2s/ |
 | `integrations/weixin_bridge/` | 固定上游 Node Bridge（iLink/CDN AES/凭据独占） | bridge.mjs、NOTICE.md |
 | `webui/index.html` | 单文件前端（无构建步骤） | webui/index.html |
 | `skills/` | 运行时技能目录（SKILL.md） | skills/*/SKILL.md |
