@@ -1579,7 +1579,13 @@ async def amain() -> None:
         web_channel._clear_callback = clear_callback  # 复用同一清空回调
         web_channel._context_callback = context_callback  # /context 占用查询
         channels.append(web_channel)
-        logger.info(f"网页渠道已启用·监听 http://{cfg.web_host}:{cfg.web_port}")
+        # webui HTTPS（TASK-042）：WebChannel 会读 cfg 的 web_ssl_cert/web_ssl_key/
+        # web_https_port 决定是否额外监听 HTTPS 端口（默认 0 关闭，明文照旧）。
+        https_note = (
+            f" + https://{cfg.web_host}:{cfg.web_https_port}"
+            if getattr(cfg, "web_https_port", 0) and cfg.web_https_port > 0 else ""
+        )
+        logger.info(f"网页渠道已启用·监听 http://{cfg.web_host}:{cfg.web_port}{https_note}")
     else:
         logger.info("网页渠道未配置 web_port 或未启用")
 

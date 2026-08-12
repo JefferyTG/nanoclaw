@@ -18,6 +18,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import ssl
 import os
 import threading
 import uuid
@@ -84,6 +85,17 @@ class WebChannel(Channel):
         self.port = port
         self.config = config              # 共享的 NanoClawConfig 实例（网页可就地修改）
         self.config_path = config_path    # 本实例 config.json 路径（用于持久化）
+        # webui HTTPS（TASK-042）：从共享 config 读取证书路径与 HTTPS 端口。
+        # config 为 None（测试/缺配置）时保持默认关闭；端口非法时回退 0。
+        # 证书/私钥路径是字符串（相对仓库根或绝对路径），敏感内容不落代码。
+        self.web_ssl_cert = getattr(config, "web_ssl_cert", "") if config is not None else ""
+        self.web_ssl_key = getattr(config, "web_ssl_key", "") if config is not None else ""
+        self.web_https_port = 0
+        if config is not None:
+            try:
+                self.web_https_port = int(getattr(config, "web_https_port", 0) or 0)
+            except (TypeError, ValueError):
+                self.web_https_port = 0
         self.session_manager = session_manager  # 会话持久化管理器（侧边栏读写用，可空）
         self.image_store = image_store    # 图片存储（落盘/解析/清理），可空
         # 文件存储（TASK-041 文件上传）：组合根 shared["file_store"] 未注入本渠道，
@@ -144,7 +156,11 @@ class WebChannel(Channel):
         self._loop = asyncio.get_running_loop()
         self._thread = threading.Thread(target=self._run_server, name="web", daemon=True)
         self._thread.start()
-        print(f"（网页渠道已启动｜监听 http://{self.host}:{self.port}）")
+        https_note = (
+            f" https://{self.host}:{self.web_https_port}"
+            if self.web_https_port > 0 else ""
+        )
+        print(f"（网页渠道已启动｜监听 http://{self.host}:{self.port}{https_note}）")
 
     def _run_server(self) -> None:
         """在独立线程里跑 aiohttp（自带事件循环），与主事件循环解耦。"""
@@ -171,11 +187,54 @@ class WebChannel(Channel):
 
             runner = web.AppRunner(app)
             loop.run_until_complete(runner.setup())
+            # 明文 HTTP 端口照旧监听（向后兼容，便于调试）
             site = web.TCPSite(runner, self.host, self.port)
             loop.run_until_complete(site.start())
+
+            # webui HTTPS（TASK-042）：https_port>0 且证书/私钥有效时额外监听
+            # 一个 HTTPS 端口（与明文端口并存）。证书缺失/无效仅 warning 并
+            # 跳过 HTTPS，绝不因 TLS 配置问题拖垮明文服务。
+            if self.web_https_port > 0:
+                ctx = self._build_ssl_context()
+                if ctx is not None:
+                    https_site = web.TCPSite(
+                        runner, self.host, self.web_https_port, ssl_context=ctx
+                    )
+                    loop.run_until_complete(https_site.start())
+                    logger.info(
+                        "网页渠道 HTTPS 已监听：https://%s:%s（明文 http://%s:%s 照常）",
+                        self.host, self.web_https_port, self.host, self.port,
+                    )
+                else:
+                    logger.warning(
+                        "网页渠道 HTTPS 未启用：web_ssl_cert=%r web_ssl_key=%r 缺失或不可用"
+                        "（需要证书与私钥均存在且可读），明文端口照常监听。",
+                        self.web_ssl_cert, self.web_ssl_key,
+                    )
             loop.run_forever()
         except Exception as exc:  # noqa: BLE001
             logger.exception("网页服务启动/运行异常：%s", exc)
+
+    def _build_ssl_context(self):
+        """按配置构建 HTTPS 上下文；证书/私钥缺失或不可读时返回 None（跳过 HTTPS）。
+
+        使用 ``ssl.Purpose.CLIENT_AUTH``（aiohttp 服务端标准做法）+ mkcert 证书链
+        （PEM，含完整链）。路径支持 ``~`` 展开；相对路径按仓库根目录（CWD）解析。
+        """
+        cert, key = self.web_ssl_cert, self.web_ssl_key
+        if not cert or not key:
+            return None
+        cert = os.path.expanduser(cert)
+        key = os.path.expanduser(key)
+        if not (os.path.isfile(cert) and os.path.isfile(key)):
+            return None
+        try:
+            ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            ctx.load_cert_chain(certfile=cert, keyfile=key)
+            return ctx
+        except Exception as exc:  # noqa: BLE001 - 证书加载失败仅跳过 HTTPS，不崩溃
+            logger.warning("网页渠道 HTTPS 证书加载失败，跳过 HTTPS：%s", exc)
+            return None
 
     # —— HTTP 路由 ——
     async def _handle_index(self, request) -> web.Response:

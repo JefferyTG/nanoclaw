@@ -75,7 +75,7 @@ unittest discover -s tests -t .                           # Ran 938 tests — OK
 python -m compileall -q channels webui                    # PASS（后端未改动，例行跑）
 python -c "import main"                                   # PASS 冒烟
 node --check（提取 <script> 49610 字节）                   # PASS
-# 手动验证（乖宝真机 ✅）：iPhone Safari + Android + Tailscale → http://100.111.207.113:8080
+# 手动验证（乖宝真机 ✅）：iPhone Safari + Android + Tailscale → http://100.x.x.x:8080
 #   桌面 Chrome 回归对照 ✅
 ```
 

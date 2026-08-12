@@ -12,7 +12,7 @@ NanoClaw 是一个本地优先、单进程、多渠道的个人 AI Agent 网关�
 |---|---|---|
 | 运行时 | Python 3.13+、`asyncio`、`uv` | 单体应用、异步编排、依赖与锁文件管理 |
 | 模型 | `openai.AsyncOpenAI` | 调用 OpenAI-compatible Chat Completions，支持流式和工具调用 |
-| Web | `aiohttp`、原生 HTML/CSS/JS | HTTP 配置/会话/图片 API、WebSocket 聊天与单页 UI |
+| Web | `aiohttp`、原生 HTML/CSS/JS、`ssl` | HTTP 配置/会话/图片 API、WebSocket 聊天与单页 UI；TASK-042 起支持 HTTPS（mkcert 证书，`web_https_port`，与明文并存） |
 | 飞书 | `lark-oapi` | WebSocket 长连接收文本/图片、IM API 发文本/图片 |
 | 微信 | Python `asyncio` + Node.js 20+ JSONL Bridge | iLink 扫码、长轮询、CDN AES 与私有持久状态 |
 | 工具扩展 | 自定义 Tool API、MCP stdio | 内置工具注册和外部 MCP Server 接入 |
@@ -130,7 +130,7 @@ nanoclaw/
 2. `build_shared()` 加载配置，创建基础 Provider、SkillsLoader、ToolRegistry、ContextBuilder、SessionManager、ImageStore、MemorySearcher、DailyMemory，以及启用时的 ReminderRepository/ReminderService；每会话的 ContextCompactor 由 make_agent_factory 内按 session 创建（TASK-006）。
 3. 启动时重建记忆/会话 SQLite 索引。
 4. MCPClientManager 按配置拉起 stdio Server，并把远端工具包装进同一个 ToolRegistry。
-5. 根据终端、飞书凭证、`weixin.enabled` 和 `web_port` 启用 Channel。微信启用时
+5. 根据终端、飞书凭证、`weixin.enabled` 和 `web_port` 启用 Channel；web 渠道若同时配置 `web_https_port>0` 且证书存在，会额外监听一个 HTTPS 端口（TASK-042）。微信启用时
    额外启动一个 Node Bridge；Python 只传状态/受控图片目录，不接触登录秘密。
 6. 启动渠道任务、Gateway 的入站/出站/流事件消费循环、单一 ReminderScheduler 与 DreamScheduler（每日做梦整理）；启动时若昨日未做整理（`dream_state.json` 的 `last_dream_date` 早于昨天）会异步补做前一天。关闭时先停止调度器，再停止出站分发和渠道。
 
@@ -167,6 +167,8 @@ TTS 同样在启动期按 `tts_model` 配置装配并只注入 WebChannel，但�
 飞书图片沿用同一套渠道无关协议。入站 `image` 事件先建立按 chat、会话序号和发送者隔离的待处理批次，再用消息 ID 与 `image_key` 调飞书鉴权资源接口下载；校验通过后保存到共享 `ImageStore`。批次默认等待 10 秒接收后续文字，连续图片会重置计时；文字到达或计时结束后，整批图片作为一条 `InboundMessage.images` 进入既有视觉链路。下载期间即使用户切换会话，图片仍归属事件到达时的会话序号。出站时 `AgentLoop` 汇总本轮（含子 Agent）生成的图片 ID，Gateway 在原会话中解析为 `ImageRef` 并放入 `OutboundMessage.images`；飞书 Channel 上传图片取得 `image_key` 后发送 `image` 消息。Web 上传本身就是单条图文消息，不使用飞书的等待合并机制；Web 的图片展示继续使用流事件，不重复消费最终出站图片。
 
 Web 文件上传（TASK-041）：`/upload` 按 MIME/扩展名分流——`image/*` 或图片扩展名走共享 `ImageStore`（按会话落盘，返回 `image_id`）；其余文件（pdf/doc/txt/zip 等）走 `FileStore`（按月归档到 `workspace/files/YYYY-MM/`，消毒名、重名后缀、50MB 上限，返回 `file_id/name/path/size/mime`）。WebChannel 在 `__init__` 里按组合根 `shared["file_store"]` 同目录同根自建一份 FileStore，ref.path 相对 `config.workspace`，Agent 可直接 `read_file` 读取。入站 WS 消息支持 `{"text","images","files"}`：文件引用先经 `FileStore.resolve` 校验（防伪造路径越界），再以微信渠道同一格式文本化进 content（`📎 收到文件：{path}（{size}）`），同时放入 `InboundMessage.files`；Agent 核心协议不变（files 字段仅总线元数据）。
+
+Web HTTPS（TASK-042）：为解锁手机浏览器 `getUserMedia` 麦克风（安全上下文要求），`WebChannel._run_server()` 在明文端口之外可额外监听一个 HTTPS 端口。启用条件为 `config.web_https_port>0` 且 `web_ssl_cert`/`web_ssl_key` 指向的 PEM 文件存在（mkcert 生成，多 SAN 覆盖 Tailscale 域名/IP、127.0.0.1 与局域网 IP）；`_build_ssl_context()` 用 `ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)` + `load_cert_chain(cert, key)` 构建上下文，经 `web.TCPSite(runner, host, https_port, ssl_context=ctx)` 监听。证书/私钥缺失或加载失败仅 `warning` 并跳过 HTTPS，明文端口完全不受影响（向后兼容）。证书文件存放于 `workspace/certs/`（整个 `workspace/` 被 `.gitignore` 忽略，敏感物不入库）；手机信任 mkcert CA 的步骤见 `workspace/WEB_HTTPS.md`。
 
 ### 5.2 消息与并发
 

@@ -22,7 +22,7 @@
 | 微信深度集成 | ✅ | 扫码登录、图文收发、断线恢复、原生 typing、`/bind-reminders`、图片等待窗口合并 |
 | 微信语音转写 | ✅ | 语音经腾讯 STT 转写（`voice_item.text`）进入 Agent，不落地本地 ASR |
 | 微信文件接收 | ✅ | 文件按月归档 `workspace/files/YYYY-MM/`（消毒名+重名加后缀+50MB 上限）；发模型只带「文件名+路径+大小」引用、不读内容不花 token；乖宝说「帮我看看」时 Agent 用 `read_file` 按需读取 |
-| 网页端 | ✅ | 流式思考/逐字输出、会话侧边栏、历史接回/删除、断线重连、回合取消（⏹ 在 header）；**移动端适配**（TASK-039）：`@media 768px` 响应式（桌面零影响）、侧边栏抽屉化+汉堡开合+遮罩防误触、100dvh 兜底 iOS 软键盘不顶飞、输入框 16px 防缩放、safe-area-inset-bottom、按钮 ≥44px 触控区、配置面板窄屏单列；**输入栏豆包化**（TASK-041）：`📷 相机 ｜ 输入框（占位「发消息或按住说话...」）｜ 🎙 麦克风 ｜ ＋ 加号`（无发送按钮、回车发送）、麦克风=打字↔按住说话切换+按住手势（按住变深/上滑取消/松开发送占位轻提示）、喇叭（自动朗读）移入右上角 header、📷 手机调起相机拍照、＋ 上传图片+文件（pdf/doc/txt/zip 等，经 FileStore 按月归档，Agent 可 read_file 读取）；**选图即自动上传**（不点回车就开始传）+ 图片压缩（1600px/JPEG85%，体积约 1/20）+ 缩略图圆形进度环（灰圈→蓝圈+真实百分比→完成隐藏）；回车发送多端适配（中文组词回车=上屏二次才发、Android keyCode 229、iOS/安卓键盘 form submit 兜底、enterkeyhint=send）；标题改「小奈」 |
+| 网页端 | ✅ | 流式思考/逐字输出、会话侧边栏、历史接回/删除、断线重连、回合取消（⏹ 在 header）；**移动端适配**（TASK-039）：`@media 768px` 响应式（桌面零影响）、侧边栏抽屉化+汉堡开合+遮罩防误触、100dvh 兜底 iOS 软键盘不顶飞、输入框 16px 防缩放、safe-area-inset-bottom、按钮 ≥44px 触控区、配置面板窄屏单列；**输入栏豆包化**（TASK-041）：`📷 相机 ｜ 输入框（占位「发消息或按住说话...」）｜ 🎙 麦克风 ｜ ＋ 加号`（无发送按钮、回车发送）、麦克风=打字↔按住说话切换+按住手势（按住变深/上滑取消/松开发送占位轻提示）、喇叭（自动朗读）移入右上角 header、📷 手机调起相机拍照、＋ 上传图片+文件（pdf/doc/txt/zip 等，经 FileStore 按月归档，Agent 可 read_file 读取）；**选图即自动上传**（不点回车就开始传）+ 图片压缩（1600px/JPEG85%，体积约 1/20）+ 缩略图圆形进度环（灰圈→蓝圈+真实百分比→完成隐藏）；回车发送多端适配（中文组词回车=上屏二次才发、Android keyCode 229、iOS/安卓键盘 form submit 兜底、enterkeyhint=send）；标题改「小奈」；**HTTPS 支持**（TASK-042）：mkcert 多 SAN 证书（Tailscale 域名/IP + 127.0.0.1 + 局域网 IP）→ `web_https_port` 额外监听 HTTPS（明文 `web_port` 照旧，向后兼容），解锁手机 `getUserMedia` 麦克风；手机信任 mkcert CA 步骤见 `workspace/WEB_HTTPS.md`，证书/私钥存 `workspace/certs/`（.gitignore 忽略、不入库） |
 | 语音输入 ASR | ✅ | OpenAI-compatible，FFmpeg 归一化；Web 录音即时转写 + 飞书语音入站自动转写（TASK-020，`asr_model` 配置启用） |
 | 飞书语音对语音 | ✅ | 语音入站→本次出站回语音气泡（TTS 甘雨合成 → ffmpeg 转 OPUS → `CreateFileRequest` 上传 → `msg_type=audio` 发送）；文字入站回文字；TTS/转换/上传/发送失败自动回文字原文不静默，超 `max_voice_chars`（默认 300）只发文字，音频全程内存/临时目录即用即删不落盘（TASK-021） |
 | 语音朗读 TTS | ✅ | edge-tts 分句流水线（默认）或 DashScope 甘雨音色流式 TTS（`provider=dashscope_realtime`，QwenTtsRealtime WebSocket 流式合成 WAV，支持录音复刻换音色 `create_voice_by_clone`，支持情绪指令 `instructions`（可爱基调，TASK-018）），可取消，默认关（`tts_model` 配置启用） |
@@ -131,6 +131,6 @@ Web 附加：AgentLoop 流事件 → Bus.stream → WebChannel → WebSocket（t
 
 > **唯一事实源是 git 本身**（`git log` / `git status` / `git diff`）。本段只留指针与稳定约定，**不复制任何瞬时状态**——hash 列表、领先/落后数量、未跟踪清单都会过期，一律不写，需要时直接查 git。
 
-- 当前里程碑：TASK-001~041 已完成并归档（TASK-038 AEC 实验已回退并归档，任务卡均在 `docs/tasks/completed/`）；active：TASK-040 webui 多端历史同步（待开始，与 041 顺序执行避免同文件冲突，041 已完成归档）。任务卡在 `docs/tasks/active/`。
+- 当前里程碑：TASK-001~042 已完成并归档（TASK-038 AEC 实验已回退并归档，任务卡均在 `docs/tasks/completed/`）；active：TASK-040 webui 多端历史同步（待开始）。任务卡在 `docs/tasks/active/`。
 - 最新提交、分支、领先/落后、工作区状态：`git log` / `git status`。
 - 稳定约定：`kb-testset/`（个人知识库测试资产）已在 `.gitignore` 中不追踪；存在 codex 外部 worktree → 多会话并行开发时严格遵守 AGENTS.md 文件所有权规则。

@@ -102,6 +102,7 @@
 | 实时通话打断由服务端动态判停，客户端不主动干预（TASK-037 决策） | 有效 | 客户端不发 `response.cancel`；`transcription.started` 只清播放缓冲、`response.canceled` 不清已收音频；`output_audio.delta` 收到即入队播放（不依赖本地播放态过滤）、下行队列无上限不丢帧。客户端 AEC（speexdsp，TASK-038）与本地 VAD 打断均实验后回退移除——「外放被掐断」根因是客户端在 `response.canceled` 后丢弃后续 delta（听感像被打断），而非服务端回声误判本身 |
 | 实时通话人设单文件（TASK-037 决策） | 有效 | 根目录私有 `realtime_identity.md`（.gitignore 排除）为唯一人设/个人记忆源，每轮 `session.create` 前重读（修改下次唤醒生效）；config/代码无第二份 instructions 覆盖项，避免漂移；缺失/为空本轮通话明确失败回待命 |
 
+| webui HTTPS 支持（TASK-042 决策） | 有效 | mkcert 自签 CA 方案（Tailscale cert 服务端故障 `500: acme order invalid`，官方 GitHub #19942/#14402，恢复后可切换回合法证书）；证书多 SAN（Tailscale 域名 `my-macbook-neo.tailXXXX.ts.net` + Tailscale IP `100.x.x.x` + `127.0.0.1` + 局域网 IP）；config 新增 `web_ssl_cert`/`web_ssl_key`/`web_https_port`（默认 0 关闭、向后兼容；证书字段不进网页可编辑白名单，保持只读防静默关闭）；`web.TCPSite` 双端口并存（明文照旧，证书缺失仅 warning 不崩溃）；证书/私钥存 `workspace/certs/`（`.gitignore` 忽略绝不入库）；手机 CA 安装步骤在 `workspace/WEB_HTTPS.md`（含乖宝个人网络信息，不跟踪不入库）；Safari 需「描述文件+信任开关」两步缺一不可 |
 ## 3. 演进时间线
 
 | 日期 | 主要变化 | 仍然重要的经验 |

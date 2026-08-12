@@ -135,6 +135,12 @@ _CONFIG_FIELDS = (
     "feishu_image_merge_window_sec",
     "web_host",
     "web_port",
+    # webui HTTPS（TASK-042）：web_https_port>0 且证书/私钥路径有效时额外监听
+    # HTTPS 端口（明文 web_port 照旧，向后兼容）；证书由 mkcert 生成到
+    # workspace/certs/（.gitignore 忽略整个 workspace/，敏感物不入库）。
+    "web_ssl_cert",
+    "web_ssl_key",
+    "web_https_port",
     "turn_timeout_sec",
     "shell_timeout_sec",  # Shell 工具单条命令超时（秒，默认 300）
     # 上下文 token 预算：ContextCompactor 的压缩阈值（启动期配置，改后需重启）。
@@ -218,6 +224,14 @@ class NanoClawConfig:
     feishu_image_merge_window_sec: float = 10.0
     web_host: str = "0.0.0.0"        # 网页渠道监听地址（0.0.0.0 同局域网可达）
     web_port: int = 0                # 网页渠道端口；0 表示不启用网页渠道
+    # webui HTTPS（TASK-042）：web_https_port>0 且 web_ssl_cert/web_ssl_key
+    # 指向的证书文件存在时，WebChannel 额外监听一个 HTTPS 端口（建议 8443），
+    # 明文 web_port 照旧（向后兼容）。证书由 mkcert 生成到 workspace/certs/
+    # （整个 workspace/ 被 .gitignore 忽略，证书私钥绝不入库）；路径可为相对
+    # 仓库根目录的相对路径或绝对路径。默认全部关闭（不影响现有明文模式）。
+    web_ssl_cert: str = ""           # HTTPS 证书路径（PEM，含完整链，mkcert 产物）
+    web_ssl_key: str = ""            # HTTPS 私钥路径（PEM，mkcert 产物）
+    web_https_port: int = 0          # HTTPS 监听端口；0 表示不启用 HTTPS
     turn_timeout_sec: int = 600      # 单轮对话墙钟超时（秒）；超时强制终止，防卡死
     shell_timeout_sec: int = 300      # ExecTool（Shell）单条命令超时（秒）；超时整组杀进程
     context_budget_tokens: int = 524288  # 上下文 token 预算（ContextCompactor 压缩阈值；默认 512k）
