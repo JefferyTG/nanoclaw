@@ -15,6 +15,7 @@
 
 | 决策 | 状态 | 原因与影响 |
 |---|---|---|
+| webui 移动端响应式断点 768px（TASK-039） | 有效 | 单文件响应式，改造全部收敛在 `@media (max-width:768px)` 内叠加，桌面 ≥769px 零回归；侧边栏抽屉化+汉堡开合；100vh 兜底 + 100dvh 覆盖（iOS Safari 软键盘，15.4+），输入框 16px 防 iOS 自动缩放，`env(safe-area-inset-bottom)` 安全区；触控目标 ≥44px。验证：乖宝 08-12 真机 iPhone/Android + 桌面回归全过，938 tests OK。**遗留**：多端历史不同步（后端按 conn_id 单发不回广播+前端无同步机制）→ TASK-040 |
 | Python 3.13 + `uv` + `uv.lock` | 有效 | 保证环境可复现；禁止用全局 pip 改项目依赖 |
 | `main.py` 作为直接运行入口和装配根 | 有效 | 使用顶层 `agent.*`/`session.*` 导入；不引入 DI 框架 |
 | Channel、Bus、Gateway、Agent 解耦 | 有效 | 新增渠道不应修改 Agent 核心协议以外逻辑 |

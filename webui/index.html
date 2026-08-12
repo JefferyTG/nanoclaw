@@ -8,6 +8,9 @@
 <style>
   :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --txt:#e6e8ec; --muted:#9aa3b2; --accent:#538bf0; --ok:#3ecf8e; --think:#2a2333; --think-line:#4a3a5e; }
   * { box-sizing: border-box; }
+  /* TASK-039：汉堡按钮 / 侧边栏遮罩仅移动端显示，桌面默认隐藏 */
+  #sbToggle { display:none; }
+  #sbMask { display:none; }
   body { margin:0; font-family: -apple-system, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
          background:var(--bg); color:var(--txt); height:100vh; display:flex; flex-direction:column; }
   header { display:flex; align-items:center; gap:12px; padding:10px 16px; border-bottom:1px solid var(--line); }
@@ -150,11 +153,89 @@
                      border-radius:6px; }
   .sb-item .sb-del:hover { color:#ff6b6b; background:rgba(255,107,107,.12); }
   #main { flex:1; min-width:0; display:flex; flex-direction:column; }
+  /* ================================================================
+     TASK-039 移动端适配（断点 ≤768px：iPhone/Android 手机、窄屏）
+     —— 全部叠加仅在本媒体查询内；桌面（≥769px）样式与改造前完全一致 ——
+     ================================================================ */
+  @media (max-width: 768px) {
+    /* 1) 高度：100vh 兜底 + 100dvh 覆盖（iOS Safari 软键盘弹出时不顶飞底部输入栏） */
+    body { height:100vh; height:100dvh; }
+    html { -webkit-tap-highlight-color: transparent; }
+
+    /* 2) 侧边栏抽屉化：fixed + translateX 默认隐藏；汉堡按钮开合，点遮罩/选会话自动关闭 */
+    header { padding:8px 10px; gap:8px; }
+    header h1 { font-size:16px; }
+    #status { min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    #sbToggle { display:inline-flex; align-items:center; justify-content:center;
+                min-width:44px; min-height:44px; padding:0 8px; font-size:18px; }
+    #sidebar { position:fixed; left:0; top:0; bottom:0; z-index:100;
+               width:min(78vw,300px); transform:translateX(-100%);
+               transition:transform .25s ease; box-shadow:0 0 24px rgba(0,0,0,.5); }
+    body.sb-open #sidebar { transform:translateX(0); }
+    #sbMask { position:fixed; inset:0; z-index:90; background:rgba(0,0,0,.45); display:none; }
+    body.sb-open #sbMask { display:block; }
+
+    /* 3) 输入栏与软键盘：底部安全区、16px 防 iOS 自动缩放、44px 触控目标 */
+    #bar { gap:6px; padding:10px 10px calc(10px + env(safe-area-inset-bottom)); }
+    #bar input[type=text] { font-size:16px; min-height:44px; }
+    #bar button { min-height:44px; font-size:16px; padding:0 14px; }
+    #bar #attachBtn, #bar #recordBtn, #bar #ttsBtn { min-width:44px; padding:0; font-size:20px; }
+    #bar #sendBtn { min-width:56px; }
+
+    /* 4) 触控反馈：手机无 hover，补 :active 等价样式（不影响桌面 hover 外观） */
+    header button { min-height:44px; font-size:14px; padding:5px 14px; }
+    header button:active { border-color:var(--accent); }
+    #bar #attachBtn:active, #bar #recordBtn:active, #bar #ttsBtn:active { border-color:var(--accent); background:#1e2430; }
+    #bar #sendBtn:active { filter:brightness(1.15); }
+    #sidebar .sb-head button { min-height:44px; font-size:14px; padding:5px 14px; }
+    #sidebar .sb-head button:active { filter:brightness(1.1); }
+    .sb-item:active { border-color:var(--accent); }
+    .sb-item .sb-del:active { color:#ff6b6b; background:rgba(255,107,107,.12); }
+    .att-item .att-del:active { background:rgba(255,107,107,.85); }
+    .think .sum:active, .tool-card .tc-head:active, .subagent .sa-head:active { background:rgba(255,255,255,.06); }
+
+    /* 5) 字号/间距微调（基础 13px → 15px 级别，消息间距略放宽） */
+    #chat { padding:14px 12px; gap:14px; }
+    .msg.sys { font-size:13px; }
+    .msg.user .bubble { padding:10px 14px; font-size:16px; }
+    .answer-label { font-size:12px; }
+    .answer { font-size:16px; line-height:1.7; }
+    .think .sum { font-size:13px; padding:10px 12px; }
+    .think .think-body { font-size:14px; line-height:1.6; }
+    .tool-card { font-size:13px; }
+    .tool-card .tc-head { padding:10px; }
+    .tool-card .tc-args, .tool-card .tc-result { font-size:12px; }
+    .subagent .sa-head { font-size:13px; padding:10px; }
+    .subagent .sa-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .subagent .sa-output { font-size:13px; }
+    #sidebar .sb-head { padding:12px; }
+    #sidebar .sb-head h2 { font-size:15px; }
+    .sb-item { padding:10px 12px; }
+    .sb-item .sb-title { font-size:15px; padding-right:32px; }
+    .sb-item .sb-preview { font-size:12px; }
+    .sb-item .sb-time { font-size:11px; }
+    .sb-item .sb-del { min-width:32px; min-height:32px; font-size:14px; }
+
+    /* 6) 图片/附件条：max-width 收窄，附件格子保持 56px 可点 */
+    #attach { padding:8px 12px 0; }
+    .img-strip img { max-width:40vw; max-height:40vw; }
+    .bot-images img { max-width:80vw; max-height:80vw; }
+    #ctxbar { padding:6px 12px 0; }
+
+    /* 7) 配置面板：窄屏 row 双列改单列，输入防缩放，按钮加大 */
+    #config { padding:12px; }
+    #config .row { flex-direction:column; gap:0; }
+    #config h2 { font-size:14px; }
+    #config label { font-size:13px; }
+    #config input { font-size:16px; padding:10px; }
+    #config .actions button { min-height:44px; font-size:14px; }
+  }
 </style>
 </head>
 <body>
 <header>
   <h1>NanoClaw 网页端</h1>
+  <button id="sbToggle" aria-label="打开会话列表" title="会话列表">☰</button>
   <span class="status" id="status">连接中…</span>
   <button id="cfgBtn">配置</button>
 </header>
@@ -211,6 +292,7 @@
       <button id="sendBtn">发送</button>
     </div>
   </div><!-- /#main -->
+  <div id="sbMask"></div>
 </div><!-- /#app -->
 
 <script>
@@ -1197,6 +1279,18 @@
   var newBtn = document.getElementById('newBtn');
   var currentKey = null;   // 当前激活的会话标识（后端 current_key）
 
+  // —— TASK-039 移动端：侧边栏抽屉开合（汉堡按钮 + 遮罩；桌面无副作用）——
+  var sbToggle = document.getElementById('sbToggle');
+  var sbMask = document.getElementById('sbMask');
+  function toggleSidebar() {
+    var open = document.body.classList.toggle('sb-open');
+    sbToggle.setAttribute('aria-label', open ? '关闭会话列表' : '打开会话列表');
+    sbToggle.title = open ? '关闭会话列表' : '打开会话列表';
+  }
+  function closeSidebar() { document.body.classList.remove('sb-open'); }
+  sbToggle.onclick = toggleSidebar;
+  sbMask.onclick = closeSidebar;
+
   // —— 上下文占用进度条（usage 流事件）：按会话各自保存，无数据时隐藏降级 ——
   var ctxbar = document.getElementById('ctxbar');
   var ctxFill = document.getElementById('ctxFill');
@@ -1298,6 +1392,7 @@
   function openSession(key) {
     if (!canChangeSession()) return;
     if (!ws || ws.readyState !== WebSocket.OPEN) { addSys('连接未就绪，无法打开会话'); return; }
+    closeSidebar();   // 移动端：选中会话后自动收起抽屉
     stopTtsForTransition();
     clearSubagentTimers(cur);
     ws.send(JSON.stringify({ ctl: true, type: 'open', key: key }));
@@ -1317,6 +1412,7 @@
   function newSession() {
     if (!canChangeSession()) return;
     if (!ws || ws.readyState !== WebSocket.OPEN) { addSys('连接未就绪'); return; }
+    closeSidebar();   // 移动端：点击「＋ 新会话」后自动收起抽屉
     stopTtsForTransition();
     clearSubagentTimers(cur);
     ws.send(JSON.stringify({ ctl: true, type: 'new' }));
