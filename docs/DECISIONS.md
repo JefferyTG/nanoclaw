@@ -61,6 +61,9 @@
 | 微信提醒复用现有 Scheduler 与 Bridge 主动发送 | 有效 | SQLite 按稳定 target 精确路由，execution correlation ID 跨重试/重启稳定；会话过期/context 缺失暂停目标并释放 claim，不复制调度器或保存 token |
 | 微信采用固定 Node Bridge 而非重写协议或运行 OpenClaw | 有效 | vendor `wechat-ilink-client` 固定提交，Python 只做 Channel/JSONL/生命周期，Agent 逻辑继续复用 NanoClaw |
 | 微信稳定身份是 account_id + user_id | 有效 | 会话和未来主动提醒不依赖临时 context token；target 使用可逆编码避免分隔符碰撞 |
+| WebKit/Safari 流式 WebM 无 duration 元数据（TASK-043 决策） | 有效 | iPhone 新版 Safari（18.4+）MediaRecorder 输出 `audio/webm;codecs=opus` 但 EBML 不写 Duration（流式写入），ffprobe `format:{}` 读不到时长。`voice/media.py` `normalize_to_pcm_wav` 改为：有音频流但 duration 缺失 → 不报错，ffmpeg 转码成功后用标准库 `wave` 从 WAV 头兜底校验时长上限（`input_too_long` 拦截不降级）；streams 为空（真损坏）仍报「无法读取音频时长」。+2 回归测试 |
+| normalize 的 ffmpeg 不用 `-xerror`（TASK-043 决策） | 有效 | WebKit 流式 WebM 时间戳从 -16ms（pre-roll padding）开始，WAV 封装器报 `Non-monotonic DTS`（warning 级），`-xerror` 把警告当错误导致 ffmpeg exit 234 转换失败。去掉后真正无法解码的输入仍非零退出。`encode_to_opus`（TTS 出站）保留 `-xerror`（自家合成音频无此问题）。回归测试断言 normalize 命令不含 `-xerror` |
+| VoiceChannel 唤醒测试必须隔离 `wake_replies_dir`（TASK-043 决策） | 有效 | `_play_wake_reply()` 本地缓存优先：只要 `wake_replies_dir`（默认 `workspace/voice/wake_replies/`）下有 `wake_*.wav` 就 `random.choice` 直接播放，不检查 tts/wake_replies 配置。凡触发 `_play_wake_reply` 的测试必须传 `wake_replies_dir="/nonexistent/"` 隔离（否则全量测试会真播放真实音色 WAV，08-12 实测踩坑）。渠道行为本身为 TASK-029 设计，不做改动 |
 | 微信秘密和同步状态由 Bridge 独占 | 有效 | token/cursor/context/去重只写入被忽略的 0700/0600 状态目录，不进入 config、Bus 或普通日志 |
 | 微信原生 typing 由 Bridge 管理 activity 生命周期 | 有效 | Python/Gateway 只传稳定 target 与不含秘密的 activity ID；Bridge 在内存中按 target 计数、用 getconfig/sendtyping 续期，最终回复被渠道接受后才 cancel，失败/取消/shutdown/session expired 均 best-effort 且不阻塞回答 |
 | 微信入站采用 ack 后批次提交 cursor | 有效 | context 先落盘，Python 投递成功后 ack，整批完成才提交去重与 cursor；崩溃允许重复、不允许静默丢失 |

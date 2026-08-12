@@ -142,7 +142,7 @@ nanoclaw/
 
 Linux 后台控制脚本通过 `setsid` 建立独立进程组，并用 PID 文件校验 `/proc` 中的工作目录和命令行，避免陈旧 PID 误杀其它进程。`SIGTERM` 在 `main.py` 中转换为 asyncio 停止事件；Gateway 先取消并等待已登记的在途消息任务，再停止渠道并关闭 MCP 连接。
 
-ASR 在启动期按 `asr_model` 配置装配并只注入 WebChannel。浏览器把完整录音上传到独立 HTTP 端点，WebChannel 在主事件循环调用共享转写服务；成功且非空的文本再通过原有 WebSocket 文本入口进入 MessageBus。音频字节、临时路径和 Provider 原始响应均不进入 Bus 或会话持久化。
+ASR 在启动期按 `asr_model` 配置装配并只注入 WebChannel。浏览器把完整录音上传到独立 HTTP 端点，WebChannel 在主事件循环调用共享转写服务；成功且非空的文本再通过原有 WebSocket 文本入口进入 MessageBus。音频字节、临时路径和 Provider 原始响应均不进入 Bus 或会话持久化。归一化（`voice/media.py`）兼容 WebKit/Safari 流式 WebM：ffprobe 读不到 duration（流式 EBML 不写 Duration）时不报错，转码后用 `wave` 从 WAV 头兜底校验时长上限；normalize 的 ffmpeg 不用 `-xerror`（WebKit 时间戳从 -16ms 开始的 Non-monotonic DTS 警告不致命，去掉后真正无法解码仍非零退出）。
 
 `realtime` 渠道（TASK-037）是**不走消息总线的特例**：基于豆包端到端全双工
 （Seeduplex 1.2.6.1），语音进→语音出、对话思考发生在豆包服务端内部，因此

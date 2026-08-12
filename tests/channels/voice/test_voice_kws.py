@@ -452,6 +452,9 @@ class VoiceChannelWakeTests(unittest.IsolatedAsyncioTestCase):
             asr_service=asr,
             record_sec=2.0,
             record_delay_sec=0.0,
+            # TASK-043 修复：隔离唤醒回应缓存目录，避免 _play_wake_reply
+            # 真播放 workspace/voice/wake_replies/ 下的真实 WAV（「哎～我在呢」）
+            wake_replies_dir="/nonexistent/",
         )
         emitted: list = []
         channel._reply_sink = emitted.append
@@ -490,6 +493,8 @@ class VoiceChannelWakeTests(unittest.IsolatedAsyncioTestCase):
             record_sec=2.0,
             record_delay_sec=0.0,
             silence_timeout_sec=3.0,
+            # TASK-043 修复：同上，隔离唤醒回应缓存目录
+            wake_replies_dir="/nonexistent/",
         )
         emitted: list = []
         channel._reply_sink = emitted.append

@@ -93,6 +93,10 @@
               user-select:none; -webkit-user-select:none; -webkit-touch-callout:none; touch-action:none; }
   #voiceBar.holding { background:#2a2f3a; border-color:var(--accent); color:var(--txt); }
   #voiceBar.cancel { background:#3a2026; border-color:#e86b78; color:#ff8a94; }
+  /* TASK-043：录音中 voiceBar —— 红点(::before) + 红色描边，与 .holding 叠加 */
+  #voiceBar.recording { border-color:#e86b78; }
+  #voiceBar.recording::before { content:""; display:inline-block; width:8px; height:8px; border-radius:50%;
+               background:#e86b78; margin-right:7px; vertical-align:1px; }
   /* 顶栏：自动朗读（原在 bar，TASK-041 移到右上角 header）与回合停止键 */
   #ttsBtn.enabled { color:var(--ok); border-color:var(--ok); }
   #stopBtn { display:none; }
@@ -1333,9 +1337,11 @@
   // 麦克风按钮（micBtn）三态：
   //   1) 空闲·键盘模式：单击 → 切「按住说话」模式；长按(>400ms) → 旧 ASR 录音；
   //   2) voice 模式：单击 → 切回打字；
-  //   3) 录音中：单击 → 停止录音并转写（旧能力，不动）。
-  // 验收标准「按住说话不真录音」：按住说话手势只做交互 + 轻提示占位，未来接录音
-  // 时直接复用该手势状态机（startPress/endPress）即可。
+  //   3) 录音中：单击 → 停止录音并转写（旧能力，共用同一状态机）。
+  // TASK-043：按住说话手势已接到真实录音链路——按住 voiceBar 达 HOLD_MS 后
+  // startRecording() 开始录音；松开（未上滑取消）→ stopRecording → 上传 /api/asr
+  // 转写并作为消息发送；上滑到取消区 → 丢弃不发送。与长按 🎙 旧入口共用
+  // recorder/recordingBusy 状态机，转写中/录音中禁止再次触发。
   var micBtn = document.getElementById('micBtn');
   var voiceBar = document.getElementById('voiceBar');
   var inputMode = 'keyboard';        // 'keyboard' | 'voice'
@@ -1369,8 +1375,26 @@
   }
 
   function resetVoiceBar() {
-    voiceBar.classList.remove('holding', 'cancel');
+    voiceBar.classList.remove('holding', 'cancel', 'recording');
     voiceBar.textContent = '按住说话';
+  }
+
+  // TASK-043：按当前手势/录音状态渲染 voiceBar 文案（红点+计时由 .recording 提供）
+  function updateVoiceBarLabel() {
+    if (!press) return;
+    if (press.zone === 'cancel') {
+      voiceBar.classList.add('cancel');
+      voiceBar.textContent = '松开取消';
+      return;
+    }
+    voiceBar.classList.remove('cancel');
+    voiceBar.classList.add('holding');
+    if (press.held) {
+      var sec = recStartTs ? Math.floor((Date.now() - recStartTs) / 1000) : 0;
+      voiceBar.textContent = sec + 's · 松开 发送 · 上滑 取消';
+    } else {
+      voiceBar.textContent = '松开 发送 · 上滑 取消';
+    }
   }
 
   function startPress(via, y) {
@@ -1378,9 +1402,15 @@
     press = { startY: y, zone: 'send', via: via, held: false, timer: null };
     press.timer = setTimeout(function () {          // 按住 HOLD_MS 才算手势
       if (!press) return;
+      if (recordingBusy || recorder) {              // TASK-043：转写中/录音中禁止再次触发
+        showToast(recorder ? '正在录音，请先停止。' : '正在转写语音，请稍候。');
+        press = null;                               // 本次按住作废：不切模式、不触发录音
+        resetVoiceBar();
+        return;
+      }
       press.held = true;
-      voiceBar.classList.add('holding');
-      voiceBar.textContent = '松开发送 · 上滑取消';
+      updateVoiceBarLabel();
+      startRecording();                             // TASK-043：按住说话 → 真实录音
     }, HOLD_MS);
   }
   function movePress(via, y) {
@@ -1389,10 +1419,7 @@
     var zone = dy > SLIDE_CANCEL_PX ? 'cancel' : 'send';
     if (zone === press.zone) return;
     press.zone = zone;
-    if (press.held) {
-      voiceBar.classList.toggle('cancel', zone === 'cancel');
-      voiceBar.textContent = zone === 'cancel' ? '松开取消' : '松开发送 · 上滑取消';
-    }
+    updateVoiceBarLabel();                          // 录音中也会更新（保留计时）
   }
   function endPress(via) {
     if (!press || press.via !== via) return;
@@ -1400,9 +1427,15 @@
     press = null;
     if (ended.timer) { clearTimeout(ended.timer); ended.timer = null; }
     if (ended.held) {
+      if (ended.zone === 'send') {
+        // 松开（未上滑取消）→ 停止录音 → onstop 自动上传 /api/asr 转写并发送；
+        // 授权还没完成就松手（如首次权限弹窗中）→ 放弃本次启动。
+        if (recordingStarting) recordingStartAborted = true;
+        else stopRecording();
+      } else {
+        discardRecording();                         // 上滑取消：丢弃录音不发送
+      }
       resetVoiceBar();
-      if (ended.zone === 'send') showToast('语音功能待开放，先打字吧');   // 占位：不真录音
-      // 取消区：复位即可（保持 voice 模式）
     } else {
       // 快速点按「按住说话」条：切回打字模式（对应验收「点输入框→切回打字」）
       setInputMode('keyboard');
@@ -1412,6 +1445,7 @@
   function cancelPress(via) {
     if (!press || press.via !== via) return;
     press = null;
+    discardRecording();   // TASK-043：触摸中断/切后台 → 丢弃本次录音（best-effort）
     resetVoiceBar();
   }
 
@@ -1467,9 +1501,8 @@
 
   micBtn.onclick = function () {
     if (micLongPress) { micLongPress = false; return; }   // 长按已触发录音，单击不再切换
-    if (recorder && recorder.state !== 'inactive') {      // 录音中：单击停止（旧能力）
-      setRecordingState(false, true);
-      recorder.stop();
+    if (recorder && recorder.state !== 'inactive') {      // 录音中：单击停止（旧能力，共用同一状态机）
+      stopRecording();
       return;
     }
     setInputMode(inputMode === 'voice' ? 'keyboard' : 'voice');
@@ -1482,6 +1515,13 @@
   var recordingChunks = [];
   var recordingBusy = false;
   var recordingSessionKey = null;
+  // TASK-043 按住说话接线：录音状态机共享给「按住说话」手势入口与长按 🎙 旧入口
+  var MAX_RECORD_SEC = 60;           // 录音时长上限（秒）：超过自动停止并转写，手感可调
+  var recStartTs = 0;                // 本次录音开始时间戳（voiceBar 计时显示用）
+  var recTickTimer = null;           // 录音计时器：红点/秒数 + 上限自动停止
+  var recordingStarting = false;     // getUserMedia 授权在途（尚未真正开始录）
+  var recordingStartAborted = false; // 授权完成前已松手/取消：放弃本次启动
+  var recordingDiscarded = false;    // 本次录音标记为丢弃：onstop 只复位、不上传
 
   function stopRecordingTracks() {
     if (recordingStream) {
@@ -1490,12 +1530,55 @@
     }
   }
 
+  // TASK-043：停止录音并触发 onstop（onstop 里自动上传转写并发送）
+  function stopRecording() {
+    if (recorder && recorder.state !== 'inactive') {
+      try { recorder.stop(); } catch (_e) { /* 已停止等边界情况忽略 */ }
+    }
+  }
+
+  // TASK-043：上滑取消 / 触摸中断 → 丢弃本次录音，不触发转写发送
+  function discardRecording() {
+    recordingDiscarded = true;    // onstop 里看到 → 只复位不上传
+    recordingStartAborted = true; // 授权尚未完成 → getUserMedia 成功回调里取消启动
+    if (recorder && recorder.state !== 'inactive') {
+      try { recorder.stop(); } catch (_e) {}
+    }
+  }
+
+  // TASK-043：录音计时（voiceBar 红点/秒数）+ MAX_RECORD_SEC 上限自动停止并转写
+  function startRecTick() {
+    clearRecTick();
+    recStartTs = Date.now();
+    if (press && press.held) {
+      voiceBar.classList.add('recording');
+      updateVoiceBarLabel();
+    }
+    recTickTimer = setInterval(function () {
+      if (press && press.held) updateVoiceBarLabel();
+      // 超过 MAX_RECORD_SEC 秒：自动停止并转写（recorder.state 兜底，避免重复触发）
+      if (recorder && recorder.state === 'recording' &&
+          Date.now() - recStartTs >= MAX_RECORD_SEC * 1000) {
+        showToast('已达 ' + MAX_RECORD_SEC + ' 秒录音上限，自动停止并转写。');
+        stopRecording();
+      }
+    }, 1000);
+  }
+
+  function clearRecTick() {
+    if (recTickTimer) { clearInterval(recTickTimer); recTickTimer = null; }
+    voiceBar.classList.remove('recording');
+    recStartTs = 0;   // 未录音时归零：避免下次按住时秒数误显示
+  }
+
   function setRecordingState(active, busy) {
     recordingBusy = !!busy;
     micBtn.disabled = !!busy;
     micBtn.classList.toggle('recording', !!active);
     micBtn.textContent = active ? '■' : '🎙';
     micBtn.title = active ? '停止录音' : (busy ? '语音转写中…' : '切换到按住说话 · 长按录音');
+    if (active) startRecTick();   // TASK-043：录音中 voiceBar 红点/计时 + 60s 上限
+    else clearRecTick();
   }
 
   function canChangeSession() {
@@ -1522,8 +1605,16 @@
       .then(function (response) {
         return response.json().catch(function () { return {}; }).then(function (body) {
           if (!response.ok || !body.ok) {
-            var err = body && body.error;
-            throw new Error((err && err.message) || '语音转写失败');
+            // TASK-043：复用 /api/asr 错误码映射，给出友好提示
+            var code = body && body.error && body.error.code;
+            var msg = body && body.error && body.error.message;
+            var friendly = {
+              asr_unavailable: '语音转写服务未配置或暂不可用，请稍后再试。',
+              file_too_large: '录音文件过大，请缩短录音时长后重试。',
+              empty_transcript: '没有识别到可发送的文字，请重新录制。',
+              asr_failed: '语音转写失败，请稍后重试。'
+            };
+            throw new Error(friendly[code] || msg || '语音转写失败');
           }
           return String(body.text || '').trim();
         });
@@ -1543,8 +1634,19 @@
     // 即使 UI 已阻止切换，会话也可能因重连/服务端事件变化；完成转写前必须
     // 仍属于开始录音时的同一会话，才允许走现有文本发送路径。
     recordingSessionKey = currentKey;
+    // TASK-043：重置上次「放弃/丢弃」标记，避免误伤本次录音
+    recordingStartAborted = false;
+    recordingDiscarded = false;
+    recordingStarting = true;
     setRecordingState(false, true);
     navigator.mediaDevices.getUserMedia({ audio: true }).then(function (stream) {
+      recordingStarting = false;
+      if (recordingStartAborted) {   // TASK-043：松手/取消发生在授权完成前 → 放弃启动
+        stream.getTracks().forEach(function (track) { track.stop(); });
+        recordingSessionKey = null;
+        setRecordingState(false, false);
+        return;
+      }
       recordingStream = stream;
       recordingChunks = [];
       var options = chooseRecorderOptions();
@@ -1566,12 +1668,21 @@
         var mime = (finished && finished.mimeType) || 'audio/webm';
         var blob = new Blob(recordingChunks, { type: mime });
         recordingChunks = [];
+        var discarded = recordingDiscarded;   // TASK-043：上滑取消/中断 → 只复位不上传
+        recordingDiscarded = false;
+        if (discarded) {
+          recordingSessionKey = null;
+          setRecordingState(false, false);
+          return;
+        }
         if (!blob.size) {
           addSys('没有录到声音，请检查麦克风权限后重试。');
           recordingSessionKey = null;
           setRecordingState(false, false);
           return;
         }
+        setRecordingState(false, true);   // TASK-043：转写中置忙，禁止再次触发录音
+        if (press && press.held) voiceBar.textContent = '转写中…';   // 自动停止后仍按住
         var ext = mime.indexOf('mp4') >= 0 ? 'm4a' : (mime.indexOf('ogg') >= 0 ? 'ogg' : 'webm');
         uploadRecording(blob, 'recording.' + ext).then(function (text) {
           if (!text) throw new Error('没有识别到可发送的文字，请重新录制。');
@@ -1592,10 +1703,21 @@
       recorder.start();
       setRecordingState(true, false);
     }).catch(function (err) {
+      recordingStarting = false;
       stopRecordingTracks();
       recordingSessionKey = null;
       setRecordingState(false, false);
-      addSys('无法启用麦克风：' + ((err && err.message) || '请检查浏览器权限。'));
+      // TASK-043：权限被拒等给出可操作提示（检查 HTTPS / 去浏览器与系统设置授权）
+      var name = err && (err.name || (err.code && String(err.code)));
+      if (name === 'NotAllowedError' || name === 'PermissionDeniedError' || name === 'SecurityError') {
+        addSys('麦克风权限被拒绝：请点击浏览器地址栏的麦克风图标或到系统设置中允许本网站使用麦克风（需通过 HTTPS 或 localhost 访问才会弹出授权）。');
+      } else if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+        addSys('未检测到可用麦克风设备，请检查设备连接后重试。');
+      } else if (name === 'NotReadableError' || name === 'TrackStartError') {
+        addSys('麦克风正被其它应用占用，请关闭占用后重试。');
+      } else {
+        addSys('无法启用麦克风：' + ((err && err.message) || '请检查浏览器权限。'));
+      }
     });
   }
 

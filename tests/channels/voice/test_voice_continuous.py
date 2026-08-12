@@ -257,6 +257,8 @@ class VoiceContinuousTests(unittest.IsolatedAsyncioTestCase):
             record_sec=2.0,
             record_delay_sec=0.0,
             silence_timeout_sec=5.0,
+            # TASK-043：隔离唤醒回应缓存，防止 _handle_wake 真播放真实 WAV
+            wake_replies_dir="/nonexistent/",
         )
         emitted: list = []
         channel._reply_sink = emitted.append
@@ -286,6 +288,8 @@ class VoiceContinuousTests(unittest.IsolatedAsyncioTestCase):
             record_sec=2.0,
             record_delay_sec=0.0,
             silence_timeout_sec=10**6,  # 阈值极大：多轮静默也远达不到退出
+            # TASK-043：同上，隔离唤醒回应缓存
+            wake_replies_dir="/nonexistent/",
         )
         silent = _silent_wav(2.0)
         with patch(

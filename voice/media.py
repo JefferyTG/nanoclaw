@@ -3,6 +3,7 @@
 import asyncio
 import json
 import math
+import wave
 from pathlib import Path
 from typing import Sequence
 
@@ -108,18 +109,26 @@ async def normalize_to_pcm_wav(
         timeout_sec=timeout_sec,
         failure_category="media_invalid",
     )
+    streams = None
+    duration = None
     try:
         probe = json.loads(stdout.decode("utf-8", errors="strict"))
         streams = probe.get("streams") if isinstance(probe, dict) else None
-        if not streams:
-            raise ValueError("no audio stream")
-        duration = float((probe.get("format") or {}).get("duration"))
-    except (AttributeError, TypeError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
-        raise MediaError("media_invalid", "无法读取音频时长。") from exc
-    if not math.isfinite(duration) or duration <= 0:
-        raise MediaError("media_invalid", "音频时长无效。")
-    if duration > max_duration_sec:
-        raise MediaError("input_too_long", "音频时长超过允许上限。")
+        if streams:
+            raw_duration = (probe.get("format") or {}).get("duration")
+            if raw_duration is not None:
+                duration = float(raw_duration)
+    except (AttributeError, TypeError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        duration = None  # 无法解析 → 视为无时长，转码后从 WAV 头兜底校验
+    if not streams:
+        raise MediaError("media_invalid", "无法读取音频时长。")
+    # WebKit/Safari MediaRecorder 的流式 WebM 常缺 duration 元数据（ffprobe
+    # format.duration 为空）：此时不报错，转码完成后用 wave 模块从 WAV 头兜底读取。
+    if duration is not None:
+        if not math.isfinite(duration) or duration <= 0:
+            raise MediaError("media_invalid", "音频时长无效。")
+        if duration > max_duration_sec:
+            raise MediaError("input_too_long", "音频时长超过允许上限。")
 
     await _run(
         [
@@ -128,7 +137,9 @@ async def normalize_to_pcm_wav(
             "-nostdin",
             "-v",
             "error",
-            "-xerror",
+            # 不用 -xerror：WebKit/Safari 流式 WebM 时间戳从负值开始
+            # （Non-monotonic DTS: -16ms pre-roll），-xerror 会把该警告当
+            # 错误导致转换失败；去掉后真正无法解码的输入仍会非零退出。
             "-i",
             str(source),
             "-map",
@@ -153,6 +164,17 @@ async def normalize_to_pcm_wav(
         raise MediaError("media_invalid", "音频转换未生成有效输出。") from exc
     if not normalized:
         raise MediaError("media_invalid", "音频转换未生成有效输出。")
+    if duration is None:
+        # ffprobe 未给出时长（WebKit 流式 WebM）→ 从 WAV 头兜底校验时长上限
+        try:
+            with wave.open(str(output), "rb") as wf:
+                wav_duration = wf.getnframes() / float(wf.getframerate())
+        except (OSError, wave.Error, ValueError, ZeroDivisionError) as exc:
+            raise MediaError("media_invalid", "音频时长无效。") from exc
+        if not math.isfinite(wav_duration) or wav_duration <= 0:
+            raise MediaError("media_invalid", "音频时长无效。")
+        if wav_duration > max_duration_sec:
+            raise MediaError("input_too_long", "音频时长超过允许上限。")
     return ASRAudio(normalized, "audio.wav", "audio/wav")
 
 

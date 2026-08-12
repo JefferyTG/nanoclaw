@@ -1,6 +1,8 @@
 import asyncio
+import io
 import json
 import tempfile
+import wave
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -143,6 +145,10 @@ class ASRCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(audio.data, b"RIFF....WAVE")
         self.assertIn("-select_streams", commands[0])
         self.assertEqual(commands[0][commands[0].index("-select_streams") + 1], "a:0")
+        # TASK-043 回归：normalize 的 ffmpeg 不得带 -xerror（WebKit 流式 WebM
+        # 时间戳从负值开始，-xerror 会把 Non-monotonic DTS 警告当错误导致转换失败）
+        self.assertEqual(commands[1][0], "ffmpeg")
+        self.assertNotIn("-xerror", commands[1])
 
     async def test_cancelled_media_process_is_reaped(self):
         class HangingProcess:
@@ -236,6 +242,71 @@ class ASRCoreTests(unittest.IsolatedAsyncioTestCase):
                     )
         self.assertEqual(caught.exception.category, "input_too_long")
         self.assertEqual(calls, ["ffprobe"])
+
+    async def test_media_tolerates_missing_duration_metadata(self):
+        """WebKit/Safari 流式 WebM 无 duration 元数据（ffprobe format 为空）→
+        转码后从 WAV 头兜底读时长，不报「无法读取音频时长」。（TASK-043 回归）"""
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(b"\x00\x00" * 8000)  # 0.5s @16k mono 16bit
+        wav_data = buf.getvalue()
+
+        commands = []
+
+        async def create_process(*args, **kwargs):
+            commands.append(args[0])
+            if args[0] == "ffprobe":
+                # 与 Safari 真实输出一致：有音频流但 format 无 duration
+                return _Process(json.dumps({"streams": [{"index": 0}], "format": {}}).encode())
+            Path(args[-1]).write_bytes(wav_data)
+            return _Process()
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("voice.media.asyncio.create_subprocess_exec", side_effect=create_process):
+                audio = await media.normalize_to_pcm_wav(
+                    ASRAudio(b"source", "voice.webm", "audio/webm"),
+                    directory=directory,
+                    ffmpeg_path="ffmpeg",
+                    ffprobe_path="ffprobe",
+                    timeout_sec=1,
+                    max_duration_sec=2,
+                )
+        self.assertEqual(audio.data, wav_data)
+        self.assertEqual(audio.filename, "audio.wav")
+        self.assertEqual(audio.media_type, "audio/wav")
+        self.assertEqual(commands, ["ffprobe", "ffmpeg"])
+
+    async def test_media_rejects_too_long_when_duration_falls_back_to_wav(self):
+        """ffprobe 无 duration 时，wave 兜底检测超长音频仍拒绝（TASK-043 回归）"""
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(b"\x00\x00" * 64000)  # 4s @16k mono 16bit > max 2
+        wav_data = buf.getvalue()
+
+        async def create_process(*args, **kwargs):
+            if args[0] == "ffprobe":
+                return _Process(json.dumps({"streams": [{"index": 0}], "format": {}}).encode())
+            Path(args[-1]).write_bytes(wav_data)
+            return _Process()
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("voice.media.asyncio.create_subprocess_exec", side_effect=create_process):
+                with self.assertRaises(media.MediaError) as caught:
+                    await media.normalize_to_pcm_wav(
+                        ASRAudio(b"source", "voice.webm", "audio/webm"),
+                        directory=directory,
+                        ffmpeg_path="ffmpeg",
+                        ffprobe_path="ffprobe",
+                        timeout_sec=1,
+                        max_duration_sec=2,
+                    )
+        self.assertEqual(caught.exception.category, "input_too_long")
 
     async def test_service_enforces_size_and_rejects_empty_text(self):
         provider = _Provider("")
