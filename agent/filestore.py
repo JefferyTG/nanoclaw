@@ -186,3 +186,25 @@ class FileStore:
                 os.unlink(target)
         except OSError:
             pass
+
+    def resolve(self, ref) -> "object | None":
+        """校验并解析一份文件引用：路径必须落在 ``files_dir`` 内且文件存在。
+
+        TASK-041 网页渠道用：前端把上传时得到的引用字段原样回传，入站前先经
+        此校验，防止伪造 ``path`` 引用越界文件；不存在或越界返回 ``None``。
+        返回的 ``FileRef`` 保留原引用字段（id/path/name/size/mime），name/size
+        缺失时以磁盘真实值兜底。
+        """
+        from bus.queue import FileRef
+
+        target = self._absolute_path(getattr(ref, "path", None))
+        if target is None or not os.path.isfile(target):
+            return None
+        rel_path = os.path.relpath(target, self.ref_root).replace(os.sep, "/")
+        return FileRef(
+            id=getattr(ref, "id", None) or uuid.uuid4().hex,
+            path=rel_path,
+            name=getattr(ref, "name", None) or os.path.basename(target),
+            size=getattr(ref, "size", None) or os.path.getsize(target),
+            mime=getattr(ref, "mime", None),
+        )

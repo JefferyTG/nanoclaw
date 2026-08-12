@@ -166,6 +166,8 @@ TTS 同样在启动期按 `tts_model` 配置装配并只注入 WebChannel，但�
 
 飞书图片沿用同一套渠道无关协议。入站 `image` 事件先建立按 chat、会话序号和发送者隔离的待处理批次，再用消息 ID 与 `image_key` 调飞书鉴权资源接口下载；校验通过后保存到共享 `ImageStore`。批次默认等待 10 秒接收后续文字，连续图片会重置计时；文字到达或计时结束后，整批图片作为一条 `InboundMessage.images` 进入既有视觉链路。下载期间即使用户切换会话，图片仍归属事件到达时的会话序号。出站时 `AgentLoop` 汇总本轮（含子 Agent）生成的图片 ID，Gateway 在原会话中解析为 `ImageRef` 并放入 `OutboundMessage.images`；飞书 Channel 上传图片取得 `image_key` 后发送 `image` 消息。Web 上传本身就是单条图文消息，不使用飞书的等待合并机制；Web 的图片展示继续使用流事件，不重复消费最终出站图片。
 
+Web 文件上传（TASK-041）：`/upload` 按 MIME/扩展名分流——`image/*` 或图片扩展名走共享 `ImageStore`（按会话落盘，返回 `image_id`）；其余文件（pdf/doc/txt/zip 等）走 `FileStore`（按月归档到 `workspace/files/YYYY-MM/`，消毒名、重名后缀、50MB 上限，返回 `file_id/name/path/size/mime`）。WebChannel 在 `__init__` 里按组合根 `shared["file_store"]` 同目录同根自建一份 FileStore，ref.path 相对 `config.workspace`，Agent 可直接 `read_file` 读取。入站 WS 消息支持 `{"text","images","files"}`：文件引用先经 `FileStore.resolve` 校验（防伪造路径越界），再以微信渠道同一格式文本化进 content（`📎 收到文件：{path}（{size}）`），同时放入 `InboundMessage.files`；Agent 核心协议不变（files 字段仅总线元数据）。
+
 ### 5.2 消息与并发
 
 ```mermaid

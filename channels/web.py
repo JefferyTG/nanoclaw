@@ -24,7 +24,8 @@ import uuid
 
 from aiohttp import web
 
-from bus.queue import InboundMessage, OutboundMessage
+from agent.filestore import MAX_FILE_BYTES, FileTooLargeError
+from bus.queue import FileRef, InboundMessage, OutboundMessage
 from channels.base import Channel
 from voice.asr.base import ASRError
 from voice.tts.base import TTSError
@@ -34,6 +35,29 @@ logger = logging.getLogger("nanoclaw.web")
 # 所有 HTTP 响应都禁止缓存，确保浏览器每次都拉取最新前端（避免流式上线后
 # 旧页面把 {"event":...} 帧当纯文本显示成「一堆 JSON」的缓存陷阱）。
 _NO_CACHE = {"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
+
+# 图片判定集合：/upload 按 MIME/扩展名分流——content_type 以 image/ 开头或
+# 扩展名命中此集合的走 ImageStore；其余文件走 FileStore（与微信 TASK-003 同一底座）。
+_IMAGE_EXTENSIONS = frozenset({
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "heic", "heif",
+    "avif", "ico", "tif", "tiff",
+})
+
+
+def _human_file_size(num_bytes: int) -> str:
+    """把字节数格式化为人类可读大小，与微信渠道保持同一格式（单一事实源）。"""
+    try:
+        size = float(max(0, int(num_bytes or 0)))
+    except (TypeError, ValueError):
+        size = 0.0
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            break
+        size /= 1024
+    if unit == "B":
+        return f"{int(size)}B"
+    return f"{size:.1f}{unit}" if size < 10 else f"{size:.0f}{unit}"
+
 
 # 浏览器录音由本地 ASR 服务即时转写，不落盘。服务通常提供自己的上限；此值
 # 仅在注入的兼容服务没有声明 max_audio_bytes 时作为安全回退。
@@ -62,6 +86,22 @@ class WebChannel(Channel):
         self.config_path = config_path    # 本实例 config.json 路径（用于持久化）
         self.session_manager = session_manager  # 会话持久化管理器（侧边栏读写用，可空）
         self.image_store = image_store    # 图片存储（落盘/解析/清理），可空
+        # 文件存储（TASK-041 文件上传）：组合根 shared["file_store"] 未注入本渠道，
+        # 这里按 main.py L1107 完全同参数自建一份——同目录（workspace/files）同根
+        # （ref_root=config.workspace），因此 web 上传的文件与微信入站文件落到同一
+        # workspace/files/YYYY-MM/ 归档，ref.path 相对 config.workspace，Agent 可
+        # 直接 read_file。config 为 None（测试/缺配置）时留空，文件上传返回未就绪。
+        self.file_store = None
+        if config is not None and getattr(config, "workspace", None):
+            try:
+                from agent.filestore import FileStore
+
+                self.file_store = FileStore(
+                    os.path.join(config.workspace, "workspace", "files"),
+                    ref_root=config.workspace,
+                )
+            except Exception as exc:  # noqa: BLE001 - 文件上传降级为不可用，不影响聊天
+                logger.warning("文件存储初始化失败，文件上传不可用：%s", exc)
         # 语音转写服务；由 composition root 注入。None 表示本实例未启用 ASR。
         # 服务属于主 asyncio loop，不能直接在本文件的 aiohttp 后台 loop 调用。
         self.asr_service = asr_service
@@ -113,8 +153,9 @@ class WebChannel(Channel):
             asyncio.set_event_loop(loop)
             self._web_loop = loop
 
-            # client_max_size：默认仅 1MB，上传照片会 413；放宽到 20MB
-            app = web.Application(client_max_size=20 * 1024 * 1024)
+            # client_max_size：默认仅 1MB，上传照片会 413；放宽到 50MB，
+            # 与 FileStore.MAX_FILE_BYTES（50MB）对齐，文件上传不超过 50MB。
+            app = web.Application(client_max_size=50 * 1024 * 1024)
             app.router.add_get("/", self._handle_index)
             app.router.add_get("/ws", self._handle_ws)
             app.router.add_post("/upload", self._handle_upload)
@@ -195,12 +236,10 @@ class WebChannel(Channel):
         """会话标识合法性校验：防止 key 携带路径分隔符/..，拼出穿越路径。"""
         return bool(key) and ":" in key and "/" not in key and "\\" not in key and ".." not in key
 
-    # —— 图片上传（供网页发送图片，后端落盘并返回 image_id）——
+    # —— 上传（供网页发送图片/文件，后端落盘并返回引用）——
+    # 按 MIME/扩展名分流：图片走 ImageStore（返回 image_id，行为与旧版一致）；
+    # 其它文件走 FileStore（返回 file_id/name/path/size/mime，TASK-041）。
     async def _handle_upload(self, request) -> web.Response:
-        if self.image_store is None:
-            return web.json_response(
-                {"ok": False, "error": "图片存储未就绪"}, status=500
-            )
         # key 为完整会话标识（含 web: 前缀），用于定位图片落盘目录
         key = request.query.get("key", "")
         if not self._valid_key(key):
@@ -220,15 +259,49 @@ class WebChannel(Channel):
             return web.json_response({"ok": False, "error": f"读取文件失败：{exc}"}, status=500)
         if not raw:
             return web.json_response({"ok": False, "error": "文件为空"}, status=400)
-        filename = getattr(f, "filename", "") or "image.png"
-        ext = os.path.splitext(filename)[1].lstrip(".") or "png"
-        mime = getattr(f, "content_type", None) or "image/png"
+        filename = getattr(f, "filename", "") or "file"
+        ext = os.path.splitext(filename)[1].lstrip(".").lower()
+        mime = (getattr(f, "content_type", None) or "").strip()
+        is_image = mime.lower().startswith("image/") or ext in _IMAGE_EXTENSIONS
+
+        if is_image:
+            if self.image_store is None:
+                return web.json_response(
+                    {"ok": False, "error": "图片存储未就绪"}, status=500
+                )
+            ext = ext or "png"
+            try:
+                ref = self.image_store.save(key, raw, ext, mime or "image/png")
+            except Exception as exc:  # noqa: BLE001
+                return web.json_response({"ok": False, "error": f"保存失败：{exc}"}, status=500)
+            return web.json_response(
+                {"ok": True, "image_id": ref.id, "mime": ref.mime}, headers=_NO_CACHE
+            )
+
+        # 非图片文件：走 FileStore（按月归档、消毒名、重名后缀、50MB 上限）
+        if self.file_store is None:
+            return web.json_response(
+                {"ok": False, "error": "文件存储未就绪"}, status=500
+            )
         try:
-            ref = self.image_store.save(key, raw, ext, mime)
+            ref = self.file_store.save(raw, filename, mime or None)
+        except FileTooLargeError:
+            return web.json_response(
+                {"ok": False, "error": f"文件超过 {MAX_FILE_BYTES // (1024 * 1024)}MB 限制"},
+                status=413,
+            )
         except Exception as exc:  # noqa: BLE001
             return web.json_response({"ok": False, "error": f"保存失败：{exc}"}, status=500)
         return web.json_response(
-            {"ok": True, "image_id": ref.id, "mime": ref.mime}, headers=_NO_CACHE
+            {
+                "ok": True,
+                "file_id": ref.id,
+                "name": ref.name,
+                "path": ref.path,
+                "size": ref.size,
+                "mime": ref.mime,
+            },
+            headers=_NO_CACHE,
         )
 
     @staticmethod
@@ -508,29 +581,15 @@ class WebChannel(Channel):
                                 )
                             # 控制消息不进入聊天流程
                             continue
-                    # 聊天用 JSON（不带 ctl 标记）：{"text":..., "images":[id,...]}
-                    # 用于网页发送带图片的消息；图片 id 来自 /upload 的返回。
-                    if obj and ("text" in obj or "images" in obj):
-                        st = self._session_state(conn_id)
-                        text2 = obj.get("text", "") or ""
-                        images = []
-                        skey = f"{self.name}:{st['current_key']}"
-                        for iid in (obj.get("images") or []):
-                            if self.image_store is not None:
-                                ref = self.image_store.resolve(skey, iid)
-                                if ref is not None:
-                                    images.append(ref)
-                        inbound = InboundMessage(
-                            channel=self.name,
-                            sender_id=st["current_key"],
-                            chat_id=conn_id,
-                            content=text2,
-                            images=images or None,
-                            raw={"conn_id": conn_id},
-                        )
-                        asyncio.run_coroutine_threadsafe(
-                            self.bus.publish_inbound(inbound), self._loop
-                        )
+                    # 聊天用 JSON（不带 ctl 标记）：{"text":..., "images":[id,...],
+                    # "files":[{file_id,name,path,size,mime},...]}
+                    # 用于网页发送带图片/文件的消息；引用来自 /upload 的返回。
+                    if obj and ("text" in obj or "images" in obj or "files" in obj):
+                        inbound = self._build_inbound_chat(conn_id, obj)
+                        if inbound is not None:
+                            asyncio.run_coroutine_threadsafe(
+                                self.bus.publish_inbound(inbound), self._loop
+                            )
                         continue
 
                     # 内置命令：命中则直接回复，不经过 Agent
@@ -556,6 +615,7 @@ class WebChannel(Channel):
                     import sys as _sys, traceback as _tb
                     _tb.print_exc()
                     print(f"[WS_HANDLER_ERROR] conn={conn_id}: {type(exc).__name__}: {exc}", file=_sys.stderr, flush=True)
+                    logger.warning("web WS 处理消息异常 conn=%s text=%r exc=%s: %s", conn_id, (text or "")[:80], type(exc).__name__, exc)
                     try:
                         await self._ws_send(ws, f"⚠️ 处理你的消息时后端出错：{type(exc).__name__}: {exc}")
                     except Exception:
@@ -583,6 +643,99 @@ class WebChannel(Channel):
         st = self._session_state(conn_id)
         st["seq"] += 1
         return f"{conn_id}:{st['seq']}"
+
+    # —— TASK-041 文件引用：文本化进 content（与微信渠道同一格式，单一事实源）——
+    @staticmethod
+    def _file_reference_text(ref) -> str:
+        """把一份 FileRef 拼成入站 content 中的文件引用文本（不读文件内容）。"""
+        return f"📎 收到文件：{ref.path}（{_human_file_size(ref.size)}）"
+
+    def _build_content(self, text: str, images: list, files: list) -> str:
+        """按文本/图片/文件组装入站 content（与微信渠道 _build_content 同构）。
+
+        文本在前；文件引用随后（每份一行，路径为相对 workspace 的相对路径）。
+        纯文件消息（无文本）的 content 就是文件引用文本，能直接进 Agent；
+        Agent 看到路径后可自行 read_file 读取内容。图片不参与文本化（走
+        images 引用进多模态链路）。
+        """
+        parts = []
+        if text:
+            parts.append(text)
+        file_lines = [self._file_reference_text(ref) for ref in files]
+        if file_lines:
+            parts.append("\n".join(file_lines))
+        if parts:
+            return "\n".join(parts)
+        if images:
+            return "请分析这张图片。" if len(images) == 1 else "请分析这些图片。"
+        return ""
+
+    def _resolve_file_ref(self, entry: dict):
+        """把前端回传的文件引用字段经 FileStore 校验为 FileRef；非法返回 None。
+
+        前端上传成功后拿到 {file_id,name,path,size,mime} 原样回传，入站前必须
+        校验 path 确实落在 FileStore 归档目录且文件仍存在，防止伪造路径引用
+        越界文件。
+        """
+        if self.file_store is None or not isinstance(entry, dict):
+            return None
+        try:
+            size = int(entry.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        ref = FileRef(
+            id=entry.get("file_id") or entry.get("id") or "",
+            path=entry.get("path") or "",
+            name=entry.get("name") or "",
+            size=size,
+            mime=entry.get("mime") or None,
+        )
+        return self.file_store.resolve(ref)
+
+    def _build_inbound_chat(self, conn_id: str, obj: dict):
+        """把网页聊天 JSON（{"text","images","files"}）解析为 InboundMessage。
+
+        与 ctl 控制消息无关；text/images/files 任意组合均可。图片引用经
+        ImageStore 解析、文件引用经 FileStore 校验，文件引用文本化拼进
+        content 并同时放入 InboundMessage.files（与微信渠道一致，总线元数据，
+        Agent 核心不消费该字段）。内容为空时返回 None（调用方忽略）。
+        """
+        st = self._session_state(conn_id)
+        text2 = obj.get("text", "") or ""
+        images = []
+        skey = f"{self.name}:{st['current_key']}"
+        for iid in obj.get("images") or []:
+            if self.image_store is not None:
+                ref = self.image_store.resolve(skey, iid)
+                if ref is not None:
+                    images.append(ref)
+                else:
+                    logger.warning("web 入站图片引用解析失败：skey=%s iid=%s", skey, iid)
+        files = []
+        for entry in obj.get("files") or []:
+            ref = self._resolve_file_ref(entry)
+            if ref is not None:
+                files.append(ref)
+            else:
+                logger.warning("web 入站文件引用校验失败：%r", entry)
+        content = self._build_content(text2, images, files)
+        logger.info(
+            "web 入站聊天消息 conn=%s text=%r images=%d files=%d content=%r",
+            conn_id, (text2 or "")[:80], len(images), len(files), (content or "")[:150],
+        )
+        if not content:
+            logger.warning("web 入站消息内容为空，已丢弃 conn=%s obj=%r", conn_id, obj)
+            return None
+        return InboundMessage(
+            channel=self.name,
+            sender_id=st["current_key"],
+            chat_id=conn_id,
+            content=content,
+            images=images or None,
+            files=files or None,
+            raw={"conn_id": conn_id},
+        )
+
 
     def _handle_command(self, conn_id: str, text: str):
         """解析网页内置命令，返回回复文本；非命令返回 None（交给 Agent）。"""

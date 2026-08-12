@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>NanoClaw 网页端</title>
+<title>小奈</title>
 <meta name="page-version" content="__NC_PAGE_VERSION__" />
 <style>
   :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --txt:#e6e8ec; --muted:#9aa3b2; --accent:#538bf0; --ok:#3ecf8e; --think:#2a2333; --think-line:#4a3a5e; }
@@ -77,18 +77,40 @@
   .answer { padding:9px 12px; white-space:pre-wrap; word-break:break-word; line-height:1.65; min-height:20px; }
   .answer.empty::after { content:"生成中…"; color:var(--muted); }
 
+  /* —— TASK-041 输入栏豆包化：📷 相机 ｜ 大输入框（/按住说话条）｜ 🎙 麦克风 ｜ ＋ 加号 —— */
   #bar { display:flex; gap:8px; padding:12px 16px; border-top:1px solid var(--line); }
-  #bar input[type=text] { flex:1; background:var(--panel); border:1px solid var(--line); color:var(--txt);
+  #bar input[type=text] { flex:1; min-width:0; background:var(--panel); border:1px solid var(--line); color:var(--txt);
                border-radius:10px; padding:10px 12px; font-size:14px; outline:none; }
   #bar input[type=text]:focus { border-color:var(--accent); }
-  #bar button { background:var(--accent); color:#fff; border:none; border-radius:10px; padding:0 18px; font-size:14px; cursor:pointer; }
-  #bar #attachBtn, #bar #recordBtn, #bar #ttsBtn { background:var(--panel); color:var(--txt); border:1px solid var(--line); padding:0 12px; font-size:16px; }
-  #bar #attachBtn:hover, #bar #recordBtn:hover, #bar #ttsBtn:hover { border-color:var(--accent); }
-  #bar #ttsBtn.enabled { color:var(--ok); border-color:var(--ok); }
-  #bar #recordBtn.recording { background:#b13d4b; border-color:#e86b78; color:#fff; }
-  /* 停止键：回合进行中 sendBtn 变「⏹ 停止」，红色警示；防重复点击时禁用 */
-  #bar #sendBtn.stop { background:#b13d4b; border-color:#e86b78; }
-  #bar #sendBtn:disabled { opacity:.6; cursor:default; }
+  #bar #cameraBtn, #bar #micBtn, #bar #plusBtn { background:var(--panel); color:var(--txt); border:1px solid var(--line);
+               border-radius:10px; padding:0 12px; font-size:16px; cursor:pointer; }
+  #bar #cameraBtn:hover, #bar #micBtn:hover, #bar #plusBtn:hover { border-color:var(--accent); }
+  #bar #micBtn.voice-on { color:var(--accent); border-color:var(--accent); background:#1b2230; }
+  #bar #micBtn.recording { background:#b13d4b; border-color:#e86b78; color:#fff; }
+  /* 按住说话条：voice 模式替换输入框；touch-action:none 保证按住手势期间不随手指滚动页面 */
+  #voiceBar { flex:1; min-width:0; background:var(--panel); border:1px solid var(--line); color:var(--muted);
+              border-radius:10px; padding:10px 12px; font-size:14px; text-align:center; cursor:pointer;
+              user-select:none; -webkit-user-select:none; -webkit-touch-callout:none; touch-action:none; }
+  #voiceBar.holding { background:#2a2f3a; border-color:var(--accent); color:var(--txt); }
+  #voiceBar.cancel { background:#3a2026; border-color:#e86b78; color:#ff8a94; }
+  /* 顶栏：自动朗读（原在 bar，TASK-041 移到右上角 header）与回合停止键 */
+  #ttsBtn.enabled { color:var(--ok); border-color:var(--ok); }
+  #stopBtn { display:none; }
+  #stopBtn.on { display:inline-block; background:#b13d4b; border-color:#e86b78; color:#fff; }
+  #stopBtn:disabled { opacity:.6; cursor:default; }
+  /* 轻提示（语音占位等）：自关闭，非阻塞 */
+  #toast { position:fixed; left:50%; bottom:130px; transform:translateX(-50%); background:rgba(20,23,30,.94);
+           color:var(--txt); border:1px solid var(--line); border-radius:10px; padding:9px 16px; font-size:13px;
+           max-width:80vw; text-align:center; pointer-events:none; opacity:0; transition:opacity .25s ease;
+           z-index:200; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #toast.show { opacity:1; }
+  /* 用户消息里的文件 chip（发送后即时回显；历史回放以文本 📎 形式在 content 中展示） */
+  .file-strip { display:flex; flex-direction:column; gap:6px; margin-top:6px; align-items:flex-end; }
+  .file-chip { display:inline-flex; align-items:center; gap:6px; background:rgba(255,255,255,.16); border-radius:8px;
+               padding:6px 10px; font-size:12px; max-width:100%; }
+  .file-chip .fc-ico { font-size:15px; flex:none; }
+  .file-chip .fc-name { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:180px; }
+  .file-chip .fc-size { opacity:.75; flex:none; }
 
   /* —— 上下文占用进度条（usage 流事件；无数据时隐藏，不报错）—— */
   #ctxbar { padding:6px 16px 0; }
@@ -105,9 +127,22 @@
   #attach.show { display:flex; }
   .att-item { position:relative; width:56px; height:56px; border:1px solid var(--line); border-radius:8px; overflow:hidden; background:var(--panel); }
   .att-item img { width:100%; height:100%; object-fit:cover; display:block; }
+  /* 上传进度环：半透明遮罩盖在缩略图上，SVG 圆环 + 百分比（乖宝 2026-08-12 要求） */
+  .att-progress { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center;
+                  justify-content:center; gap:2px; background:rgba(0,0,0,.45); border-radius:8px; }
+  .att-progress svg { width:34px; height:34px; }
+  .att-progress .prog-ring { transform:rotate(-90deg); transform-origin:center; transition:stroke-dashoffset .15s linear; }
+  .att-progress span { font-size:10px; color:#fff; line-height:1; }
   .att-item .att-del { position:absolute; top:0; right:0; background:rgba(0,0,0,.55); color:#fff; border:none;
                        cursor:pointer; font-size:11px; line-height:1; padding:2px 5px; border-radius:0 0 0 6px; }
   .att-item .att-del:hover { background:rgba(255,107,107,.85); }
+  /* TASK-041：加号上传文件时的 chip 预览（图片仍走缩略图） */
+  .att-item.file { display:flex; align-items:center; gap:6px; width:auto; min-width:120px; max-width:200px;
+                   height:auto; padding:8px 28px 8px 10px; }
+  .att-item.file .att-ico { font-size:16px; flex:none; }
+  .att-item.file .att-name { font-size:11px; color:var(--txt); white-space:nowrap; overflow:hidden;
+                             text-overflow:ellipsis; min-width:0; flex:1; }
+  .att-item.file .att-del { position:absolute; top:0; right:0; }
 
   /* —— 消息里的图片条（用户气泡下方 / 历史回放）—— */
   .img-strip { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; justify-content:flex-end; }
@@ -178,15 +213,13 @@
     /* 3) 输入栏与软键盘：底部安全区、16px 防 iOS 自动缩放、44px 触控目标 */
     #bar { gap:6px; padding:10px 10px calc(10px + env(safe-area-inset-bottom)); }
     #bar input[type=text] { font-size:16px; min-height:44px; }
-    #bar button { min-height:44px; font-size:16px; padding:0 14px; }
-    #bar #attachBtn, #bar #recordBtn, #bar #ttsBtn { min-width:44px; padding:0; font-size:20px; }
-    #bar #sendBtn { min-width:56px; }
+    #voiceBar { font-size:16px; min-height:44px; }
+    #bar #cameraBtn, #bar #micBtn, #bar #plusBtn { min-width:44px; padding:0; font-size:20px; }
 
     /* 4) 触控反馈：手机无 hover，补 :active 等价样式（不影响桌面 hover 外观） */
     header button { min-height:44px; font-size:14px; padding:5px 14px; }
     header button:active { border-color:var(--accent); }
-    #bar #attachBtn:active, #bar #recordBtn:active, #bar #ttsBtn:active { border-color:var(--accent); background:#1e2430; }
-    #bar #sendBtn:active { filter:brightness(1.15); }
+    #bar #cameraBtn:active, #bar #micBtn:active, #bar #plusBtn:active { border-color:var(--accent); background:#1e2430; }
     #sidebar .sb-head button { min-height:44px; font-size:14px; padding:5px 14px; }
     #sidebar .sb-head button:active { filter:brightness(1.1); }
     .sb-item:active { border-color:var(--accent); }
@@ -234,9 +267,11 @@
 </head>
 <body>
 <header>
-  <h1>NanoClaw 网页端</h1>
+  <h1>小奈</h1>
   <button id="sbToggle" aria-label="打开会话列表" title="会话列表">☰</button>
   <span class="status" id="status">连接中…</span>
+  <button id="ttsBtn" title="开启自动朗读" aria-label="开启自动朗读" aria-pressed="false">🔇</button>
+  <button id="stopBtn" title="停止当前回复">⏹</button>
   <button id="cfgBtn">配置</button>
 </header>
 
@@ -283,23 +318,27 @@
       <div class="ctx-track"><div class="ctx-fill" id="ctxFill"></div></div>
       <div class="ctx-meta" id="ctxMeta"></div>
     </div>
-    <div id="bar">
-      <button id="attachBtn" title="上传图片（也可直接粘贴）">🖼</button>
-      <input id="fileInput" type="file" accept="image/*" multiple style="display:none" />
-      <button id="recordBtn" title="开始录音">🎙</button>
-      <button id="ttsBtn" title="开启自动朗读" aria-label="开启自动朗读" aria-pressed="false">🔇</button>
-      <input id="input" type="text" placeholder="输入消息，回车发送；可粘贴/上传图片；/new 开新会话，/clear 清当前" autocomplete="off" />
-      <button id="sendBtn">发送</button>
-    </div>
+    <form id="bar" autocomplete="off">
+      <button type="button" id="cameraBtn" title="拍照（手机调起相机，桌面为选择图片）">📷</button>
+      <input id="cameraInput" type="file" accept="image/*" capture="environment" style="display:none" />
+      <input id="input" type="text" placeholder="发消息或按住说话..." enterkeyhint="send" />
+      <div id="voiceBar" style="display:none" title="按住说话">按住说话</div>
+      <button type="button" id="micBtn" title="切换到按住说话">🎙</button>
+      <button type="button" id="plusBtn" title="上传图片或文件">＋</button>
+      <input id="fileInput" type="file"
+             accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.md,.csv,.zip,.rar,.7z,.json,.log"
+             multiple style="display:none" />
+    </form>
   </div><!-- /#main -->
   <div id="sbMask"></div>
 </div><!-- /#app -->
+<div id="toast"></div>
 
 <script>
 (function () {
   var chat = document.getElementById('chat');
   var input = document.getElementById('input');
-  var sendBtn = document.getElementById('sendBtn');
+  var stopBtn = document.getElementById('stopBtn');
   // —— 聊天区 sticky scroll：贴底才自动跟随，用户上滑读历史时不被拉回 ——
   var nearBottom = true;   // 是否在底部附近（阈值 80px）；贴底才自动滚动到底
   function scrollChatToBottom() {
@@ -572,7 +611,7 @@
   };
   updateTtsButton();
 
-  function addUser(text, imgUrls) {
+  function addUser(text, imgUrls, files) {
     var m = document.createElement('div'); m.className = 'msg user';
     if (text) {
       var b = document.createElement('div'); b.className = 'bubble'; b.textContent = text;
@@ -585,6 +624,19 @@
         strip.appendChild(im);
       });
       m.appendChild(strip);
+    }
+    // TASK-041：文件 chip 即时回显（历史回放以 content 里的 📎 文本展示）
+    if (files && files.length) {
+      var chips = document.createElement('div'); chips.className = 'file-strip';
+      files.forEach(function (f) {
+        var c = document.createElement('span'); c.className = 'file-chip';
+        c.innerHTML = '<span class="fc-ico">📄</span><span class="fc-name"></span><span class="fc-size"></span>';
+        c.querySelector('.fc-name').textContent = f.name || '文件';
+        c.querySelector('.fc-size').textContent = humanSize(f.size);
+        c.title = (f.name || '文件') + '（' + humanSize(f.size) + '）';
+        chips.appendChild(c);
+      });
+      m.appendChild(chips);
     }
     chat.appendChild(m); scrollChatToBottom();
   }
@@ -779,6 +831,7 @@
       currentKey = ev.key;
       renderCtxBar();
       loadSessions();
+      tryAutoUploads();   // 会话就绪后，把之前选好还没传的附件自动补传
       return;
     }
     var t = ev.type;
@@ -796,11 +849,11 @@
       return;
     }
     if (t === 'subagent_event') {
-      if (!cur) { cur = newTurn(); updateSendBtn(); }
+      if (!cur) { cur = newTurn(); updateStopBtn(); }
       onSubagentEvent(cur, ev);
       return;
     }
-    if (!cur) { cur = newTurn(); updateSendBtn(); }
+    if (!cur) { cur = newTurn(); updateStopBtn(); }
     if (t === 'thinking') {
       // 全文累积到 body（仅展开时可见），单行预览随思考流式刷新
       cur.thinkBody.textContent += (ev.content || '');
@@ -875,7 +928,7 @@
       flushTtsSegments(cur, true);
       ttsDiscardUntilDone = false;
       cur = null;
-      updateSendBtn();   // 回合结束：按钮恢复「发送」
+      updateStopBtn();   // 回合结束：按钮恢复「发送」
       scrollChatToBottom();
       loadSessions();   // 刷新侧边栏：新会话出现 / 预览与末次时间更新
     }
@@ -917,7 +970,7 @@
       ttsDiscardUntilDone = false;
       clearSubagentTimers(cur);
       cur = null;
-      updateSendBtn();   // 断线回合作废：按钮恢复「发送」
+      updateStopBtn();   // 断线回合作废：按钮恢复「发送」
       statusEl.textContent = '已断开 · 重连中…';
       statusEl.style.color = '#d98c00';
       if (_reconnectTimer) clearTimeout(_reconnectTimer);
@@ -946,43 +999,79 @@
       cur.answer.textContent += data;
       cur.think.classList.remove('live');
       cur = null;
-      updateSendBtn();   // 兜底路径也要恢复按钮
+      updateStopBtn();   // 兜底路径也要恢复按钮
     };
   }
   connectWS();
 
-  // —— 图片附件：粘贴或选择后先本地暂存（File + ObjectURL 预览），发送时才上传 ——
+  // —— 附件（图片 + 文件，TASK-041）：选择后先本地暂存，发送时才上传 ——
   // 发送时才上传的原因：上传接口按「当前会话 key」落盘，若附图后又切换会话，
-  // 提前上传的图会落错目录；发送瞬间 currentKey 一定是本条消息所属会话。
+  // 提前上传会落错目录；发送瞬间 currentKey 一定是本条消息所属会话。
   var attachBar = document.getElementById('attach');
   var fileInput = document.getElementById('fileInput');
-  var recordBtn = document.getElementById('recordBtn');
-  var pendingImages = [];   // [{file, url}]
+  var cameraInput = document.getElementById('cameraInput');
+  var pendingAtts = [];   // [{file, kind:'image'|'file', url?}]
+
+  function humanSize(n) {
+    var size = Math.max(0, Number(n) || 0);
+    var unit = 'B';
+    while (size >= 1024 && unit !== 'GB') {
+      size /= 1024;
+      unit = unit === 'B' ? 'KB' : (unit === 'KB' ? 'MB' : 'GB');
+    }
+    return unit === 'B' ? Math.round(size) + 'B' : (size < 10 ? size.toFixed(1) : Math.round(size)) + unit;
+  }
 
   function renderAttach() {
     attachBar.innerHTML = '';
-    attachBar.className = pendingImages.length ? 'show' : '';
-    pendingImages.forEach(function (it, idx) {
-      var d = document.createElement('div'); d.className = 'att-item';
-      var im = document.createElement('img'); im.src = it.url; d.appendChild(im);
+    attachBar.className = pendingAtts.length ? 'show' : '';
+    pendingAtts.forEach(function (it, idx) {
+      var d = document.createElement('div');
+      d.className = 'att-item' + (it.kind === 'file' ? ' file' : '');
+      if (it.kind === 'image') {
+        var im = document.createElement('img'); im.src = it.url; d.appendChild(im);
+      } else {
+        var ico = document.createElement('span'); ico.className = 'att-ico'; ico.textContent = '📄';
+        var nm = document.createElement('span'); nm.className = 'att-name'; nm.textContent = it.file.name;
+        d.appendChild(ico); d.appendChild(nm);
+      }
+      // 进度遮罩：pending=灰圈（待传） / uploading=蓝圈+% / done=隐藏 / error=灰圈
+      var pg = document.createElement('div'); pg.className = 'att-progress';
+      pg.innerHTML = '<svg viewBox="0 0 40 40"><circle cx="20" cy="20" r="16" fill="none" stroke="rgba(255,255,255,.18)" stroke-width="4"/><circle class="prog-ring" cx="20" cy="20" r="16" fill="none" stroke="rgba(255,255,255,.5)" stroke-width="4" stroke-linecap="round" stroke-dasharray="100.53" stroke-dashoffset="100.53"/></svg><span style="display:none">0%</span>';
+      if (it.upState === 'done') pg.style.display = 'none';
+      d.appendChild(pg);
       var del = document.createElement('button'); del.className = 'att-del'; del.textContent = '✕';
-      del.title = '移除这张图';
+      del.title = '移除';
       del.onclick = function () {
-        URL.revokeObjectURL(it.url);
-        pendingImages.splice(idx, 1);
+        if (it.url) URL.revokeObjectURL(it.url);
+        pendingAtts.splice(idx, 1);
         renderAttach();
       };
       d.appendChild(del);
+      it.el = d;   // 上传时用它在缩略图上画进度环
       attachBar.appendChild(d);
     });
   }
   function addPendingFile(file) {
-    if (!file || file.type.indexOf('image/') !== 0) return;
-    pendingImages.push({ file: file, url: URL.createObjectURL(file) });
+    if (!file) return;
+    // voice 模式下添加附件：自动切回打字模式（否则隐藏的输入框无法回车发送）
+    if (inputMode === 'voice') setInputMode('keyboard');
+    if (file.type && file.type.indexOf('image/') === 0) {
+      pendingAtts.push({ file: file, kind: 'image', url: URL.createObjectURL(file), upState: 'pending', ref: null });
+    } else {
+      pendingAtts.push({ file: file, kind: 'file', upState: 'pending', ref: null });
+    }
     renderAttach();
+    tryAutoUploads();   // 选图即自动上传（乖宝 2026-08-12：不用等回车才开始传）
   }
-  // 入口 1：按钮选择文件（可多选）
-  document.getElementById('attachBtn').onclick = function () { fileInput.click(); };
+  // 入口 1a：📷 相机按钮（手机调起相机拍照，桌面为选择图片）——仅图片
+  document.getElementById('cameraBtn').onclick = function () { cameraInput.click(); };
+  cameraInput.addEventListener('change', function () {
+    Array.prototype.forEach.call(cameraInput.files || [], addPendingFile);
+    cameraInput.value = '';   // 允许再次选择同一文件
+  });
+  // 入口 1b：＋ 加号按钮——图片 + 文件（pdf/doc/txt/zip 等，可多选）
+  document.getElementById('plusBtn').onclick = function () { fileInput.click(); };
   fileInput.addEventListener('change', function () {
     Array.prototype.forEach.call(fileInput.files || [], addPendingFile);
     fileInput.value = '';   // 允许再次选择同一文件
@@ -999,38 +1088,145 @@
     }
     if (got) e.preventDefault();   // 有图片时不把二进制粘进输入框
   });
-  // 入口 3：拖拽图片到聊天区
+  // 入口 3：拖拽文件/图片到聊天区
   chat.addEventListener('dragover', function (e) { e.preventDefault(); });
   chat.addEventListener('drop', function (e) {
     e.preventDefault();
     Array.prototype.forEach.call((e.dataTransfer && e.dataTransfer.files) || [], addPendingFile);
   });
 
-  function uploadOne(file, key) {
-    var fd = new FormData();
-    fd.append('file', file, file.name || 'pasted.png');
-    return fetch('/upload?key=' + encodeURIComponent(key), { method: 'POST', body: fd })
-      .then(function (r) { return r.json(); })
-      .then(function (d) {
-        if (!d || !d.ok) throw new Error((d && d.error) || '上传失败');
-        return d.image_id;
-      });
+  // 统一上传：图片 → /upload 走 ImageStore（返回 image_id）；文件 → 走 FileStore
+  // （返回 file_id/name/path/size/mime），后端按 MIME/扩展名自动分流。
+  // 统一上传：图片 → /upload 走 ImageStore（返回 image_id）；文件 → 走 FileStore
+  // （返回 file_id/name/path/size/mime），后端按 MIME/扩展名自动分流。
+  // 用 XHR 而非 fetch：fetch 拿不到上传进度，XHR 的 upload.onprogress 可以
+  // （乖宝 2026-08-12 要求：上传慢要有进度显示，不能干等像卡死）。
+  function uploadOne(file, key, onProgress) {
+    return new Promise(function (resolve, reject) {
+      var fd = new FormData();
+      fd.append('file', file, file.name || 'pasted.png');
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', '/upload?key=' + encodeURIComponent(key));
+      xhr.timeout = 180000;  // 单文件 3 分钟超时（文件大，别催）
+      xhr.onload = function () {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            var d = JSON.parse(xhr.responseText);
+            if (!d || !d.ok) reject(new Error((d && d.error) || '上传失败'));
+            else resolve(d);
+          } catch (err) { reject(new Error('上传响应解析失败')); }
+        } else {
+          reject(new Error('上传失败（HTTP ' + xhr.status + '）'));
+        }
+      };
+      xhr.onerror = function () { reject(new Error('网络错误，上传失败')); };
+      xhr.ontimeout = function () { reject(new Error('上传超时')); };
+      if (xhr.upload && onProgress) {
+        xhr.upload.onprogress = function (e) {
+          if (e.lengthComputable) onProgress(e.loaded, e.total);
+        };
+      }
+      xhr.send(fd);
+    });
   }
 
-  // —— 停止键：回合进行中 sendBtn 变「⏹ 停止」，点击后取消当前回合 ——
+  // 图片压缩（乖宝 2026-08-12 拍板）：最长边 1600px、JPEG 质量 85%。
+  // 手机原图 5~10MB → 几百 KB，上传秒级；小图（<1MB 且不需缩放）不压；
+  // 压缩失败/非标准图回退原文件，绝不阻断发送。文件（pdf 等）不压缩。
+  function compressImage(file, maxDim, quality) {
+    maxDim = maxDim || 1600;
+    quality = quality || 0.85;
+    return new Promise(function (resolve) {
+      var url = URL.createObjectURL(file);
+      var img = new Image();
+      img.onload = function () {
+        URL.revokeObjectURL(url);
+        var scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+        if (scale >= 1 && file.size < 1024 * 1024) { resolve(file); return; }  // 小图不压
+        var w = Math.max(1, Math.round(img.width * scale));
+        var h = Math.max(1, Math.round(img.height * scale));
+        var canvas = document.createElement('canvas');
+        canvas.width = w; canvas.height = h;
+        canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+        var newName = (file.name.replace(/\.[^.]+$/, '') || 'image') + '.jpg';
+        canvas.toBlob(function (blob) {
+          if (blob && blob.size > 0) resolve(new File([blob], newName, { type: 'image/jpeg' }));
+          else resolve(file);
+        }, 'image/jpeg', quality);
+      };
+      img.onerror = function () { URL.revokeObjectURL(url); resolve(file); };
+      img.src = url;
+    });
+  }
+
+  // —— 附件自动上传（乖宝 2026-08-12：选图即传，不用等回车）——
+  var RING_C = 100.53;   // 圆环周长 2πr (r=16)
+  function updateAttRing(it, pct) {
+    var pg = it.el && it.el.querySelector('.att-progress');
+    if (!pg) return;
+    var ring = pg.querySelector('.prog-ring');
+    var label = pg.querySelector('span');
+    pct = Math.min(100, Math.max(0, pct || 0));
+    if (ring) { ring.style.stroke = '#4cc2ff'; ring.style.strokeDashoffset = RING_C * (1 - pct / 100); }
+    if (label) { label.style.display = 'block'; label.textContent = pct + '%'; }
+    // 不在此处隐藏：onProgress 100% 只表示字节已发完，后端响应（done）才算真正完成；
+    // 否则出现「圈消失但还提示上传中」的时序错觉（乖宝 2026-08-12 实测）
+    pg.style.display = 'flex';
+  }
+  function hideAttRing(it) {
+    var pg = it.el && it.el.querySelector('.att-progress');
+    if (pg) pg.style.display = 'none';
+  }
+  function resetAttRing(it) {
+    var pg = it.el && it.el.querySelector('.att-progress');
+    if (!pg) return;
+    var ring = pg.querySelector('.prog-ring');
+    var label = pg.querySelector('span');
+    if (ring) { ring.style.stroke = 'rgba(255,255,255,.5)'; ring.style.strokeDashoffset = RING_C; }
+    if (label) label.style.display = 'none';
+    pg.style.display = 'flex';
+  }
+  function uploadAtt(it, i) {
+    if (!currentKey || it.upState === 'uploading' || it.upState === 'done') return;
+    it.upState = 'uploading';
+    console.log('[upload] start idx=' + i, it.file && it.file.name, (it.file && it.file.size) || 0);
+    var prep = (it.kind === 'image' && it.file && it.file.type && it.file.type.indexOf('image/') === 0)
+      ? compressImage(it.file).then(function (blob) { return blob; })
+      : Promise.resolve(it.file);
+    prep.then(function (uploadFile) {
+      return uploadOne(uploadFile, currentKey, function (loaded, total) {
+        updateAttRing(it, total > 0 ? Math.round(loaded / total * 100) : 0);
+      });
+    }).then(function (d) {
+      it.ref = d;
+      it.upState = 'done';
+      console.log('[upload] done idx=' + i, d && (d.image_id || d.file_id));
+      hideAttRing(it);   // 真正完成（后端响应）才隐藏圈
+    }).catch(function (e) {
+      it.upState = 'error';
+      console.log('[upload] error idx=' + i, e);
+      resetAttRing(it);
+      addSys('「' + (it.file && it.file.name || '附件') + '」上传失败：' + (e && e.message || e) + '，可删除后重新添加');
+    });
+  }
+  function tryAutoUploads() {
+    if (!currentKey) return;
+    pendingAtts.forEach(function (it, i) { uploadAtt(it, i); });
+  }
+
+  // —— 停止键（TASK-041 从底部 bar 移入右上角 header）：回合进行中显示 ⏹，
+  //     点击后取消当前回合；回合结束/断线自动隐藏，防重复点击时禁用 ——
   var stopping = false;          // 停止请求已发出（防重复点击）
   var stopRetryTimer = null;     // 兜底：done 迟迟未到则恢复可点击，允许重试
 
-  function updateSendBtn() {
+  function updateStopBtn() {
     if (stopRetryTimer) { clearTimeout(stopRetryTimer); stopRetryTimer = null; }
     if (cur) {
-      sendBtn.textContent = '⏹ 停止';
-      sendBtn.classList.add('stop');
-      sendBtn.disabled = stopping;
+      stopBtn.classList.add('on');
+      stopBtn.disabled = stopping;
     } else {
-      sendBtn.textContent = '发送';
-      sendBtn.classList.remove('stop');
-      sendBtn.disabled = false;
+      stopBtn.classList.remove('on');
+      stopBtn.disabled = false;
       stopping = false;
     }
   }
@@ -1038,83 +1234,249 @@
   function stopTurn() {
     if (!cur || stopping) return;
     stopping = true;
-    updateSendBtn();
+    updateStopBtn();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       // 连接已断开：本地直接结束回合状态（已生成内容保留在界面）
       cur = null;
-      updateSendBtn();
+      updateStopBtn();
       return;
     }
     try {
       ws.send(JSON.stringify({ ctl: true, type: 'cancel' }));
     } catch (err) {
       stopping = false;
-      updateSendBtn();
+      updateStopBtn();
       return;
     }
     // 防抖兜底：8s 内未收到 done（服务端异常/取消未生效）则恢复可点击以便重试
     stopRetryTimer = setTimeout(function () {
       stopRetryTimer = null;
       stopping = false;
-      updateSendBtn();
+      updateStopBtn();
     }, 8000);
   }
 
   var sending = false;   // 上传期间防重复发送
+  var sendingTimer = null;  // 上传超时兜底计时器
   function send() {
+    console.log('[send] enter', { text: input.value, atts: pendingAtts.map(function (it) { return it.upState; }) });
     if (recorder || recordingBusy) {
       addSys(recorder ? '正在录音，请先停止录音。' : '正在转写语音，请稍候。');
       return;
     }
-    if (sending) return;
+    if (sending) { addSys('上传未完成，稍等…'); return; }
     var text = input.value.trim();
-    var hasImgs = pendingImages.length > 0;
-    if ((!text && !hasImgs) || ws.readyState !== WebSocket.OPEN) return;
+    var hasAtts = pendingAtts.length > 0;
+    if (!text && !hasAtts) return;
+    if (ws.readyState !== WebSocket.OPEN) { addSys('连接已断开，请稍候重试…'); return; }
 
-    if (!hasImgs) {          // 纯文本：维持原路径（命令等均不受影响）
+    if (!hasAtts) {          // 纯文本：维持原路径（命令等均不受影响）
       stopTtsForTransition();
       addUser(text);
       cur = newTurn();
-      updateSendBtn();   // 回合开始：按钮变「⏹ 停止」
+      updateStopBtn();   // 回合开始：header 出现 ⏹ 停止
       ws.send(text);
       input.value = '';
       return;
     }
-    // 带图片：需要当前会话 key；连接建立/切换会话时后端会推 session_changed
-    if (!currentKey) { addSys('会话尚未就绪，请稍候再发送图片'); return; }
-    sending = true;
-    var imgs = pendingImages.slice();
-    var key = currentKey;
-    statusEl.textContent = '上传图片中…';
-    Promise.all(imgs.map(function (it) { return uploadOne(it.file, key); }))
-      .then(function (ids) {
-        stopTtsForTransition();
-        addUser(text, imgs.map(function (it) { return it.url; }));   // 本地预览 URL 直接回显
-        cur = newTurn();
-        updateSendBtn();   // 回合开始：按钮变「⏹ 停止」
-        ws.send(JSON.stringify({ text: text, images: ids }));
-        input.value = '';
-        pendingImages = [];
-        renderAttach();
-        statusEl.textContent = '已连接';
-      })
-      .catch(function (e) {
-        addSys('图片上传失败：' + (e && e.message || e) + '，本条消息未发送');
-        statusEl.textContent = '已连接';
-      })
-      .finally(function () { sending = false; });
+    // 带附件（图片/文件）：选图即自动上传（addPendingFile → tryAutoUploads），
+    // 这里只检查上传状态并发送引用，不再触发上传（乖宝 2026-08-12：不用点回车才开始传）。
+    var atts = pendingAtts.slice();
+    var hasError = atts.some(function (it) { return it.upState === 'error'; });
+    var hasUploading = atts.some(function (it) { return it.upState === 'uploading' || it.upState === 'pending'; });
+    if (hasError) { addSys('有附件上传失败，请删除后重新添加'); return; }
+    if (hasUploading) { addSys('图片/文件上传中，稍等…'); return; }
+    var images = [], files = [];
+    atts.forEach(function (it) {
+      if (!it.ref) return;
+      if (it.kind === 'image') images.push(it.ref.image_id);
+      else files.push({ file_id: it.ref.file_id, path: it.ref.path, name: it.ref.name, size: it.ref.size, mime: it.ref.mime });
+    });
+    if (images.length === 0 && files.length === 0) { addSys('附件未就绪，请重试'); return; }
+    stopTtsForTransition();
+    addUser(text,
+            atts.filter(function (it) { return it.kind === 'image'; }).map(function (it) { return it.url; }),
+            atts.filter(function (it) { return it.kind === 'file'; }).map(function (it) { return it.file; }));
+    cur = newTurn();
+    updateStopBtn();
+    ws.send(JSON.stringify({ text: text, images: images, files: files }));
+    input.value = '';
+    pendingAtts = [];
+    renderAttach();
+    statusEl.textContent = '已连接';
   }
-  sendBtn.onclick = function () {
-    if (cur) { stopTurn(); return; }   // 回合进行中：按钮是「停止」
-    send();
+  stopBtn.onclick = function () {   // TASK-041：停止键移到 header，仅回合进行中可见
+    if (cur) stopTurn();
   };
-  // 回车发送；但输入法（IME）组字过程中的回车（确认候选词）不算发送，
-  // 用 isComposing / keyCode===229 区分，避免中文上屏误发。
+  // 回车发送：非组词回车直接发；中文输入法组词中的回车只负责上屏候选词、不发送
+  // （第二次回车才发）——乖宝 2026-08-12 明确不要「按一次就发」。
+  // form submit 兜底仅服务手机键盘「发送」键：iOS 的 enterkeyhint=send 键点击触发
+  // 的是 form submit 而非 keydown（安卓某些输入法同理），桌面不受影响。
+  var barForm = document.getElementById('bar');
   input.addEventListener('keydown', function (e) {
-    if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) send();
+    if (e.key !== 'Enter') return;
+    // 只用标准 isComposing 判断组词；不能依赖 keyCode!==229——Android 输入法
+    // （尤其国产）派发的 keydown 的 keyCode 常恒为 229，会导致回车永远发不出去
+    // （乖宝 2026-08-12 Android 实测「按回车没反应」根因）。
+    if (e.isComposing) return;   // 组词中：交给输入法上屏，不发送
+    e.preventDefault();          // 阻止 form 默认 submit（避免与 send 重复触发）
+    send();
+  });
+  if (barForm && barForm.addEventListener) {
+    barForm.addEventListener('submit', function (e) {
+      e.preventDefault();
+      send();
+    });
+  }
+
+  // —— TASK-041 语音模式 + 按住说话手势 + 旧 ASR 录音（长按 🎙 触发）——
+  // 麦克风按钮（micBtn）三态：
+  //   1) 空闲·键盘模式：单击 → 切「按住说话」模式；长按(>400ms) → 旧 ASR 录音；
+  //   2) voice 模式：单击 → 切回打字；
+  //   3) 录音中：单击 → 停止录音并转写（旧能力，不动）。
+  // 验收标准「按住说话不真录音」：按住说话手势只做交互 + 轻提示占位，未来接录音
+  // 时直接复用该手势状态机（startPress/endPress）即可。
+  var micBtn = document.getElementById('micBtn');
+  var voiceBar = document.getElementById('voiceBar');
+  var inputMode = 'keyboard';        // 'keyboard' | 'voice'
+  var press = null;                  // 按住说话手势状态 {startY, zone, via, held, timer}
+  var SLIDE_CANCEL_PX = 60;          // 上滑超过该距离 → 取消区
+  var HOLD_MS = 200;                 // 按住多少毫秒进入「按住说话」手势（防误触快速点按）
+
+  var toastTimer = null;
+  function showToast(text) {
+    var t = document.getElementById('toast');
+    t.textContent = text;
+    t.classList.add('show');
+    if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
+    toastTimer = setTimeout(function () { t.classList.remove('show'); }, 2200);
+  }
+
+  function setInputMode(m) {
+    inputMode = m;
+    if (m === 'voice') {
+      input.blur();               // iOS：先收起键盘再隐藏输入框
+      input.style.display = 'none';
+      voiceBar.style.display = 'block';
+      micBtn.classList.add('voice-on');
+      micBtn.title = '切换到打字输入';
+    } else {
+      input.style.display = '';
+      voiceBar.style.display = 'none';
+      micBtn.classList.remove('voice-on');
+      micBtn.title = '切换到按住说话';
+    }
+  }
+
+  function resetVoiceBar() {
+    voiceBar.classList.remove('holding', 'cancel');
+    voiceBar.textContent = '按住说话';
+  }
+
+  function startPress(via, y) {
+    if (inputMode !== 'voice' || press) return;
+    press = { startY: y, zone: 'send', via: via, held: false, timer: null };
+    press.timer = setTimeout(function () {          // 按住 HOLD_MS 才算手势
+      if (!press) return;
+      press.held = true;
+      voiceBar.classList.add('holding');
+      voiceBar.textContent = '松开发送 · 上滑取消';
+    }, HOLD_MS);
+  }
+  function movePress(via, y) {
+    if (!press || press.via !== via) return;
+    var dy = press.startY - y;
+    var zone = dy > SLIDE_CANCEL_PX ? 'cancel' : 'send';
+    if (zone === press.zone) return;
+    press.zone = zone;
+    if (press.held) {
+      voiceBar.classList.toggle('cancel', zone === 'cancel');
+      voiceBar.textContent = zone === 'cancel' ? '松开取消' : '松开发送 · 上滑取消';
+    }
+  }
+  function endPress(via) {
+    if (!press || press.via !== via) return;
+    var ended = press;
+    press = null;
+    if (ended.timer) { clearTimeout(ended.timer); ended.timer = null; }
+    if (ended.held) {
+      resetVoiceBar();
+      if (ended.zone === 'send') showToast('语音功能待开放，先打字吧');   // 占位：不真录音
+      // 取消区：复位即可（保持 voice 模式）
+    } else {
+      // 快速点按「按住说话」条：切回打字模式（对应验收「点输入框→切回打字」）
+      setInputMode('keyboard');
+      input.focus();
+    }
+  }
+  function cancelPress(via) {
+    if (!press || press.via !== via) return;
+    press = null;
+    resetVoiceBar();
+  }
+
+  // —— 按住说话手势：触屏（touch）与桌面（mouse）双通道，防误触 ——
+  voiceBar.addEventListener('touchstart', function (e) {
+    if (e.touches && e.touches[0]) startPress('touch', e.touches[0].clientY);
+    if (e.cancelable) e.preventDefault();   // 阻止合成 mouse/click，防双通道重复触发
+  }, { passive: false });
+  voiceBar.addEventListener('touchmove', function (e) {
+    if (e.touches && e.touches[0]) movePress('touch', e.touches[0].clientY);
+    if (e.cancelable) e.preventDefault();   // 按住期间页面不随手指滚动
+  }, { passive: false });
+  voiceBar.addEventListener('touchend', function () { endPress('touch'); });
+  voiceBar.addEventListener('touchcancel', function () { cancelPress('touch'); });
+  voiceBar.addEventListener('mousedown', function (e) {
+    if (e.button !== 0) return;
+    startPress('mouse', e.clientY);
+    e.preventDefault();   // 阻止拖拽选中文字
+  });
+  document.addEventListener('mousemove', function (e) {
+    if (press && press.via === 'mouse') movePress('mouse', e.clientY);
+  });
+  document.addEventListener('mouseup', function (e) {
+    if (press && press.via === 'mouse') endPress('mouse');
   });
 
-  // —— 浏览器录音：仅把 ASR 成功的文本交给现有 WebSocket 文本入口 ——
+  // —— 麦克风按钮：单击切换模式 / 录音中单击停止 / 长按走旧 ASR 录音 ——
+  var micPressTimer = null;
+  var micLongPress = false;
+  function clearMicPress() {
+    if (micPressTimer) { clearTimeout(micPressTimer); micPressTimer = null; }
+  }
+  function armMicLongPress() {
+    micLongPress = false;
+    clearMicPress();
+    micPressTimer = setTimeout(function () {
+      micLongPress = true;
+      micPressTimer = null;
+      startRecording();          // 旧 ASR 录音能力：长按 🎙 触发
+    }, 400);
+  }
+  micBtn.addEventListener('touchstart', function (e) {
+    if (!(recorder && recorder.state !== 'inactive')) armMicLongPress();
+  }, { passive: true });
+  micBtn.addEventListener('touchend', clearMicPress);
+  micBtn.addEventListener('touchcancel', clearMicPress);
+  micBtn.addEventListener('mousedown', function (e) {
+    if (e.button !== 0) return;
+    if (!(recorder && recorder.state !== 'inactive')) armMicLongPress();
+  });
+  document.addEventListener('mouseup', clearMicPress);
+  micBtn.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+
+  micBtn.onclick = function () {
+    if (micLongPress) { micLongPress = false; return; }   // 长按已触发录音，单击不再切换
+    if (recorder && recorder.state !== 'inactive') {      // 录音中：单击停止（旧能力）
+      setRecordingState(false, true);
+      recorder.stop();
+      return;
+    }
+    setInputMode(inputMode === 'voice' ? 'keyboard' : 'voice');
+    if (inputMode === 'keyboard') input.focus();
+  };
+
+  // —— 浏览器录音（旧能力保留）：仅把 ASR 成功的文本交给现有 WebSocket 文本入口 ——
   var recorder = null;
   var recordingStream = null;
   var recordingChunks = [];
@@ -1130,10 +1492,10 @@
 
   function setRecordingState(active, busy) {
     recordingBusy = !!busy;
-    recordBtn.disabled = !!busy;
-    recordBtn.classList.toggle('recording', !!active);
-    recordBtn.textContent = active ? '■' : '🎙';
-    recordBtn.title = active ? '停止录音' : (busy ? '语音转写中…' : '开始录音');
+    micBtn.disabled = !!busy;
+    micBtn.classList.toggle('recording', !!active);
+    micBtn.textContent = active ? '■' : '🎙';
+    micBtn.title = active ? '停止录音' : (busy ? '语音转写中…' : '切换到按住说话 · 长按录音');
   }
 
   function canChangeSession() {
@@ -1218,7 +1580,7 @@
           stopTtsForTransition();
           addUser(text);
           cur = newTurn();
-          updateSendBtn();   // 回合开始：按钮变「⏹ 停止」
+          updateStopBtn();   // 回合开始：按钮变「⏹ 停止」
           ws.send(text);
         }).catch(function (err) {
           addSys('语音转写失败：' + ((err && err.message) || err));
@@ -1236,15 +1598,6 @@
       addSys('无法启用麦克风：' + ((err && err.message) || '请检查浏览器权限。'));
     });
   }
-
-  recordBtn.onclick = function () {
-    if (recorder && recorder.state !== 'inactive') {
-      setRecordingState(false, true);
-      recorder.stop();
-      return;
-    }
-    startRecording();
-  };
 
   cfgBtn.onclick = function () {
     cfgPanel.classList.toggle('show');
@@ -1402,7 +1755,7 @@
       chat.innerHTML = '';
       nearBottom = true;   // 历史回放从底部开始跟随
       cur = null;
-      updateSendBtn();
+      updateStopBtn();
       renderHistory((d && d.messages) || []);
       loadSessions();
     }).catch(function (e) { addSys('打开会话失败：' + e); });
@@ -1419,7 +1772,7 @@
     chat.innerHTML = '';
     nearBottom = true;   // 新会话从底部开始跟随
     cur = null;
-    updateSendBtn();
+    updateStopBtn();
     currentKey = null;
     renderCtxBar();
   }
@@ -1544,7 +1897,7 @@
   newBtn.onclick = newSession;
   loadSessions();   // 首屏拉取历史会话列表
 
-  addSys('欢迎使用 NanoClaw 网页端。左侧「会话」可查看并接上历史会话，也可删除；思考过程与工具调用默认折叠为单行，点标题即可展开，并显示思考时长。');
+  addSys('欢迎使用小奈～左侧「会话」可查看并接上历史会话，也可删除；思考过程与工具调用默认折叠为单行，点标题即可展开，并显示思考时长。');
 })();
 </script>
 </body>
