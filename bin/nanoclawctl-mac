@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# NanoClaw macOS launchd 控制器。
+# 用法对齐 Linux 版 bin/nanoclawctl：start/stop/restart/status/logs，
+# 并额外提供 install/uninstall（生成并加载 LaunchAgent）与 self-restart
+# （供 Agent 自己延迟重启，避免杀掉当前回复流程）。
+#
+# 所有路径从本脚本位置自动推导，仓库 clone 到任何位置都能用。
+# 注意：所有变量引用统一用 ${VAR} 花括号形式——bash 对「$VAR 后紧跟多字节
+# 字符（如中文全角括号）」会解析出错，花括号可彻底规避。
+#
+# 关键：launchd 默认 PATH 只有 /usr/bin:/bin:/usr/sbin:/sbin，找不到 node / uv
+# 等工具；微信 bridge 用裸 `node` 命令启动，会导致「渠道启动失败→实例自杀→
+# KeepAlive 无限重试」。因此 install 时把当前 shell 的完整 PATH 注入 plist 的
+# EnvironmentVariables，让 launchd 环境与终端一致。
+
+SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)/bin/nanoclawctl-mac"
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+LABEL="com.nanoclaw.agent"
+DOMAIN="gui/$(id -u)"
+PLIST_DST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
+RESIDENT_SH="${PROJECT_DIR}/scripts/run_resident.sh"
+LOG_FILE="${PROJECT_DIR}/nanoclaw.launchd.log"
+
+usage() {
+  cat <<'EOF'
+用法：bin/nanoclawctl-mac {install|uninstall|start|stop|restart|status|logs|self-restart}
+
+  install       生成并加载 launchd 服务（登录自启 + 崩溃自动拉起）
+  uninstall     卸载并移除服务
+  start         启动（未加载则先 install）
+  stop          停止并卸载
+  restart       重启服务（停止后立刻重新拉起）
+  status        查看运行状态
+  logs          持续查看运行日志（Ctrl-C 退出）
+  self-restart  供 Agent 自己调用：延迟 3 秒后台重启，不打断当前回复
+EOF
+}
+
+is_loaded() {
+  launchctl print "${DOMAIN}/${LABEL}" >/dev/null 2>&1
+}
+
+gen_plist() {
+  # 捕获当前 PATH（含 node/uv/homebrew 等），注入 plist，让 launchd 环境与终端一致。
+  # 微信 bridge 依赖裸 `node` 命令，缺 PATH 会导致整个实例启动失败。
+  local current_path="${PATH}"
+  cat > "${PLIST_DST}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>${RESIDENT_SH}</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>${PROJECT_DIR}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>${current_path}</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${LOG_FILE}</string>
+  <key>StandardErrorPath</key>
+  <string>${LOG_FILE}</string>
+</dict>
+</plist>
+EOF
+}
+
+do_install() {
+  mkdir -p "$(dirname "${PLIST_DST}")"
+  gen_plist
+  if is_loaded; then
+    echo "服务已加载，先卸载旧配置……"
+    launchctl bootout "${DOMAIN}/${LABEL}" 2>/dev/null || true
+  fi
+  launchctl bootstrap "${DOMAIN}" "${PLIST_DST}"
+  echo "已安装并启动服务（${LABEL}）"
+  echo "日志：${LOG_FILE}"
+}
+
+do_uninstall() {
+  if is_loaded; then
+    launchctl bootout "${DOMAIN}/${LABEL}" 2>/dev/null || true
+  fi
+  rm -f "${PLIST_DST}"
+  echo "已卸载服务（${LABEL}）"
+}
+
+do_start() {
+  if is_loaded; then
+    launchctl kickstart -k "${DOMAIN}/${LABEL}"
+    echo "已启动（kickstart）"
+  else
+    do_install
+  fi
+}
+
+do_stop() {
+  if is_loaded; then
+    launchctl bootout "${DOMAIN}/${LABEL}" 2>/dev/null || true
+    echo "已停止"
+  else
+    echo "服务未加载"
+  fi
+}
+
+do_restart() {
+  if is_loaded; then
+    launchctl kickstart -k "${DOMAIN}/${LABEL}"
+    echo "已重启"
+  else
+    do_install
+  fi
+}
+
+do_status() {
+  if is_loaded; then
+    echo "服务已加载：${LABEL}"
+    launchctl print "${DOMAIN}/${LABEL}" 2>/dev/null \
+      | sed -n 's/^[[:space:]]*\(state\|pid\|last exit code\)[[:space:]]*=[[:space:]]*/  \1 = /p'
+  else
+    echo "服务未加载：${LABEL}"
+    return 3
+  fi
+}
+
+do_logs() {
+  touch "${LOG_FILE}"
+  exec tail -n 100 -F "${LOG_FILE}"
+}
+
+do_self_restart() {
+  # 供 Agent 自己调用：延迟 3 秒后台重启，避免杀掉当前回复流程。
+  nohup bash -c "sleep 3; exec '${SCRIPT_PATH}' restart" >/dev/null 2>&1 &
+  echo "已安排 3 秒后重启（self-restart）"
+}
+
+case "${1:-}" in
+  install) do_install ;;
+  uninstall) do_uninstall ;;
+  start) do_start ;;
+  stop) do_stop ;;
+  restart) do_restart ;;
+  status) do_status ;;
+  logs) do_logs ;;
+  self-restart) do_self_restart ;;
+  *) usage; exit 2 ;;
+esac

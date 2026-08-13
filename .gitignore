@@ -53,3 +53,5 @@ Camera_*.jpg
 # 个人知识库测试资产（独立项目 kb 的评测资产，不纳入本仓库）
 kb-testset/
 !scripts/synthesize_wake_replies.py
+# 可移植的 macOS 常驻/控制脚本（路径自动推导，配合 bin/nanoclawctl-mac 使用）
+!scripts/run_resident.sh
