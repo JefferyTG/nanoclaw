@@ -2,9 +2,9 @@
 
 ## 任务卡
 
-- 状态：待开始
+- 状态：**遗留挂起**（08-13 codebuddy 首战实现+962 测试通过，但真机验收暴露方案 C 前置缺失；乖宝决定回退，后续再改）
 - 负责人：乖宝（验收）/ code-master（实现）
-- 执行会话/子 Agent：code-master
+- 执行会话/子 Agent：code-master（默认）/ **codebuddy（08-13 实际执行）**
 - 基线 commit / 分支：待定（依赖 TASK-039 先验收归档；当前工作区含 039 未提交改动）
 - 依赖任务：TASK-039（webui 移动端适配，同一文件 `webui/index.html`，需 039 先落地/归档避免文件所有权冲突）
 
@@ -92,9 +92,24 @@ python -m compileall -q channels         # 后端语法
 - TASK-0??：webui 实时语音 / HTTPS / PWA（见 TASK-039 后续任务，优先级更高）
 - 多端「实时双人编辑」级别的冲突解决（本任务只保证不打断输入，不做协同编辑）
 
+## 执行日志（codebuddy 驱动，08-13，乖宝要求全程记录供复盘）
+
+- 14:0x 乖宝决定用 codebuddy 执行本任务（首次实战），要求全程记录、结束后复盘
+- 调用约定：`CODEBUDDY_MODEL=hy3 codebuddy -p ... --permission-mode=acceptEdits`；hy3 超量则切 deepseek-v4-flash
+- 14:10 派活：`CODEBUDDY_MODEL=hy3 codebuddy --bg --name task040 -p "<任务说明书>" --permission-mode=acceptEdits --max-turns 40`（任务说明书存 workspace/tmp/task040_prompt.txt，含范围/约束/验收）
+- 14:16 任务结束。**关键发现**：`--bg` 会自动创建 git worktree（`项目内/.codebuddy/worktrees/bg-74bab5bb`，分支 `worktree-bg-74bab5bb`），改动落在 worktree 而非主工作区；stdout 日志 0 字节，完整会话记录在 `~/.codebuddy/projects/Users-xx-WorkBuddy-nanoclaw/74bab5bb-*.jsonl`（440KB）
+- 14:17 改动合回主工作区：worktree 里 `git diff > /tmp/task040.patch` → 主工作区 `git apply`（未 commit）
+- **改动内容**：channels/web.py +56（新增 `_notify_peers()` 反查 `_sessions` 找同会话其它连接推 `{"type":"sync","key":...}`；send() 非流式回包后触发；stream_event 的 done 处触发，逐 token 不推）+ webui/index.html +51（ws.onmessage 处理 sync → `handleSync()`：永远 `loadSessions()` 刷侧边栏；`isUserTyping()` 检测输入中；`reloadCurrentSession()` 多保护点：录音中/渲染中/输入中/会话切换中均跳过，异步返回前二次校验）
+- **验收结果**：`python -m compileall -q channels` OK；全量 `unittest discover -s tests -t .` = **962 tests OK**（50.3s）
+- **真机验收（14:35~14:41，乖宝）**：❌ **未通过**——手机+电脑双端，发消息后另一端不自动刷新，需手动刷新
+- **根因（14:38~14:41 排查实锤）**：方案 C 的广播依赖「两端同会话 key」，但 webui 每连接默认**新建独立会话**（`current_key = f"{conn_id}:0"`，各带自己的 conn_id 前缀）→ 手机/电脑 key 天生不同 → `_notify_peers` 遍历 `_sessions` 找不到同 key 其它连接 → **sync 事件从未发出**（前端 onEvent 的 sync 分支、后端 done 触发、网关 done 事件均验证存在，链路本身没断）
+- **回退（14:41 乖宝拍板）**：代码 `git restore channels/web.py webui/index.html` 已还原；worktree `bg-74bab5bb` 已移除（分支 worktree-bg-74bab5bb 引用保留）；补丁留档 `workspace/tmp/task040-patch-backup.diff`（含完整实现，可复用）
+- **后续方案（未开工）**：加前置——新连接 hello 初始化 current_key 时，若存在最近活跃的 `web:` 会话则默认接管（而非新建独立会话），两端默认同 key，sync 自然生效；前端基本不用动
+- **复盘要点**：①codebuddy 首战实现了方案 C 本身（代码质量 OK、测试通过），但**需求层缺前置假设**——「多端同步」默认意味着「打开即同一会话」，而现有会话模型是每连接独立的，这是需求设计问题不是实现问题；②无头模式派活前应把这类「隐含前置」也写清/想清；③worktree 机制：乖宝 14:23 拍板**默认主工作区改，worktree 必须主动说明**（已入 skill+记忆）
+
 ## 执行交接
 
-- 状态：待开始（2026-08-12 11:1x 建卡）
+- 状态：**遗留挂起**（08-13 codebuddy 首战实现+962 测试通过，但真机验收暴露方案 C 前置缺失；乖宝决定回退，后续再改）（2026-08-12 11:1x 建卡）
 - 实际改动文件：（待填）
 - 实现摘要：（待填）
 - 关键决策与假设：（待填）

@@ -55,3 +55,7 @@ kb-testset/
 !scripts/synthesize_wake_replies.py
 # 可移植的 macOS 常驻/控制脚本（路径自动推导，配合 bin/nanoclawctl-mac 使用）
 !scripts/run_resident.sh
+
+# CodeBuddy CLI 项目内生成物（隔离，不提交）
+.codebuddy/
+CODEBUDDY.md
