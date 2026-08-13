@@ -30,6 +30,7 @@ from bus.queue import FileRef, InboundMessage, OutboundMessage
 from channels.base import Channel
 from voice.asr.base import ASRError
 from voice.tts.base import TTSError
+from voice.realtime_s2s.client import DEFAULT_MODEL_VERSION, DEFAULT_VOICE, RealtimeS2SClient
 
 logger = logging.getLogger("nanoclaw.web")
 
@@ -64,6 +65,12 @@ def _human_file_size(num_bytes: int) -> str:
 # 仅在注入的兼容服务没有声明 max_audio_bytes 时作为安全回退。
 _DEFAULT_ASR_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
+# 实时通话人设源：与 channels/realtime.py 同一仓库根私有文件（不进 Git）。
+REALTIME_IDENTITY_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "realtime_identity.md",
+)
+
 # 网页可编辑的配置字段白名单（GET 返回、POST 接受均限定在此范围内）
 _CONFIG_FIELDS = (
     "api_key", "base_url", "model", "subagent_model", "workspace", "timezone",
@@ -74,12 +81,104 @@ _CONFIG_FIELDS = (
 )
 
 
+class RealtimeBridge:
+    """浏览器 WS ⇄ RealtimeS2SClient 双向中继桥（web 事件循环内运行，一次一路）。
+
+    职责：建会话（人设/音色/模型由调用方注入）→ 上行音频帧转发豆包 → 下行豆包
+    事件推给浏览器 → 断开时优雅 ``close_session``。纯 asyncio，与 client 同循环直用。
+    """
+
+    def __init__(self, client, *, instructions="", voice_type=None, model=None,
+                 enable_websearch=False) -> None:
+        self.client = client
+        self.instructions = instructions
+        self.voice_type = voice_type
+        self.model = model
+        self.enable_websearch = enable_websearch
+
+    async def run(self, ws) -> None:
+        """建会话 → 双向转发 → 优雅关闭（建会话失败也保证 close_session）。"""
+        try:
+            await self.client.connect()
+            await self.client.create_session(
+                instructions=self.instructions,
+                voice_type=self.voice_type,
+                model=self.model,
+                enable_websearch=self.enable_websearch,
+            )
+            # session.create 完成后明确告知浏览器可以开始采集麦克风。
+            await ws.send_str(
+                json.dumps({"event": {"type": "realtime.ready"}}, ensure_ascii=False)
+            )
+            await self._relay(ws)
+        finally:
+            await self.close()
+
+    async def _relay(self, ws) -> None:
+        """并发跑上行/下行两个循环；任一结束即取消另一个。"""
+
+        async def uplink():
+            async for msg in ws:
+                if msg.type == web.WSMsgType.TEXT:
+                    try:
+                        obj = json.loads(msg.data)
+                    except (ValueError, TypeError):
+                        continue
+                    if obj.get("type") == "input_audio_buffer.append":
+                        await self.client.send_event({
+                            "type": "input_audio_buffer.append",
+                            "audio": obj.get("audio") or "",
+                        })
+                    elif obj.get("type") == "hangup":
+                        return
+                elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
+                    return
+
+        async def downlink():
+            async for event in self.client.iter_events():
+                if event is None:
+                    continue  # 心跳（静默检查用），不推给浏览器
+                try:
+                    await ws.send_str(
+                        json.dumps({"event": event}, ensure_ascii=False)
+                    )
+                except Exception:  # noqa: BLE001 - 浏览器断开即结束
+                    return
+                if event.get("type") in ("error", "session.closed"):
+                    return
+
+        tasks = [asyncio.create_task(uplink()), asyncio.create_task(downlink())]
+        try:
+            done, pending = await asyncio.wait(
+                tasks, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            for task in done:
+                exc = task.exception()
+                if exc is not None:
+                    raise exc
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def close(self) -> None:
+        """优雅关闭会话（幂等：未连接时 client.close_session 内部直接返回）。"""
+        try:
+            await self.client.close_session()
+        except Exception as exc:  # noqa: BLE001 - 关闭失败不阻断主流程
+            logger.warning("realtime 中继桥关闭异常：%s", exc)
+
+
 class WebChannel(Channel):
     """网页渠道（name 固定为 ``"web"``），在后台线程跑 aiohttp 服务。"""
 
     def __init__(self, name: str, bus, host: str, port: int, config, config_path: str,
                  session_manager=None, image_store=None, asr_service=None,
-                 tts_service=None) -> None:
+                 tts_service=None, realtime_client_factory=None) -> None:
         super().__init__(name=name, bus=bus)
         self.host = host
         self.port = port
@@ -120,6 +219,10 @@ class WebChannel(Channel):
         # 文字转语音服务同样属于主 asyncio loop。None 表示 TTS 未启用；
         # 这不会影响既有文本 WebSocket 聊天。
         self.tts_service = tts_service
+        # 实时通话（TASK-044）：client 工厂为测试注入点；_active_realtime 记录当前
+        # 唯一一路通话的中继桥（一次只允许一路，第二路在 _serve_realtime 拒绝）。
+        self._realtime_client_factory = realtime_client_factory
+        self._active_realtime = None
         self._loop = None                 # 网关主事件循环（跨线程投递用）
         self._web_loop = None             # aiohttp 所在事件循环（后台线程）
         self._thread = None               # 后台守护线程
@@ -174,6 +277,7 @@ class WebChannel(Channel):
             app = web.Application(client_max_size=50 * 1024 * 1024)
             app.router.add_get("/", self._handle_index)
             app.router.add_get("/ws", self._handle_ws)
+            app.router.add_get("/api/realtime", self._handle_realtime)
             app.router.add_post("/upload", self._handle_upload)
             app.router.add_post("/api/asr", self._handle_asr)
             app.router.add_post("/api/tts", self._handle_tts)
@@ -684,6 +788,92 @@ class WebChannel(Channel):
                 self._conns.pop(conn_id, None)
                 self._sessions.pop(conn_id, None)
         return ws
+
+    # —— TASK-044 实时通话（浏览器 ⇄ /api/realtime ⇄ 豆包 S2S 全双工）——
+    async def _handle_realtime(self, request) -> web.WebSocketResponse:
+        """aiohttp 适配层：prepare 后把真实逻辑交给可单测的 ``_serve_realtime``。"""
+        ws = web.WebSocketResponse(heartbeat=30)
+        await ws.prepare(request)
+        return await self._serve_realtime(ws)
+
+    async def _serve_realtime(self, ws) -> web.WebSocketResponse:
+        """实时通话核心：互斥校验 → api_key 校验 → 读人设 → 建桥转发 → 优雅关闭。"""
+        if self._active_realtime is not None:
+            await self._ws_send_json(ws, {
+                "type": "realtime.error",
+                "code": "busy",
+                "message": "已有进行中的实时通话，请先挂断当前通话再试。",
+            })
+            await self._realtime_close(ws)
+            return ws
+
+        rt = self._realtime_config()
+        api_key = (rt.get("api_key") or "").strip()
+        if not api_key:
+            await self._ws_send_json(ws, {
+                "type": "realtime.error",
+                "code": "no_api_key",
+                "message": "未配置实时通话 api_key，无法发起实时通话。",
+            })
+            await self._realtime_close(ws)
+            return ws
+
+        try:
+            instructions = self._load_realtime_identity()
+        except Exception as exc:  # noqa: BLE001 - 人设缺失/为空也要友好拒绝
+            await self._ws_send_json(ws, {
+                "type": "realtime.error",
+                "code": "identity",
+                "message": str(exc),
+            })
+            await self._realtime_close(ws)
+            return ws
+
+        client = (
+            self._realtime_client_factory()
+            if self._realtime_client_factory is not None
+            else RealtimeS2SClient(api_key=api_key)
+        )
+        bridge = RealtimeBridge(
+            client,
+            instructions=instructions,
+            voice_type=rt.get("voice") or DEFAULT_VOICE,
+            model=rt.get("model") or DEFAULT_MODEL_VERSION,
+            enable_websearch=bool(rt.get("enable_websearch")),
+        )
+        self._active_realtime = bridge
+        try:
+            await bridge.run(ws)
+        finally:
+            self._active_realtime = None
+            await self._realtime_close(ws)
+        return ws
+
+    def _realtime_config(self) -> dict:
+        """读取 config.realtime 白名单字典；config 缺失/类型不符时返回空 dict。"""
+        if self.config is None:
+            return {}
+        rt = getattr(self.config, "realtime", None)
+        return rt if isinstance(rt, dict) else {}
+
+    def _load_realtime_identity(self) -> str:
+        """读取实时通话人设源（与 realtime 渠道同文件）；缺失/为空报错。"""
+        try:
+            with open(REALTIME_IDENTITY_FILE, "r", encoding="utf-8") as f:
+                instructions = f.read().strip()
+        except OSError as exc:
+            raise RuntimeError(f"实时通话人设读取失败：{REALTIME_IDENTITY_FILE}") from exc
+        if not instructions:
+            raise RuntimeError(f"实时通话人设为空：{REALTIME_IDENTITY_FILE}")
+        return instructions
+
+    @staticmethod
+    async def _realtime_close(ws) -> None:
+        """尽力关闭浏览器 WS（幂等）。"""
+        try:
+            await ws.close()
+        except Exception:  # noqa: BLE001
+            pass
 
     # —— 多会话命令（与 CLI/飞书对称）——
     def _session_state(self, conn_id: str) -> dict:

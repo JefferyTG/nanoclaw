@@ -108,6 +108,23 @@
            max-width:80vw; text-align:center; pointer-events:none; opacity:0; transition:opacity .25s ease;
            z-index:200; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   #toast.show { opacity:1; }
+
+  /* —— TASK-044 实时通话：header 打电话按钮 + 通话悬浮面板 —— */
+  #callBtn.ringing { color:var(--ok); border-color:var(--ok); }
+  #callPanel { position:fixed; left:50%; bottom:150px; transform:translateX(-50%);
+               background:var(--panel); border:1px solid var(--line); border-radius:16px;
+               padding:14px 18px; width:min(92vw,340px); z-index:150; text-align:center;
+               box-shadow:0 8px 30px rgba(0,0,0,.5); }
+  #callPanel[hidden] { display:none; }
+  .call-title { font-size:14px; color:var(--muted); margin-bottom:6px; }
+  .call-status { font-size:18px; font-weight:600; margin-bottom:4px; }
+  .call-status.ringing { color:var(--ok); }
+  .call-status.error { color:#e86b78; }
+  .call-trans { font-size:12px; color:var(--muted); min-height:18px; margin:6px 0;
+                white-space:pre-wrap; word-break:break-word; }
+  #callHangup { min-height:44px; min-width:120px; background:#b13d4b; color:#fff; border:none;
+                border-radius:22px; font-size:15px; cursor:pointer; padding:0 20px; }
+  #callHangup:disabled { opacity:.6; cursor:default; }
   /* 用户消息里的文件 chip（发送后即时回显；历史回放以文本 📎 形式在 content 中展示） */
   .file-strip { display:flex; flex-direction:column; gap:6px; margin-top:6px; align-items:flex-end; }
   .file-chip { display:inline-flex; align-items:center; gap:6px; background:rgba(255,255,255,.16); border-radius:8px;
@@ -274,6 +291,7 @@
   <h1>小奈</h1>
   <button id="sbToggle" aria-label="打开会话列表" title="会话列表">☰</button>
   <span class="status" id="status">连接中…</span>
+  <button id="callBtn" title="打电话" aria-label="打电话">📞</button>
   <button id="ttsBtn" title="开启自动朗读" aria-label="开启自动朗读" aria-pressed="false">🔇</button>
   <button id="stopBtn" title="停止当前回复">⏹</button>
   <button id="cfgBtn">配置</button>
@@ -337,6 +355,12 @@
   <div id="sbMask"></div>
 </div><!-- /#app -->
 <div id="toast"></div>
+<div id="callPanel" hidden>
+  <div class="call-title">📞 实时通话</div>
+  <div class="call-status" id="callStatus">未接通</div>
+  <div class="call-trans" id="callTrans"></div>
+  <button id="callHangup" type="button">挂断</button>
+</div>
 
 <script>
 (function () {
@@ -2015,6 +2039,287 @@
     });
     scrollChatToBottom();
   }
+
+  // —— TASK-044 实时通话：浏览器 ⇄ /api/realtime ⇄ 豆包 S2S 全双工 ——
+  // 下行 pcm_s16le 24k 直通（Web Audio AudioBuffer 播 PCM），不搬 demo 的 opus 解码。
+  var callBtn = document.getElementById('callBtn');
+  var callPanel = document.getElementById('callPanel');
+  var callStatus = document.getElementById('callStatus');
+  var callTrans = document.getElementById('callTrans');
+  var callHangup = document.getElementById('callHangup');
+
+  var CALL_INPUT_RATE = 16000;
+  var CALL_FRAME_MS = 20;
+  var CALL_FRAME_BYTES = CALL_INPUT_RATE * 2 * CALL_FRAME_MS / 1000; // 640B
+  var CALL_REC_BUFFER = 1024;
+
+  var callWs = null;          // /api/realtime WebSocket
+  var callActive = false;     // 通话中（连接建立且未挂断）
+  var callStream = null, callCtx = null, callSrc = null, callNode = null;
+  var callMicOn = false;
+  var callChunks = [], callBufferedBytes = 0;
+  var callFrameTimer = null;
+  var callPlayer = null;      // PCM 播放器（下行）
+
+  function callBytesToBase64(bytes) {
+    var binary = '';
+    var step = 0x8000;
+    for (var i = 0; i < bytes.length; i += step) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + step));
+    }
+    return btoa(binary);
+  }
+  function callBase64ToBytes(b64) {
+    var raw = atob(b64);
+    var out = new Uint8Array(raw.length);
+    for (var i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+    return out;
+  }
+  function callDownsampleToPcm16(input, inputRate) {
+    var ratio = inputRate / CALL_INPUT_RATE;
+    var length = Math.floor(input.length / ratio);
+    var out = new Int16Array(length);
+    for (var i = 0; i < length; i++) {
+      var start = Math.floor(i * ratio);
+      var end = Math.min(Math.floor((i + 1) * ratio), input.length);
+      var sum = 0;
+      for (var j = start; j < end; j++) sum += input[j];
+      var sample = Math.max(-1, Math.min(1, sum / Math.max(1, end - start)));
+      out[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+    }
+    return new Uint8Array(out.buffer);
+  }
+  function callAppend(bytes) {
+    if (!bytes || !bytes.length) return;
+    callChunks.push(bytes.slice());
+    callBufferedBytes += bytes.length;
+  }
+  function callRead(target, byteCount) {
+    var offset = 0;
+    while (offset < byteCount && callChunks.length) {
+      var chunk = callChunks[0];
+      var take = Math.min(byteCount - offset, chunk.length);
+      target.set(chunk.subarray(0, take), offset);
+      offset += take;
+      callBufferedBytes -= take;
+      if (take === chunk.length) callChunks.shift();
+      else callChunks[0] = chunk.subarray(take);
+    }
+    return offset;
+  }
+  function callTakeFrame() {
+    if (callBufferedBytes < CALL_FRAME_BYTES) return null;
+    var frame = new Uint8Array(CALL_FRAME_BYTES);
+    callRead(frame, CALL_FRAME_BYTES);
+    return frame;
+  }
+  function callSendNextFrame() {
+    if (!callWs || callWs.readyState !== WebSocket.OPEN) return;
+    var frame = callTakeFrame();
+    if (!frame) frame = new Uint8Array(CALL_FRAME_BYTES); // 静音帧补齐 20ms
+    callWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: callBytesToBase64(frame) }));
+  }
+  function callStartPump() {
+    if (callFrameTimer) return;
+    callSendNextFrame();
+    callFrameTimer = setInterval(callSendNextFrame, CALL_FRAME_MS);
+  }
+  function callStopPump() {
+    if (callFrameTimer) { clearInterval(callFrameTimer); callFrameTimer = null; }
+    callChunks = [];
+    callBufferedBytes = 0;
+  }
+
+  // 下行 PCM 播放器：delta 即收即播，用 nextPlayTime 顺序衔接，不依赖 opus 解码。
+  function CallPcmPlayer() {
+    this.sampleRate = 24000;
+    this.ctx = null;
+    this.nextPlayTime = 0;
+  }
+  CallPcmPlayer.prototype.start = function () {
+    if (!this.ctx || this.ctx.state === 'closed') {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      this.ctx = new AC({ sampleRate: this.sampleRate });
+    }
+    if (this.ctx.state === 'suspended') return this.ctx.resume();
+    return Promise.resolve();
+  };
+  CallPcmPlayer.prototype.enqueue = function (bytes) {
+    if (!bytes || bytes.length < 2) return Promise.resolve();
+    var self = this;
+    return this.start().then(function () {
+      var samples = Math.floor(bytes.length / 2);
+      var buffer = self.ctx.createBuffer(1, samples, self.sampleRate);
+      var channel = buffer.getChannelData(0);
+      var view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      for (var i = 0; i < samples; i++) channel[i] = view.getInt16(i * 2, true) / 32768;
+      var src = self.ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(self.ctx.destination);
+      var startAt = Math.max(self.nextPlayTime, self.ctx.currentTime + 0.01);
+      src.start(startAt);
+      self.nextPlayTime = startAt + buffer.duration;
+    });
+  };
+  CallPcmPlayer.prototype.stop = function () {
+    var ctx = this.ctx;
+    this.ctx = null;
+    this.nextPlayTime = 0;
+    if (!ctx) return Promise.resolve();
+    try {
+      var p = ctx.close();
+      if (p && p.catch) return p.catch(function () {});
+    } catch (e) {}
+    return Promise.resolve();
+  };
+
+  function callStartMic() {
+    return navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    }).then(function (stream) {
+      callStream = stream;
+      var AC = window.AudioContext || window.webkitAudioContext;
+      callCtx = new AC();
+      callSrc = callCtx.createMediaStreamSource(stream);
+      callNode = callCtx.createScriptProcessor(CALL_REC_BUFFER, 1, 1);
+      callNode.onaudioprocess = function (ev) {
+        if (!callMicOn) return;
+        var input = ev.inputBuffer.getChannelData(0);
+        callAppend(callDownsampleToPcm16(input, callCtx.sampleRate));
+      };
+      callSrc.connect(callNode);
+      callNode.connect(callCtx.destination);
+      callMicOn = true;
+      callStartPump();
+    });
+  }
+  function callStopMic() {
+    callMicOn = false;
+    callStopPump();
+    if (callNode) { try { callNode.disconnect(); } catch (e) {} callNode = null; }
+    if (callSrc) { try { callSrc.disconnect(); } catch (e) {} callSrc = null; }
+    if (callStream) { callStream.getTracks().forEach(function (t) { t.stop(); }); callStream = null; }
+    if (callCtx) { try { callCtx.close(); } catch (e) {} callCtx = null; }
+  }
+  function callMicErrorMessage(err) {
+    var name = err && (err.name || (err.code && String(err.code)));
+    if (name === 'NotAllowedError' || name === 'PermissionDeniedError' || name === 'SecurityError') {
+      return '麦克风权限被拒绝：请点击浏览器地址栏的麦克风图标或到系统设置中允许本网站使用麦克风（需通过 HTTPS 或 localhost 访问才会弹出授权）。';
+    }
+    if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+      return '未检测到可用麦克风设备，请检查设备连接后重试。';
+    }
+    if (name === 'NotReadableError' || name === 'TrackStartError') {
+      return '麦克风正被其它应用占用，请关闭占用后重试。';
+    }
+    return '无法启用麦克风：' + ((err && err.message) || '请检查浏览器权限。');
+  }
+
+  function callSetStatus(text, state) {
+    callStatus.textContent = text;
+    callStatus.className = 'call-status' + (state ? ' ' + state : '');
+  }
+  function callShowPanel(show) {
+    callPanel.hidden = !show;
+    callBtn.disabled = !!show;   // 通话中禁用 📞（防重复点击）
+  }
+  function callCleanup() {
+    callStopMic();
+    if (callPlayer) { callPlayer.stop(); callPlayer = null; }
+    if (callWs) {
+      var ws = callWs;
+      callWs = null;
+      ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
+      try { ws.close(); } catch (e) {}
+    }
+    callActive = false;
+    callShowPanel(false);
+    callSetStatus('未接通', '');
+    callTrans.textContent = '';
+  }
+  function endCall() {
+    if (callWs && callWs.readyState === WebSocket.OPEN) {
+      try { callWs.send(JSON.stringify({ type: 'hangup' })); } catch (e) {}
+    }
+    callCleanup();
+  }
+  function callConnect() {
+    if (callActive || callBtn.disabled) return;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      addSys('当前浏览器不支持录音，请使用安全上下文（HTTPS 或 localhost）并换用现代浏览器。');
+      return;
+    }
+    if (!window.isSecureContext && location.hostname !== 'localhost') {
+      addSys('打电话需要麦克风：请使用 HTTPS 或 localhost 访问此页面（录音需要安全上下文）。');
+      showToast('打电话需要安全上下文（HTTPS 或 localhost）');
+      return;
+    }
+    callActive = true;
+    callShowPanel(true);
+    callSetStatus('接通中…', '');
+    callTrans.textContent = '';
+    var url = proto + '://' + location.host + '/api/realtime';
+    var ws = new WebSocket(url);
+    callWs = ws;
+    ws.onopen = function () {
+      if (callWs !== ws) return;
+      callSetStatus('已连接，等待会话…', '');
+    };
+    ws.onmessage = function (e) {
+      var obj;
+      try { obj = JSON.parse(e.data); } catch (err) { return; }
+      var ev = obj && obj.event;
+      if (!ev) return;
+      var t = ev.type;
+      if (t === 'realtime.ready') {
+        if (callWs !== ws) return;
+        callSetStatus('通话中', 'ringing');
+        callPlayer = new CallPcmPlayer();
+        callStartMic().catch(function (err) {
+          callSetStatus('麦克风不可用', 'error');
+          addSys(callMicErrorMessage(err));
+          endCall();
+        });
+      } else if (t === 'realtime.error') {
+        if (callWs !== ws) return;
+        callSetStatus('无法接通', 'error');
+        addSys('实时通话失败：' + (ev.message || ev.code || '未知错误'));
+        showToast(ev.message || '实时通话失败');
+        endCall();
+      } else if (t === 'conversation.item.input_audio_transcription.started') {
+        // 服务端判定用户开口（插话）→ 丢掉已排队旧音频，交服务端动态判停
+        if (callPlayer) { callPlayer.stop(); callPlayer = null; }
+      } else if (t === 'conversation.item.input_audio_transcription.completed') {
+        var text = (ev.transcript || '').trim();
+        if (text) callTrans.textContent = '你说：' + text;
+      } else if (t === 'response.output_audio.started') {
+        if (callPlayer) { callPlayer.stop(); callPlayer = null; }
+        callPlayer = new CallPcmPlayer();
+      } else if (t === 'response.output_audio.delta') {
+        if (!callPlayer) callPlayer = new CallPcmPlayer();
+        callPlayer.enqueue(callBase64ToBytes(ev.delta || '')).catch(function () {});
+      } else if (t === 'response.done' || t === 'response.canceled') {
+        callSetStatus('通话中', 'ringing');
+      } else if (t === 'error') {
+        if (callWs !== ws) return;
+        callSetStatus('通话中断', 'error');
+        addSys('实时通话服务端错误：' + ((ev.error && ev.error.message) || ev.message || '未知错误'));
+        endCall();
+      }
+    };
+    ws.onerror = function () {
+      if (callWs !== ws) return;
+      callSetStatus('连接错误', 'error');
+    };
+    ws.onclose = function () {
+      if (callWs !== ws) return;
+      callWs = null;
+      callCleanup();
+      addSys('实时通话已结束。');
+    };
+  }
+  callBtn.onclick = function () { callConnect(); };
+  callHangup.onclick = function () { endCall(); };
 
   newBtn.onclick = newSession;
   loadSessions();   // 首屏拉取历史会话列表

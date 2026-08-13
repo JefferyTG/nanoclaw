@@ -19,7 +19,7 @@ NanoClaw 是一个本地优先、单进程、多渠道的个人 AI Agent 网关�
 | 网络工具 | `httpx`、`ddgs`、`html2text`、Tavily Search/Extract（REST） | 网页抓取、多通道搜索（Tavily+ddgs 降级）、抓取降级链（httpx→Jina→Chrome→Tavily）、生图服务请求 |
 | 语音输入 | MediaRecorder、FFmpeg/ffprobe、`httpx` | Web 录音、格式规范化、云端 ASR |
 | 语音输出 | `edge-tts`（默认）、`dashscope`（甘雨音色 `QwenTtsRealtime` 流式，可选）、HTMLAudioElement | Web 新回复分段合成、顺序播放与取消；DashScope 输出 WAV |
-| 实时通话 | `websockets`、sounddevice | 豆包 Seeduplex 全双工 S2S（`realtime` 渠道，**不走消息总线**；人设只读 `realtime_identity.md`；打断交由服务端动态判停，TASK-037） |
+| 实时通话 | `websockets`、sounddevice | 豆包 Seeduplex 全双工 S2S（`realtime` 渠道，**不走消息总线**；人设只读 `realtime_identity.md`；打断交由服务端动态判停，TASK-037）；webui 浏览器实时通话（TASK-044）：web 渠道 `/api/realtime` WS 中继桥（RealtimeBridge）复用同一 S2S 客户端，下行 PCM 直通、一次一路、挂断优雅关闭 |
 | 技能 | Markdown + YAML frontmatter | 技能发现、摘要注入与按需加载 |
 | 数据 | JSONL、Markdown、图片文件、SQLite | 会话、长期/每日记忆、图片、LIKE 检索索引 |
 
@@ -161,6 +161,14 @@ start/stop 生命周期由 main.py 统一管理。数据流为「KWS 待命 → 
 `realtime_identity.md` 重读完整人设与个人生活记忆并作为 `instructions` 发送；
 该文件被 Git 忽略，工作记忆不进入实时通话。配置层不再提供另一份 instructions
 覆盖项，避免代码默认值、配置和文件之间发生漂移。
+
+webui 浏览器实时通话（TASK-044）：web 渠道在 HTTP/WS 服务上新增 `/api/realtime`
+WebSocket 路由，`RealtimeBridge` 在 web 事件循环内复用同一个 `RealtimeS2SClient`
+（connect → create_session → 双向转发 → close_session）。与本地声卡 realtime 渠道
+的差异：音频采集/播放全在浏览器端（getUserMedia 采集 16k PCM→20ms 切帧上行；
+下行 `pcm_s16le` 24k base64 直通 AudioBuffer 播放，不搬 demo 的 opus 解码）；无
+KWS（点按钮即打）；一次只允许一路（`_active_realtime` 互斥，第二路拒绝并提示）。
+人设/音色/API key 仍复用 `realtime_identity.md` + `config.realtime`，key 不落文档。
 
 TTS 同样在启动期按 `tts_model` 配置装配并只注入 WebChannel，但不进入 MessageBus。`provider=edge_tts` 合成 MP3；`provider=dashscope_realtime` 走 DashScope `QwenTtsRealtime`（WebSocket 流式，provider 内部收集 PCM 后封装 WAV，commit 模式以服务端 `response.done` 判定完成，不阻塞事件循环），支持录音复刻换音色（`voice/tts/dashscope_realtime.create_voice_by_clone`，TASK-017）。网页仅在用户主动开启朗读后，从实时 Agent `token/done` 事件按标点和长度切分新回复，经独立 HTTP 端点合成短音频；当前片段播放时预合成下一片段。关闭朗读、发送新消息、切换会话或断线会取消请求并清空播放状态，历史回放不会触发 TTS。
 
