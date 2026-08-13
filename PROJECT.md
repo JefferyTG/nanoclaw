@@ -61,7 +61,8 @@
 | `agent/loop.py` | AgentLoop：ReAct 循环、流式事件、持久化、取消补历史 | agent/loop.py |
 | `agent/tools/` | Tool 抽象、Registry、内置工具、MCP 包装 | registry.py、mcp.py、各工具 |
 | `agent/daily.py` | 每日记忆：/clear 摘要 append + 每日做梦整理（固定分类/去重/合并更新） | agent/daily.py |
-| `providers/` | LLMProvider 抽象 + OpenAI 兼容实现 | base.py、openai_compat.py |
+| `agent/`（其余核心） | 上下文构建、身份引导、记忆压缩/检索、图片/文件/视频存储、历史规范化、记忆同步、场景策略、缓存观测、技能/Profile/资产加载 | context.py、identity.py、memory.py、search.py、imagestore.py、filestore.py、videostore.py、history.py、memory_sync.py、scene_policy.py、cache_observability.py、skills.py、profiles.py、scene_assets.py、tool_factories.py |
+| `providers/` | LLMProvider 抽象 + OpenAI 兼容实现 + 用量统计 | base.py、openai_compat.py、usage.py |
 | `session/manager.py` | 一会话一 JSONL，恢复与自愈 | session/manager.py |
 | `reminders/` | 提醒 DTO、SQLite 仓储、RRULE、调度器、应用服务 | models/repository/schedule/scheduler/service.py |
 | `voice/` | 音频归一化、ASR/TTS 抽象、KWS 与 Provider；`realtime_s2s/` 豆包全双工客户端 | asr/、tts/、kws/、media.py、realtime_s2s/ |

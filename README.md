@@ -178,7 +178,7 @@ uv run python main.py
 | `mcp_servers` | 外部 MCP Server 配置 | `{}` |
 | `image_gen_model` | 生图服务配置；`timeout_sec` 是单次 HTTP 请求上限，`total_timeout_sec` 是包含重试、退避与下载的整次任务预算 | 单次 `120` 秒 / 总计 `600` 秒 |
 | `asr_model` | 网页语音识别 Provider、模型、地址、超时、大小与 FFmpeg 配置 | 默认关闭 |
-| `tts_model` | 网页自动朗读的 Provider、音色、语速、超时与资源上限 | Edge TTS 后端就绪，页面默认关闭 |
+| `tts_model` | 网页自动朗读的 Provider、音色、语速、超时与资源上限 | Edge TTS Provider 已就绪（config 默认启用），页面朗读按钮默认关闭 |
 | `reminders` | 主动提醒开关、独立 SQLite 路径、回执/lease/低频校时与重试上限；均在重启后生效 | 启用，`workspace/reminders.db` |
 | `dream_time` | 每日做梦整理时刻（"HH:MM"）；到点把各会话当天事件按固定分类整理进 daily；实例未启动则下次启动补做前一天；重启后生效 | `"02:00"` |
 | `weixin` | 微信 Bridge 命令、被忽略的状态目录、私聊 allowlist、IPC/登录/图片上限；均在重启后生效 | 关闭，allowlist 为空（deny-all） |
@@ -259,7 +259,7 @@ correlation ID 和 Bridge 持久 context；若登录代次失效或 context 丢�
 
 启动后，Server 暴露的工具会以 `poetry__search_poetry`、`poetry__random_poetry`、`poetry__list_poets` 这类名字自动注册进工具集，模型可直接调用。
 
-- 多 Server 并行连接；单个 Server 连接超时 / 异常会被跳过并告警，不影响其余；
+- 多 Server 顺序连接；单个 Server 连接超时 / 异常会被跳过并告警，不影响其余；
 - `ClientSession` 手动 `__aenter__()` 以正确启动内部消息循环；
 - 退出时按 session → stdio 顺序回收子进程。
 
@@ -283,7 +283,7 @@ NanoClaw 按“只追加历史”的精确前缀组织请求：相邻回合继�
 
 每次模型调用与每个用户回合都会输出一行 `[prompt-cache]` JSON，只包含 token 计数、`system_hash`、`tools_hash`、历史消息数、`phase` 和工具迭代序号，不记录 prompt、用户文本、记忆、工具参数或密钥。压缩触发的历史摘要调用也计入同一用户回合（TASK-006 起压缩不再写 daily）。回合命中率按 `sum(cached_input_tokens) / sum(input_tokens)` 计算，不平均各调用百分比。若供应商未返回 cached tokens，字段为 `null` 且 `availability` 为 `partial/unavailable`，不会把缺失值伪报成 0 命中。流式请求会请求 usage；不支持 `stream_options.include_usage` 的兼容服务会降级继续流式返回，但 usage 明确不可用。
 
-冷启动、System/工具快照刷新、图片文件缺失或变化，以及历史超过预算后被摘要替换，都会形成合理的缓存断点。多模态历史在图片仍存在时按同一字节重建，避免把 Base64 写进 JSONL；它仍会随主请求再次发送，且缓存行为取决于供应商。文本摘要请求只接收图片省略占位，不重复发送 Base64。约 192k 预算触发的 ContextCompactor 会保留 System 与至少最后 6 条消息，并把边界向前扩展到完整工具交换，再用摘要替换中间旧历史；摘要失败时保留原历史。这是可观测但不可避免的前缀“断崖”，不能为追求缓存而牺牲上下文正确性。
+冷启动、System/工具快照刷新、图片文件缺失或变化，以及历史超过预算后被摘要替换，都会形成合理的缓存断点。多模态历史在图片仍存在时按同一字节重建，避免把 Base64 写进 JSONL；它仍会随主请求再次发送，且缓存行为取决于供应商。文本摘要请求只接收图片省略占位，不重复发送 Base64。约 512k 预算触发的 ContextCompactor 会保留 System 与至少最后 6 条消息，并把边界向前扩展到完整工具交换，再用摘要替换中间旧历史；摘要失败时保留原历史。这是可观测但不可避免的前缀“断崖”，不能为追求缓存而牺牲上下文正确性。
 
 ---
 
@@ -327,7 +327,7 @@ uv sync --frozen
 跨会话协作、验证矩阵和完成标准见 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md)；接手项目前先阅读 [`AGENTS.md`](AGENTS.md) 和 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。历史决策与当前遗留问题统一维护在 [`docs/DECISIONS.md`](docs/DECISIONS.md)。
 
 ```bash
-uv run python -m compileall -q agent bus channels providers session  # 基础语法检查
+uv run python -m compileall -q agent bus channels providers session reminders voice  # 基础语法检查
 uv run python -c "import main"                                      # 导入链冒烟
 uv run python -m unittest discover -s tests                          # Python 离线回归
 cd integrations/weixin_bridge && npm test && npm run build           # 微信 Bridge 离线回归

@@ -184,9 +184,9 @@
 | NC-OPS-001 | Mac 睡眠期间飞书消息可能丢失 | WS 不是持久队列；launchd/caffeinate 本机脚手架也不能解决纯电池合盖睡眠 |
 | NC-TEST-002 | 生图真实成功链路未验 | 历史只用假 key 验证请求到服务端并得到结构化 401；需真实服务的受控集成测试 |
 | NC-MEM-001 | 记忆软规则不保证执行 | Cue、14 天冷却、Follow Up 依赖模型自律；Daily 失败静默。历史压缩现已在摘要失败时保留原上下文，但会继续承受超预算风险 |
-| NC-DOC-001 | README 与实现有少量漂移 | README 称 MCP 多 Server 并行连接，当前实现为顺序 await；配置热更新描述也需更精确 |
+| ~~NC-DOC-001~~（2026-08-13 已核销） | README 与实现有少量漂移 | README 已改为「多 Server 顺序连接」（与实现一致）；192k→512k 预算、compileall 列表、TTS 默认状态等漂移一并修正；ARCHITECTURE §4 模块树与 PROJECT 模块表已补齐遗漏模块 |
 | NC-SEC-002 | WebFetch 可访问内网地址 | 只限制 http/https 且跟随重定向；不可信输入下应评估 SSRF 防护 |
-| NC-CLEAN-001 | `agent/skills/` 历史副本 | 当前运行入口使用根 `skills/`；确认无外部依赖后可移除重复副本 |
+| ~~NC-CLEAN-001~~（2026-08-13 已核销） | `agent/skills/` 历史副本 | 已核实 `agent/skills/` 目录不存在，副本早已清理；运行时只扫描 `<workspace>/skills/` |
 | ~~NC-MEM-002~~（TASK-015 已核销） | 压缩 `save_messages` 覆盖写回会改写会话文件时间戳 | 已修复：`save_messages(preserve_timestamps=True)` 从原文件按身份找回原始时间戳，压缩写回与压缩后无条件重建快照均走保留模式，详见 §4 核销记录 |
 | NC-LICENSE-001 | 微信社区基础缺少独立 LICENSE | 上游 `package.json` 声明 MIT，但仓库没有 LICENSE 文件；当前已固定来源/NOTICE，正式分发前仍需维护者或法律复核 |
 | NC-WEIXIN-001 | 微信真实端点未验收 | 自动化使用 fake iLink HTTP/CDN/clock/process；真实扫码、长轮询、图片和主动发送需用户授权后受控手工验收 |

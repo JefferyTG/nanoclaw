@@ -4,7 +4,7 @@
 
 NanoClaw 是一个本地优先、单进程、多渠道的个人 AI Agent 网关。它把渠道收发、会话调度、模型调用和工具执行拆开，通过进程内异步消息总线连接。默认部署模型是“一人/一场景一个独立进程实例”，而不是一个进程内运行多个长期自治 Agent。
 
-审计基线：2026-08-04，Git 提交 `0cd50de`。本文描述当前代码，不把未落地的方案文档当成现状。
+审计基线：2026-08-04，Git 提交 `0cd50de`；最新同步至 Git HEAD `e9b1e9f`（2026-08-13）。本文描述当前代码，不把未落地的方案文档当成现状。
 
 ## 2. 技术栈
 
@@ -98,13 +98,19 @@ nanoclaw/
 │   ├── skills.py           # 扫描与解析 SKILL.md
 │   ├── profiles.py         # 场景 Agent Profile v1/v2 读取与持久化
 │   ├── scene_assets.py     # 场景私有 Skill/工具 manifest 资产边界
+│   ├── scene_policy.py     # 场景策略（工具白名单等会话级策略）
 │   ├── tool_factories.py   # 受控私有 Tool 实例工厂
+│   ├── filestore.py        # 通用文件存储（按 MIME 分流、按月归档）
+│   ├── videostore.py       # 视频文件落盘存储
+│   ├── history.py          # 会话历史规范化（canonicalize_history 等纯函数）
+│   ├── memory_sync.py      # 记忆快照/补丁跨会话同步
+│   ├── cache_observability.py # Prompt Cache 观测与统计
 │   └── tools/              # Tool 抽象、Registry、内置工具、MCP 包装
 ├── bus/queue.py            # DTO 和三个 asyncio.Queue
 ├── channels/               # CLI、飞书、Web 渠道适配器
 ├── integrations/
 │   └── weixin_bridge/      # 固定上游源码、Node Bridge、NOTICE 与 Node 测试
-├── providers/              # 模型抽象和 OpenAI-compatible 实现
+├── providers/              # 模型抽象、OpenAI-compatible 实现与用量统计（base/openai_compat/usage.py）
 ├── reminders/              # DTO、RFC 5545、SQLite 仓储、调度器和应用服务
 ├── voice/                  # 音频校验/规范化、ASR/TTS、KWS、realtime_s2s（豆包全双工）
 ├── bin/nanoclawctl         # Linux 后台进程启动、停止、重启与状态查询
@@ -118,7 +124,7 @@ nanoclaw/
 
 补充说明：
 
-- `agent/skills/` 中存在一份历史技能副本，但运行时扫描的是 `<config.workspace>/skills/`；前者当前不是主技能入口。
+- ~~`agent/skills/` 历史副本~~（2026-08-13 核实：目录已不存在，副本已清理）——运行时只扫描 `<config.workspace>/skills/`。
 - `list/` 是另一套本地虚拟环境，不是业务模块。
 - `.workbuddy/`、`config.json`、`identity*.md`、`workspace/`、`deploy/`、`scripts/`、日志和个人图片均被忽略，不能作为公共仓库的稳定接口。
 
