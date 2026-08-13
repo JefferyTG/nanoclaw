@@ -1803,6 +1803,8 @@ async def amain() -> None:
         identity_bootstrapper=shared["identity_bootstrapper"],
         timezone=cfg.timezone,
     )
+    if cfg.web_port and cfg.web_port > 0:
+        web_channel._active_sessions_callback = gateway.get_active_sessions
 
     # 并发启动各渠道的 start() + 入站消费 + 出站分发协程。
     # CLI 的 start() 是长循环（/exit 时返回）；飞书/网页的 start() 仅拉起

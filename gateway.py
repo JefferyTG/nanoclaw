@@ -98,6 +98,9 @@ class Gateway:
         # 网页「停止」按钮经总线发来 ctl/cancel 控制消息时，据此取消在途回合；
         # 同一会话排队等锁的消息未持锁，不会被误取消。
         self._active_tasks: Dict[str, asyncio.Task] = {}
+        # session_key -> 该在途回合开始时刻（本地时间，用于 webui「执行中」徽标展示）。
+        # 与 _active_tasks 同生命周期登记/清理；task 已 done 时视图查询会过滤掉。
+        self._active_tasks_started: Dict[str, datetime] = {}
 
     async def run(self) -> None:
         """并发启动所有渠道、入站消费循环与出站分发循环。"""
@@ -150,6 +153,8 @@ class Gateway:
                 # 这条消息才算「当前回合」；同一会话排队等锁的消息不会被误取消。
                 active_task = asyncio.current_task()
                 self._active_tasks[session_key] = active_task
+                # 记录回合开始时刻（webui「执行中」徽标用）；与登记同生命周期清理
+                self._active_tasks_started[session_key] = datetime.now()
                 try:
                     if self.identity_bootstrapper is not None:
                         bootstrap_reply = await self.identity_bootstrapper.handle(
@@ -211,6 +216,7 @@ class Gateway:
                     # 回合结束（正常/错误/被取消）都解除在途登记
                     if self._active_tasks.get(session_key) is active_task:
                         self._active_tasks.pop(session_key, None)
+                        self._active_tasks_started.pop(session_key, None)
 
             reply_images = []
             image_store = getattr(agent, "image_store", None)
@@ -247,6 +253,24 @@ class Gateway:
         task = self._active_tasks.get(session_key)
         if task is not None and not task.done():
             task.cancel()
+
+    def get_active_sessions(self) -> Dict[str, str]:
+        """返回当前正在执行（未 done）的会话活跃状态，供 webui 侧边栏徽标使用。
+
+        返回 ``session_key -> 回合开始时间 ISO 字符串``（本地时间，与
+        ``session_manager`` 的 ``updated_at`` 同源，便于前端 ``relTime`` 解析）。
+        已 done 的 task（回合刚结束、finally 尚未清理的窗口）会被过滤掉，
+        避免误报「执行中」。没有活跃会话时返回空字典。
+        """
+        out: Dict[str, str] = {}
+        for key, task in list(self._active_tasks.items()):
+            if task.done():
+                continue
+            started = self._active_tasks_started.get(key)
+            if started is None:
+                continue
+            out[key] = started.isoformat(timespec="seconds")
+        return out
 
     def _begin_outbound_lifecycle(self, msg: InboundMessage):
         """Start an optional channel activity without making it mandatory.

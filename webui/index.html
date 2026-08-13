@@ -208,6 +208,13 @@
                      color:var(--muted); cursor:pointer; font-size:12px; line-height:1; padding:2px 5px;
                      border-radius:6px; }
   .sb-item .sb-del:hover { color:#ff6b6b; background:rgba(255,107,107,.12); }
+  /* TASK-045：会话「执行中」徽标（呼吸动画提示在途任务，不破坏现有布局） */
+  .sb-item .sb-active { display:inline-flex; align-items:center; gap:4px; margin-top:4px;
+                        font-size:10px; line-height:1.4; color:#e0a23a;
+                        background:rgba(224,162,58,.12); border:1px solid rgba(224,162,58,.32);
+                        border-radius:6px; padding:1px 6px; width:fit-content;
+                        animation:sbBreath 1.6s ease-in-out infinite; }
+  @keyframes sbBreath { 0%,100% { opacity:.55; } 50% { opacity:1; } }
   #main { flex:1; min-width:0; display:flex; flex-direction:column; }
   /* ================================================================
      TASK-039 移动端适配（断点 ≤768px：iPhone/Android 手机、窄屏）
@@ -1854,7 +1861,12 @@
     return (p[0] || iso).slice(5) + ' ' + (p[1] || '').slice(0, 5);
   }
 
+  var _loadSessionsInflight = false;   // 在途请求标记：防止轮询与 ws 事件并发堆叠
   function loadSessions() {
+    // 防抖：已有在途请求则跳过本次（轮询/重连/onmessage 多次触发也不叠加）
+    if (_loadSessionsInflight) return;
+    _loadSessionsInflight = true;
+    var prevScroll = sbList.scrollTop;   // 重渲染前记录滚动位置，结束后恢复，避免打断浏览
     fetch('/api/sessions').then(function (r) { return r.json(); }).then(function (d) {
       var items = (d && d.sessions) || [];
       sbList.innerHTML = '';
@@ -1868,12 +1880,22 @@
       items.forEach(function (it) {
         var el = document.createElement('div');
         el.className = 'sb-item' + (it.key === currentKey ? ' active' : '');
+        el.dataset.key = it.key;   // 供轻量轮询按 key 就地更新徽标
         el.innerHTML = '<div class="sb-title"></div><div class="sb-preview"></div>'
                      + '<div class="sb-time"></div><button class="sb-del" title="删除会话">🗑</button>';
         el.querySelector('.sb-title').textContent = it.title || '(空会话)';
         el.querySelector('.sb-preview').textContent = it.preview || '';
         el.querySelector('.sb-time').textContent =
           relTime(it.updated_at) + (it.count ? (' · ' + it.count + ' 条') : '');
+        // TASK-045：会话级「执行中」徽标（含开始时间，呼吸动画）
+        if (it.active) {
+          var badge = document.createElement('span');
+          badge.className = 'sb-active';
+          var sinceTxt = it.active_since ? relTime(it.active_since) : '';
+          badge.textContent = sinceTxt ? ('⏳ 执行中 · ' + sinceTxt) : '⏳ 执行中';
+          if (it.active_since) badge.title = '任务开始时间：' + it.active_since;
+          el.appendChild(badge);
+        }
         el.addEventListener('click', function (e) {
           if (e.target.classList.contains('sb-del')) return;
           openSession(it.key);
@@ -1884,7 +1906,9 @@
         });
         sbList.appendChild(el);
       });
-    }).catch(function (e) { console.warn('加载会话列表失败：', e); });
+      sbList.scrollTop = prevScroll;   // 恢复滚动位置（不打断用户在侧边栏的浏览）
+    }).catch(function (e) { console.warn('加载会话列表失败：', e); })
+      .finally(function () { _loadSessionsInflight = false; });
   }
 
   // 打开历史会话：后端切到该标识 + 前端拉取并回放历史，之后可继续对话
@@ -1985,14 +2009,31 @@
     }, null, toolResults);
   }
   // 历史回放：把磁盘消息重建为聊天视图（思考折叠、正式回答展开）
+  // 合并回放：同一轮对话（一个 user 消息后的连续 assistant/tool 消息）合并渲染成
+  // 一个连贯卡片——思考累积拼接、多段回复拼接、工具/子 Agent 复原，观感接近实时流式；
+  // 整轮无思考则不画空面板（消除「没内容的思考」观感）。
+  function finishTurn(c) {
+    finishThink(c);
+    c.think.classList.remove('live');
+    if (!c.thinkBody.textContent.trim()) {
+      c.think.style.display = 'none';            // 整轮没有思考 → 不显示空思考面板
+    }
+    if (!c.answerStarted) {                      // 纯工具轮（无正文）→ 给占位提示
+      c.answer.classList.remove('empty');
+      if (c.hadTools) c.answer.textContent = '（该回合调用了工具，详见工具记录）';
+      c.answerStarted = true;
+    }
+  }
   function renderHistory(records) {
     var toolResults = {};
     (records || []).forEach(function (m) {
       if (m && m.role === 'tool' && m.tool_call_id) toolResults[m.tool_call_id] = m.content || '';
     });
+    var cur = null;   // 当前合并中的 bot 回合（跨多条 assistant 消息累积）
     (records || []).forEach(function (m) {
       var role = m.role;
       if (role === 'user') {
+        if (cur) { finishTurn(cur); cur = null; }   // 上一轮结束，开始新一轮
         // 带图片元数据的历史消息：通过 /image 端点回显缩略图
         var urls = null;
         if (m.images && m.images.length && currentKey) {
@@ -2002,26 +2043,23 @@
         }
         addUser(m.content || '', urls);
       } else if (role === 'assistant') {
-        var c = newTurn();
-        if (m.reasoning_content) {
-          c.thinkBody.textContent = m.reasoning_content;
-          c.thinkPreview.textContent = m.reasoning_content;
+        if (!cur) cur = newTurn();                // 本轮第一条 assistant → 新建回合
+        if (m.reasoning_content) {                // 思考累积（多条中间步拼接）
+          if (cur.thinkBody.textContent) cur.thinkBody.textContent += '\n\n';
+          cur.thinkBody.textContent += m.reasoning_content;
+          cur.thinkPreview.textContent = cur.thinkBody.textContent;
         }
         var txt = m.content || '';
-        if (txt) {
-          c.answer.classList.remove('empty'); c.answer.textContent = txt; c.answerStarted = true;
-        } else if (m.tool_calls) {
-          c.answer.classList.remove('empty');
-          c.answer.textContent = '（该回合调用了工具，详见工具记录）';
-          c.answerStarted = true;
+        if (txt) {                                // 回复累积（最终步 / 分段拼接）
+          if (cur.answerStarted) cur.answer.textContent += '\n\n' + txt;
+          else { cur.answer.classList.remove('empty'); cur.answer.textContent = txt; cur.answerStarted = true; }
         }
-        c.think.classList.remove('live');
-        finishThink(c);
+        if (Array.isArray(m.tool_calls) && m.tool_calls.length) cur.hadTools = true;
         if (Array.isArray(m.subagent_runs) && m.subagent_runs.length) {
-          m.subagent_runs.forEach(function (run) { restoreSubagentRun(c, run, null, toolResults); });
+          m.subagent_runs.forEach(function (run) { restoreSubagentRun(cur, run, null, toolResults); });
         } else if (Array.isArray(m.tool_calls)) {
           // 升级前没有 subagent_runs：从 spawn 的 tool_call 与对应 tool 结果复原最小面板。
-          m.tool_calls.forEach(function (call) { oldSpawnFallback(c, call, toolResults); });
+          m.tool_calls.forEach(function (call) { oldSpawnFallback(cur, call, toolResults); });
         }
         // 回放本轮生成的图片（generate_image 落盘 + generated_images 元数据）
         if (m.generated_images && m.generated_images.length && currentKey) {
@@ -2030,13 +2068,14 @@
             gim.src = '/image?key=' + encodeURIComponent(currentKey)
                     + '&id=' + encodeURIComponent(iid);
             gim.loading = 'lazy';
-            c.botImages.appendChild(gim);
+            cur.botImages.appendChild(gim);
           });
         }
-        cur = null;
+        // 不在此结束回合：同轮后续 assistant 消息继续合并到 cur
       }
       // system / tool 消息在侧边栏回放中省略（不污染主对话视图）
     });
+    if (cur) finishTurn(cur);                     // 收尾最后一个回合
     scrollChatToBottom();
   }
 
@@ -2323,6 +2362,11 @@
 
   newBtn.onclick = newSession;
   loadSessions();   // 首屏拉取历史会话列表
+
+  // TASK-045：轻量轮询（每 6 秒）刷新侧边栏与会话「执行中」徽标。复用 loadSessions，
+  // 自带在途防抖与滚动位置保护，不堆叠、不打断输入/滚动；ws 重连(onopen)与消息
+  // 驱动的 loadSessions 共用同一函数，天然幂等。页面加载/重连后已各拉一次。
+  setInterval(function () { loadSessions(); }, 6000);
 
   addSys('欢迎使用小奈～左侧「会话」可查看并接上历史会话，也可删除；思考过程与工具调用默认折叠为单行，点标题即可展开，并显示思考时长。');
 })();

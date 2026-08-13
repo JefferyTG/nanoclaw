@@ -231,6 +231,10 @@ class WebChannel(Channel):
         self._lock = threading.Lock()     # 保护 _conns / _sessions 的跨线程访问
         self._clear_callback = None       # 清空历史回调（/clear 命令，同 CLI/飞书）
         self._context_callback = None     # 上下文占用查询回调（/context 命令，同 CLI/飞书）
+        # 活跃会话查询回调（TASK-045 webui「执行中」徽标）：duck-typed，期望返回
+        # {session_key: 开始时间ISO字符串}（仅含未结束的回合）。None 表示未注入，
+        # 此时 /api/sessions 每项 active 恒为 false（向后兼容、不强依赖 Gateway）。
+        self._active_sessions_callback = None
         self._index_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "webui", "index.html",
@@ -631,6 +635,21 @@ class WebChannel(Channel):
         if self.session_manager is None:
             return web.json_response({"sessions": []})
         items = self.session_manager.list_sessions_detailed(prefix=f"{self.name}:")
+        # TASK-045：为每个会话项补全活跃状态（active + active_since）。
+        # 回调 duck-typed：注入失败/异常时静默降级为「全部非活跃」，绝不拖垮列表。
+        active_map = None
+        cb = self._active_sessions_callback
+        if callable(cb):
+            try:
+                active_map = cb()
+            except Exception:  # noqa: BLE001 - 活跃状态只是徽标，失败不应影响历史列表
+                active_map = None
+        if not isinstance(active_map, dict):
+            active_map = None
+        for it in items:
+            since = active_map.get(it["key"]) if active_map is not None else None
+            it["active"] = bool(since)
+            it["active_since"] = since  # 非活跃为 null（JSON null）
         return web.json_response({"sessions": items}, headers=_NO_CACHE)
 
     async def _handle_get_session(self, request) -> web.Response:
