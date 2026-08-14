@@ -15,6 +15,7 @@
 
 | 决策 | 状态 | 原因与影响 |
 |---|---|---|
+| DSH 编码编排走官方 /api 直连（TASK-047） | 有效 | 对话式编排本机 DeepSeek Harness：`dsh_session` 工具封装 `http://127.0.0.1:3080/api`（RPC 信封 `client-request`，session.create/prompt/history/cancel）。不用社区 MCP/ACP 包（`dsh-harness-mcp-server`、`deepseek-harness-acp` 等均为数天前发布、star≈0）。关键坑：① DSH `session.create` 的 cwd 必须是绝对路径（`config.workspace` 默认相对路径 "."，工具内 `abspath` 规范化）；② `session.history` 的 `beforeSeq` 是「往前翻页」语义（取 seq<beforeSeq 旧事件），**不是增量起点**——增量过滤在本地按 seq 做，游标由调用方持有（工具无状态）。配套 skill `dsh-coder`（对话式多轮、plan 先行、验收纪律、workspace-write 沙箱+审批 fail-closed 安全边界）。**遗留**：长任务跨回合轮询（reminders 闹钟接力）留候选任务；`~/.dsh/sessions/` 无自动清理需人工维护；DSH rc.6 协议可能变 |
 | webui 移动端响应式断点 768px（TASK-039） | 有效 | 单文件响应式，改造全部收敛在 `@media (max-width:768px)` 内叠加，桌面 ≥769px 零回归；侧边栏抽屉化+汉堡开合；100vh 兜底 + 100dvh 覆盖（iOS Safari 软键盘，15.4+），输入框 16px 防 iOS 自动缩放，`env(safe-area-inset-bottom)` 安全区；触控目标 ≥44px。验证：乖宝 08-12 真机 iPhone/Android + 桌面回归全过，938 tests OK。**遗留**：多端历史不同步（后端按 conn_id 单发不回广播+前端无同步机制）→ TASK-040 |
 | Python 3.13 + `uv` + `uv.lock` | 有效 | 保证环境可复现；禁止用全局 pip 改项目依赖 |
 | `main.py` 作为直接运行入口和装配根 | 有效 | 使用顶层 `agent.*`/`session.*` 导入；不引入 DI 框架 |

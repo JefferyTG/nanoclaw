@@ -38,6 +38,7 @@ from agent.tools.registry import ToolRegistry
 from agent.tools.mcp import MCPClientManager
 from agent.tools.filesystem import ReadFileTool, WriteFileTool, ListDirTool
 from agent.tools.shell import ExecTool
+from agent.tools.dsh_session import DshSessionTool
 from agent.tools.web_search import WebSearchTool
 from agent.tools.web_fetch import WebFetchTool
 from agent.tools.current_time import CurrentTimeTool
@@ -1028,6 +1029,8 @@ def build_shared() -> dict:
     tools.register(WriteFileTool(config.workspace))
     tools.register(ListDirTool(config.workspace))
     tools.register(ExecTool(config.workspace, timeout=config.shell_timeout_sec))
+    # DSH 会话编排：对话式调用本机 DeepSeek Harness（dsh）编码 Agent
+    tools.register(DshSessionTool(config.workspace))
     tools.register(WebSearchTool())
     tools.register(WebFetchTool())
     # 动态墙钟不再进入 System Prompt；只有相关问题才通过此工具按实例时区查询。
