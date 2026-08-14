@@ -319,6 +319,9 @@ class Gateway:
                 streamed=(stream_sink is not None),
                 images=images,
                 outbound_lifecycle=outbound_lifecycle,
+                # TASK-046：发起连接断线后，web 渠道按此把回包转发给接管同一
+                # 会话的新连接（其他渠道不消费该字段）。
+                session_key=msg.sender_id,
             ))
             return True
         except Exception as exc:  # noqa: BLE001
@@ -332,6 +335,9 @@ class Gateway:
                 channel=msg.channel,
                 chat_id=msg.chat_id,
                 event=event,
+                # TASK-046：会话 local key（web 渠道 sender_id 即 current_key），
+                # 供 web 渠道按会话广播/接管事件流（断线重连续流）。
+                session_key=msg.sender_id,
             ))
         return sink
 
@@ -347,7 +353,9 @@ class Gateway:
             channel = self._channel_map.get("web")
             if channel is None or not hasattr(channel, "stream_event"):
                 continue
-            await channel.stream_event(ev.chat_id, ev.event)
+            await channel.stream_event(
+                ev.chat_id, ev.event, session_key=getattr(ev, "session_key", None)
+            )
 
     async def _dispatch_outbound(self) -> None:
         """出站分发循环：取回复 → 按渠道名找到 Channel → 下发。"""

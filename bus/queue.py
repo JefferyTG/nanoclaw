@@ -52,8 +52,8 @@ class InboundMessage:
     """入站消息：某渠道上用户发来的原始消息。"""
 
     channel: str                  # 来源渠道名称，如 "feishu" / "qq" / "web" / "cli"
-    sender_id: str                # 发送者标识
-    chat_id: str                  # 会话标识（群聊或私聊）
+    sender_id: str                # 发送者标识（web 渠道为会话 local key，即 current_key）
+    chat_id: str                  # 会话标识（群聊或私聊；web 渠道为 conn_id）
     content: str                  # 消息正文
     raw: Optional[dict] = None    # 原始消息（各渠道 SDK 的原始结构），调试用
     images: Optional[List[ImageRef]] = None  # 随消息附带的图片引用（无则为 None）
@@ -70,7 +70,7 @@ class OutboundMessage:
     """出站消息：Agent 处理完、准备下发到某渠道的回复。"""
 
     channel: str                  # 目标渠道
-    chat_id: str                  # 目标会话
+    chat_id: str                  # 目标会话（web 渠道为发起连接的 conn_id）
     content: str                  # 回复正文
     reply_to: Optional[str] = None  # 引用的消息 ID（可选，用于上下文关联）
     # 标记该回包是否已由流式事件（StreamEvent）完整覆盖。网页渠道在收到
@@ -91,6 +91,9 @@ class OutboundMessage:
     # channel may use it for best-effort state that must remain active until
     # the final outbound request is accepted (for example Weixin typing).
     outbound_lifecycle: Any = field(default=None, repr=False, compare=False)
+    # 会话本地标识（web 渠道为 current_key）。发起连接断线后，web 渠道可据此
+    # 把回包转发给「接管」了同一会话的新连接（TASK-046）。其他渠道不填。
+    session_key: Optional[str] = None
 
 
 @dataclass
@@ -112,8 +115,12 @@ class StreamEvent:
     """
 
     channel: str                  # 来源渠道（用于路由，仅 web 消费）
-    chat_id: str                  # 目标会话（网页为 conn_id）
+    chat_id: str                  # 目标会话（网页为发起连接的 conn_id）
     event: dict                   # 事件体
+    # 会话本地标识（web 渠道为 current_key）。web 渠道按此把事件广播给该会话
+    # 的所有活跃连接（断线重连后的新连接因此能续上事件流，TASK-046）。
+    # 其他渠道不填（None）。
+    session_key: Optional[str] = None
 
 
 class MessageBus:
@@ -154,7 +161,7 @@ class MessageBus:
         await self.outbound_queue.put(msg)
 
     async def consume_outbound(self) -> OutboundMessage:
-        """从 outbound_queue 取出一条出站消息，队列为空时自动等待。"""
+        """从 outbound_queue 取出一条出站消息，队列为空时等待。"""
         return await self.outbound_queue.get()
 
     async def publish_stream(self, event: StreamEvent) -> None:

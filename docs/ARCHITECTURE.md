@@ -184,6 +184,21 @@ Web 文件上传（TASK-041）：`/upload` 按 MIME/扩展名分流——`image/
 
 Web HTTPS（TASK-042）：为解锁手机浏览器 `getUserMedia` 麦克风（安全上下文要求），`WebChannel._run_server()` 在明文端口之外可额外监听一个 HTTPS 端口。启用条件为 `config.web_https_port>0` 且 `web_ssl_cert`/`web_ssl_key` 指向的 PEM 文件存在（mkcert 生成，多 SAN 覆盖 Tailscale 域名/IP、127.0.0.1 与局域网 IP）；`_build_ssl_context()` 用 `ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)` + `load_cert_chain(cert, key)` 构建上下文，经 `web.TCPSite(runner, host, https_port, ssl_context=ctx)` 监听。证书/私钥缺失或加载失败仅 `warning` 并跳过 HTTPS，明文端口完全不受影响（向后兼容）。证书文件存放于 `workspace/certs/`（整个 `workspace/` 被 `.gitignore` 忽略，敏感物不入库）；手机信任 mkcert CA 的步骤见 `workspace/WEB_HTTPS.md`。
 
+Web 断线重连续流与多端同步基础（TASK-046）：流式事件原按 `chat_id`（= conn_id）单发，
+连接断开后事件即丢失、重连的新连接收不到。TASK-046 将其升级为**按会话 key 广播**：
+`StreamEvent`/`OutboundMessage` 新增可选 `session_key`（web 渠道即 `current_key`，由
+Gateway 构造时取 `msg.sender_id` 带上）；`WebChannel` 维护「会话 local key → {conn_id}」
+活跃连接集合 `_key_conns`（初始连接/`ctl new`/`ctl open` 时绑定，连接断开时 `_unbind_conn`
+解绑），`stream_event(conn_id, event, session_key)` 带 key 时广播给集合内所有存活连接
+（查不到时退回按 conn_id 单发），`send()` 在发起连接断开时按 `session_key` 转发给接管
+连接。前端配套：断线保留聊天区渲染（不清空，提示一次「已断开·任务可能仍在执行」）；
+重连自动 open 原会话并按「当前会话是否 active」决定——任务仍在跑则保留现有渲染（后续
+事件自动续流），任务已完成则全量重渲染补拉历史；主界面顶部「⏳ 任务进行中·已运行N分钟」
+横幅随 6s 轮询刷新；历史回放新增普通工具卡片还原（`renderToolCardFromHistory`，仅前端
+展示，不改存储与模型输入）；新开页面自动接管活跃任务会话（`autoTakeoverActive`，页面
+生命周期内一次）。附带打通 TASK-040 的「事件按会话广播」核心；剩余多端同步（新建/切换/
+删除会话的侧边栏实时联动）仍在 TASK-040。
+
 ### 5.2 消息与并发
 
 ```mermaid

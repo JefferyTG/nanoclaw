@@ -106,7 +106,7 @@
 Channel(start) → Bus.inbound → Gateway(会话锁) → AgentLoop.run
   → Provider.chat_stream → ToolRegistry.execute（内置工具 / MCP / ReminderService）
   → OutboundMessage → Bus.outbound → Gateway._dispatch → Channel.send
-Web 附加：AgentLoop 流事件 → Bus.stream → WebChannel → WebSocket（thinking/token/tool_call/done）
+Web 附加：AgentLoop 流事件 → Bus.stream → WebChannel（TASK-046 起按会话 key 广播）→ WebSocket（thinking/token/tool_call/done；断线重连的新连接可续流）
 提醒链路：ReminderScheduler → claim/lease(SQLite) → AgentRunner 或直接取 delivery_text → Bus.outbound → 绑定渠道
 做梦链路：DreamScheduler（到 dream_time）/ 启动 catch_up → collect_messages_for_date + dream_consolidate → DailyMemory.write_dream（固定分类+去重）
 ```
@@ -132,6 +132,6 @@ Web 附加：AgentLoop 流事件 → Bus.stream → WebChannel → WebSocket（t
 
 > **唯一事实源是 git 本身**（`git log` / `git status` / `git diff`）。本段只留指针与稳定约定，**不复制任何瞬时状态**——hash 列表、领先/落后数量、未跟踪清单都会过期，一律不写，需要时直接查 git。
 
-- 当前里程碑：TASK-001~044 已完成并归档（TASK-038 AEC 实验已回退并归档，任务卡均在 `docs/tasks/completed/`）；active：TASK-040 webui 多端历史同步（待开始）。任务卡在 `docs/tasks/active/`。最新提交与分支状态见 `git log` / `git status`。
+- 当前里程碑：TASK-001~046 已完成（TASK-045 已提交 `b57d969`；TASK-046 断线重连续流+历史工具卡片还原 08-14 完成，任务卡见 `docs/tasks/completed/`）；active：TASK-040 webui 多端历史同步（部分打通：TASK-046 已完成「事件按会话广播」核心，剩侧边栏实时同步/新建切换删除联动待做）。任务卡在 `docs/tasks/active/`。最新提交与分支状态见 `git log` / `git status`。
 - 最新提交、分支、领先/落后、工作区状态：`git log` / `git status`。
 - 稳定约定：`kb-testset/`（个人知识库测试资产）已在 `.gitignore` 中不追踪；存在 codex 外部 worktree → 多会话并行开发时严格遵守 AGENTS.md 文件所有权规则。

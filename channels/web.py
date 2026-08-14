@@ -228,6 +228,9 @@ class WebChannel(Channel):
         self._thread = None               # 后台守护线程
         self._conns: dict = {}            # conn_id -> WebSocket
         self._sessions: dict = {}         # conn_id -> {"seq": int, "current_key": str}
+        # TASK-046：会话 local key -> {conn_id, ...} 活跃连接集合（事件按会话广播/
+        # 断线重连续流用）。与 _sessions 同步维护：open/new 绑定，断开时解绑。
+        self._key_conns: dict = {}        # local key -> set[conn_id]
         self._lock = threading.Lock()     # 保护 _conns / _sessions 的跨线程访问
         self._clear_callback = None       # 清空历史回调（/clear 命令，同 CLI/飞书）
         self._context_callback = None     # 上下文占用查询回调（/context 命令，同 CLI/飞书）
@@ -631,6 +634,28 @@ class WebChannel(Channel):
         )
 
     # —— 会话侧边栏 API（仅本渠道会话，前缀 web:）——
+    # —— TASK-046：会话级连接绑定（事件按会话广播 / 断线重连续流）——
+    def _bind_conn_to_key(self, conn_id: str, key: str) -> None:
+        """把连接绑定到会话 local key：先从旧集合解绑，再加入新集合。
+
+        调用点：初始连接建立、ctl new / ctl open 切换会话时。集合随
+        ``_conns`` / ``_sessions`` 一起受 ``self._lock`` 保护（跨线程安全）。
+        """
+        with self._lock:
+            for cid, conns in list(self._key_conns.items()):
+                conns.discard(conn_id)
+                if not conns:
+                    self._key_conns.pop(cid, None)
+            self._key_conns.setdefault(key, set()).add(conn_id)
+
+    def _unbind_conn(self, conn_id: str) -> None:
+        """连接断开：从所有会话连接集合移除该 conn_id，空集合一并清理。"""
+        with self._lock:
+            for cid, conns in list(self._key_conns.items()):
+                conns.discard(conn_id)
+                if not conns:
+                    self._key_conns.pop(cid, None)
+
     async def _handle_list_sessions(self, request) -> web.Response:
         if self.session_manager is None:
             return web.json_response({"sessions": []})
@@ -701,6 +726,7 @@ class WebChannel(Channel):
         # 之后 new/open 都会再发 session_changed，前端始终持有最新 key。
         try:
             st0 = self._session_state(conn_id)
+            self._bind_conn_to_key(conn_id, st0["current_key"])
             await self._ws_send_json(
                 ws, {"type": "session_changed", "key": f"{self.name}:{st0['current_key']}"}
             )
@@ -733,6 +759,7 @@ class WebChannel(Channel):
                             st = self._session_state(conn_id)
                             if ctype == "new":
                                 st["current_key"] = self._new_key(conn_id)
+                                self._bind_conn_to_key(conn_id, st["current_key"])
                                 # 前端高亮用的是完整标识（含 web: 前缀），故这里补回
                                 await self._ws_send_json(
                                     ws, {"type": "session_changed", "key": f"{self.name}:" + st["current_key"]}
@@ -743,6 +770,7 @@ class WebChannel(Channel):
                                     # 去掉渠道前缀存本地标识；Gateway 会再补 "web:"，
                                     # 与 CLI/飞书一致，避免文件名出现 web_web 重复前缀
                                     st["current_key"] = key[len(self.name) + 1:]
+                                    self._bind_conn_to_key(conn_id, st["current_key"])
                                     await self._ws_send_json(
                                         ws, {"type": "session_changed", "key": key}
                                     )
@@ -806,6 +834,7 @@ class WebChannel(Channel):
             with self._lock:
                 self._conns.pop(conn_id, None)
                 self._sessions.pop(conn_id, None)
+            self._unbind_conn(conn_id)   # TASK-046：从所有会话连接集合移除
         return ws
 
     # —— TASK-044 实时通话（浏览器 ⇄ /api/realtime ⇄ 豆包 S2S 全双工）——
@@ -1069,6 +1098,16 @@ class WebChannel(Channel):
         conn_id = message.chat_id
         with self._lock:
             ws = self._conns.get(conn_id)
+        if ws is None and getattr(message, "session_key", None):
+            # TASK-046：发起连接已断开，按会话 key 找「接管」同一会话的新连接转发，
+            # 避免断线重连后回包丢失。
+            key = message.session_key
+            with self._lock:
+                for cid in list(self._key_conns.get(key, ())):
+                    candidate = self._conns.get(cid)
+                    if candidate is not None:
+                        ws = candidate
+                        break
         if ws is None:
             logger.warning("网页回包找不到连接 %s，已丢弃", conn_id)
             return
@@ -1080,24 +1119,40 @@ class WebChannel(Channel):
         except Exception as exc:  # noqa: BLE001
             logger.warning("网页回包投递失败：%s", exc)
 
-    async def stream_event(self, conn_id: str, event: dict) -> None:
-        """由网关 _dispatch_stream 调用：把一个流式事件（JSON）推给指定 WS 连接。
+    async def stream_event(
+        self, conn_id: str, event: dict, session_key: str | None = None
+    ) -> None:
+        """由网关 _dispatch_stream 调用：把一个流式事件（JSON）推给 WS 连接。
 
         事件可能是思考增量、最终回答增量、工具调用/结果、完成信号等，
         具体由前端按 ``event["type"]`` 渲染。连接归属 web 事件循环，故跨线程调度。
+
+        TASK-046：带 ``session_key`` 时按会话**广播**给该会话所有活跃连接——
+        断线重连后新连接 open 了同一会话，事件流即可自动续上；同时为多端同步
+        （TASK-040）铺路。不带 key 或集合中查不到该连接时退回按 conn_id 单发。
         """
-        with self._lock:
-            ws = self._conns.get(conn_id)
-        if ws is None:
-            # 连接已断开，丢弃该事件（不影响其他连接）
-            return
-        try:
-            fut = asyncio.run_coroutine_threadsafe(
-                self._ws_send_json(ws, event), self._web_loop
-            )
-            await asyncio.wrap_future(fut)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("网页流式事件投递失败：%s", exc)
+        targets: list[tuple[str, object]] = []
+        if session_key:
+            with self._lock:
+                for cid in list(self._key_conns.get(session_key, ())):
+                    ws = self._conns.get(cid)
+                    if ws is not None:
+                        targets.append((cid, ws))
+        if not targets:
+            with self._lock:
+                ws = self._conns.get(conn_id)
+            if ws is None:
+                # 连接已断开，丢弃该事件（不影响其他连接）
+                return
+            targets.append((conn_id, ws))
+        for cid, ws in targets:
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    self._ws_send_json(ws, event), self._web_loop
+                )
+                await asyncio.wrap_future(fut)
+            except Exception as exc:  # noqa: BLE001 - 单连接失败不影响其他连接
+                logger.warning("网页流式事件投递失败（conn=%s）：%s", cid, exc)
 
     async def _ws_send_json(self, ws, event: dict) -> None:
         """把一个事件 dict 以 JSON 推到指定 WebSocket（web 事件循环内调用）。"""

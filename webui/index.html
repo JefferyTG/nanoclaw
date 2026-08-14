@@ -25,6 +25,11 @@
   .msg.user .bubble { background:var(--accent); color:#fff; padding:9px 12px; border-radius:12px; white-space:pre-wrap; word-break:break-word; }
   .msg.bot { align-self:flex-start; width:88%; display:flex; flex-direction:column; gap:8px; }
   .msg.sys { align-self:center; background:transparent; color:var(--muted); font-size:12px; }
+  /* TASK-046：主界面「任务进行中」横幅（断线重连/长任务时显示，比侧边栏徽标更显眼） */
+  #taskBanner { display:none; align-items:center; justify-content:center; gap:6px;
+                padding:6px 12px; font-size:12px; color:#e0a23a; text-align:center;
+                background:rgba(224,162,58,.10); border-bottom:1px solid rgba(224,162,58,.25);
+                animation:sbBreath 1.6s ease-in-out infinite; }
 
   /* —— 思考过程面板：独立分区、默认折叠、点开看 —— */
   .think { border:1px solid var(--think-line); border-radius:10px; background:var(--think); overflow:hidden; }
@@ -313,6 +318,7 @@
     <div class="sb-list" id="sbList"></div>
   </aside>
   <div id="main">
+    <div id="taskBanner" style="display:none"></div>
     <div id="chat"></div>
 
 <div id="config">
@@ -929,6 +935,20 @@
                   : (typeof card2._start === 'number' ? (performance.now() - card2._start) : null);
         card2.querySelector('.tc-dur').textContent = (durMs != null) ? fmtDur(durMs) : '';
         card2.querySelector('.tc-status').textContent = '✅ 完成';
+      } else {
+        // TASK-046 兜底：断线重连后聊天区已重渲染，进行中的工具卡片（cur.lastTool）
+        // 已丢失；tool_result 到达时不能再静默丢弃——创建一张结果卡片展示出来。
+        var orphan = document.createElement('div'); orphan.className = 'tool-card has-result';
+        orphan.innerHTML = '<div class="tc-head"><span class="tc-name"></span>'
+                         + '<span class="tc-status">✅ 完成</span><span class="tc-dur"></span></div>'
+                         + '<div class="tc-args" style="display:none"></div><div class="tc-result"></div>';
+        orphan.querySelector('.tc-name').textContent = '🔧 ' + (ev.name || '工具');
+        orphan.querySelector('.tc-result').textContent = (ev.content || '');
+        if (typeof ev.duration_ms === 'number') {
+          orphan.querySelector('.tc-dur').textContent = fmtDur(ev.duration_ms);
+        }
+        cur.activity.appendChild(orphan);
+        cur.lastTool = orphan;   // 后续同一工具的 done/结果仍能关联
       }
       scrollChatToBottom();
     } else if (t === 'image') {
@@ -984,6 +1004,8 @@
   var ws = null;                 // 当前 WebSocket（断线后重建）
   var _reconnectDelay = 1000;    // 重连间隔（指数退避，上限 10s）
   var _reconnectTimer = null;
+  var _disconnectNotified = false;  // TASK-046：断线提示只弹一次，重连后复位
+  var _autoTakeoverDone = false;    // TASK-046：页面生命周期内只自动接管活跃会话一次
 
   // 建立 WebSocket；断线后自动重连（指数退避），连上后自动接回当前会话。
   // 解决：Mac 睡眠 / 重启实例后，浏览器旧连接死掉、一直「已断开」需手动刷新的问题。
@@ -993,9 +1015,35 @@
       statusEl.textContent = '已连接';
       statusEl.style.color = 'var(--ok)';
       _reconnectDelay = 1000;           // 连接成功，重置退避
-      // 若之前有激活会话，重连后自动接回（服务端新连接会重置会话，需要重新 open）
+      _disconnectNotified = false;      // 恢复后允许下次断线再次提示
+      // TASK-046：重连自动接管原会话并补拉历史（断网期间任务跑完的结果一次看全）。
+      // 后端已按会话广播事件流，open 后后续进展会自动续上，无需手动刷新。
       if (currentKey) {
-        ws.send(JSON.stringify({ ctl: true, type: 'open', key: currentKey }));
+        var reqKey = currentKey;
+        ws.send(JSON.stringify({ ctl: true, type: 'open', key: reqKey }));
+        fetch('/api/session?key=' + encodeURIComponent(reqKey))
+          .then(function (r) { return r.json(); })
+          .then(function (d) {
+            if (currentKey !== reqKey) return;   // 期间用户切换了会话则不打扰
+            // TASK-046：任务仍在跑时**保留现有聊天渲染**（断线前已输出的思考/回答
+            // 不消失），后续事件会自动续流；任务已完成/无任务时才全量重渲染补拉历史。
+            return fetch('/api/sessions').then(function (r) { return r.json(); }).then(function (sd) {
+              var active = false;
+              (sd.sessions || []).forEach(function (it) {
+                if (it.key === currentKey && it.active) active = true;
+              });
+              if (!active) {
+                chat.innerHTML = '';
+                cur = null;
+                updateStopBtn();
+                renderHistory((d && d.messages) || []);
+              } else {
+                addSys('已重连 · 任务仍在执行，进展会自动续上');
+              }
+              loadSessions();
+            });
+          })
+          .catch(function (e) { console.warn('重连补拉历史失败：', e); });
       }
       loadSessions();                   // 顺手刷新侧边栏列表
     };
@@ -1008,6 +1056,12 @@
       updateStopBtn();   // 断线回合作废：按钮恢复「发送」
       statusEl.textContent = '已断开 · 重连中…';
       statusEl.style.color = '#d98c00';
+      // TASK-046：保留聊天区渲染（不清空），只提示一次「已断开」；任务在 Mac 上
+      // 可能仍在跑，重连后自动接管会话、补拉历史并续上事件流。
+      if (!_disconnectNotified) {
+        _disconnectNotified = true;
+        addSys('已断开连接 · 任务可能仍在执行，重连后自动续上');
+      }
       if (_reconnectTimer) clearTimeout(_reconnectTimer);
       _reconnectTimer = setTimeout(connectWS, _reconnectDelay);
       _reconnectDelay = Math.min(Math.floor(_reconnectDelay * 1.6), 10000);
@@ -1862,6 +1916,49 @@
   }
 
   var _loadSessionsInflight = false;   // 在途请求标记：防止轮询与 ws 事件并发堆叠
+  // TASK-046：自动接管「正在执行任务」的会话。手机/新设备打开 webui 时，
+  // 如果存在 active（有在途任务）的会话且当前不在其上，自动跳转过去——
+  // 这样打开就能看到任务在跑（横幅 + 后续结果自动出现），不用手动翻侧边栏。
+  // 只在页面生命周期内执行一次，用户手动切换会话后不再打扰。
+  function autoTakeoverActive(items) {
+    if (_autoTakeoverDone) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    var activeItem = null;
+    for (var i = 0; i < (items || []).length; i++) {
+      if (items[i].active) {
+        if (!activeItem || (items[i].active_since || '') > (activeItem.active_since || '')) {
+          activeItem = items[i];   // 多个活跃时选最近开始的
+        }
+      }
+    }
+    if (activeItem && activeItem.key !== currentKey) {
+      _autoTakeoverDone = true;
+      openSession(activeItem.key);
+    }
+  }
+
+  // TASK-046：主界面「任务进行中」横幅。当前会话有在途任务时显示，并每轮
+  // 轮询刷新已运行时长（分钟）。比侧边栏小徽标更显眼，断线重连也能看到任务没丢。
+  function updateTaskBanner(items) {
+    var banner = document.getElementById('taskBanner');
+    if (!banner) return;
+    var active = null;
+    for (var i = 0; i < (items || []).length; i++) {
+      if (items[i].key === currentKey && items[i].active) { active = items[i]; break; }
+    }
+    if (active) {
+      var mins = 0;
+      if (active.active_since) {
+        var t = new Date(active.active_since).getTime();
+        if (!isNaN(t)) mins = Math.max(0, Math.floor((Date.now() - t) / 60000));
+      }
+      banner.style.display = 'flex';
+      banner.textContent = '⏳ 任务进行中' + (mins > 0 ? (' · 已运行 ' + mins + ' 分钟') : '');
+    } else {
+      banner.style.display = 'none';
+    }
+  }
+
   function loadSessions() {
     // 防抖：已有在途请求则跳过本次（轮询/重连/onmessage 多次触发也不叠加）
     if (_loadSessionsInflight) return;
@@ -1875,6 +1972,8 @@
         tip.style.cssText = 'color:var(--muted);font-size:12px;padding:8px;';
         tip.textContent = '暂无历史会话。点击「＋ 新会话」开始。';
         sbList.appendChild(tip);
+        updateTaskBanner([]);
+        autoTakeoverActive([]);
         return;
       }
       items.forEach(function (it) {
@@ -1907,6 +2006,8 @@
         sbList.appendChild(el);
       });
       sbList.scrollTop = prevScroll;   // 恢复滚动位置（不打断用户在侧边栏的浏览）
+      updateTaskBanner(items);          // TASK-046：主界面任务横幅随 6s 轮询刷新
+      autoTakeoverActive(items);        // TASK-046：新开页面自动接管活跃任务会话
     }).catch(function (e) { console.warn('加载会话列表失败：', e); })
       .finally(function () { _loadSessionsInflight = false; });
   }
@@ -1994,6 +2095,31 @@
       duration_ms: run.duration_ms
     });
   }
+  // TASK-046：历史回放还原「普通工具」卡片（exec/web_search/generate_image 等，
+  // 非子 Agent 派发）。纯前端展示：只渲染已落盘的 tool_calls 与 tool 结果，
+  // 不改变会话存储与模型输入。
+  function renderToolCardFromHistory(turn, call, toolResults) {
+    var fn = call && call.function;
+    if (!fn || !fn.name) return;
+    var card = document.createElement('div'); card.className = 'tool-card';
+    card.innerHTML = '<div class="tc-head"><span class="tc-name"></span>'
+                   + '<span class="tc-status">✅ 完成</span><span class="tc-dur"></span></div>'
+                   + '<div class="tc-args"></div><div class="tc-result"></div>';
+    card.querySelector('.tc-name').textContent = '🔧 ' + fn.name;
+    var args = '';
+    try {
+      var parsed = JSON.parse(fn.arguments || '{}');
+      args = JSON.stringify(parsed, null, 2);
+    } catch (_e) { args = fn.arguments || ''; }
+    card.querySelector('.tc-args').textContent = args ? ('入参：\n' + args) : '';
+    var result = toolResults[call.id];
+    card.querySelector('.tc-result').textContent = (result != null && result !== '')
+      ? ('结果：\n' + result) : '（历史记录未保存该工具结果）';
+    card.classList.add('has-result');
+    turn.activity.appendChild(card);
+    turn.hadTools = true;
+  }
+
   function oldSpawnFallback(turn, call, toolResults) {
     var fn = call && call.function;
     if (!fn || fn.name !== 'spawn_subagent') return;
@@ -2057,9 +2183,20 @@
         if (Array.isArray(m.tool_calls) && m.tool_calls.length) cur.hadTools = true;
         if (Array.isArray(m.subagent_runs) && m.subagent_runs.length) {
           m.subagent_runs.forEach(function (run) { restoreSubagentRun(cur, run, null, toolResults); });
+          // 新格式：普通工具（exec/web_search 等）也在 tool_calls 里，一并还原
+          m.tool_calls.forEach(function (call) {
+            var cfn = call && call.function;
+            if (cfn && cfn.name === 'spawn_subagent') return;   // 子 Agent 已在上面渲染
+            renderToolCardFromHistory(cur, call, toolResults);
+          });
         } else if (Array.isArray(m.tool_calls)) {
-          // 升级前没有 subagent_runs：从 spawn 的 tool_call 与对应 tool 结果复原最小面板。
-          m.tool_calls.forEach(function (call) { oldSpawnFallback(cur, call, toolResults); });
+          // 升级前没有 subagent_runs：从 spawn 的 tool_call 与对应 tool 结果复原最小面板；
+          // 其余普通工具还原成工具卡片。
+          m.tool_calls.forEach(function (call) {
+            var cfn = call && call.function;
+            if (cfn && cfn.name === 'spawn_subagent') { oldSpawnFallback(cur, call, toolResults); }
+            else { renderToolCardFromHistory(cur, call, toolResults); }
+          });
         }
         // 回放本轮生成的图片（generate_image 落盘 + generated_images 元数据）
         if (m.generated_images && m.generated_images.length && currentKey) {
