@@ -253,6 +253,25 @@ class DshSessionTool(Tool):
             (e.get("event") or {}).get("type") == "turn/end" for e in events
         )
 
+        # 检测挂起的审批请求：DSH 审批策略为 ask 且应答者缺失/无人应答时，
+        # 回合会卡在 approval/asked 上（宿主 Agent 无法通过 API 批准）。
+        approvals = [
+            (e.get("event") or {}).get("data") or {}
+            for e in events
+            if (e.get("event") or {}).get("type") == "approval/asked"
+        ]
+        if approvals and not has_turn_end:
+            a = approvals[-1]
+            reason = str(a.get("reason") or "")
+            tool_name = str(a.get("toolName") or "?")
+            return (
+                f"⚠️ DSH 正在等待权限审批（工具 {tool_name}），已挂起：{reason}\n"
+                "宿主 Agent 无法批准 DSH 的审批请求（/api 无审批方法）。处理方式：\n"
+                "1) 让用户在 DSH Web 界面（127.0.0.1:3080）处理审批，或\n"
+                "2) 用 action=cancel 取消当前回合，重新派活时明确限定在项目目录内，或\n"
+                "3) 在 DSH 侧把审批策略改为 never（越界操作确定性拒绝，不挂起）。"
+            )
+
         if not replies:
             if has_turn_end:
                 return (

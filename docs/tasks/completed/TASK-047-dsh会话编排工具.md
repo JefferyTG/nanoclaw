@@ -19,6 +19,8 @@
 
 **遗留问题**：长任务跨回合轮询（reminders 闹钟接力）未做，留候选任务；`~/.dsh/sessions/` 无自动清理，需人工/脚本清理（skill 已记录）。
 
+**补丁（2026-08-15 真机发现）——DSH 审批挂起**：DSH Agent 越界操作（写项目外路径等）会发 `approval/asked` 挂起（策略 ask、应答者=Web 界面用户），宿主 Agent 无法通过 /api 批准（无审批方法）→ read 永远"还在干活"。修复：① 工具 read 检测 `approval/asked` 事件并明确提示（工具名/原因/三种处理方式），18 单测；② DSH 侧治本方案（审批策略改 never，越界确定性拒绝不挂起）待乖宝确认后改 `~/.dsh/profiles/web/cordis.patch.yml`。全量 1002 tests OK。
+
 ## 实现进展（2026-08-14）
 
 - [x] `agent/tools/dsh_session.py` 完成（DshSessionTool：list/prompt/read/cancel，RPC 信封 + 本地增量过滤）

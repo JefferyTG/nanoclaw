@@ -257,6 +257,33 @@ class DshReadTests(unittest.IsolatedAsyncioTestCase):
         result = await tool.execute(action="read")
         self.assertIn("必须带 session_id", result)
 
+    async def test_read_detects_pending_approval(self):
+        """审批挂起检测（2026-08-15 真机复现）：DSH 需要权限时回合卡在
+        approval/asked 上，宿主 Agent 无法批准——read 必须明确提示而不是
+        一直显示"还在干活"。"""
+        events = [
+            _msg_event(3, "旧回复"),
+            {
+                "event": {
+                    "type": "approval/asked",
+                    "seq": 10,
+                    "data": {
+                        "id": "appr-1",
+                        "toolName": "write",
+                        "reason": "escalate sandbox to danger-full-access: 写项目外路径",
+                    },
+                }
+            },
+        ]
+        tool = make_tool(json_handler(self._history(events)))
+        result = await tool.execute(action="read", session_id="s1", before_seq=5)
+        self.assertIn("等待权限审批", result)
+        self.assertIn("write", result)
+        self.assertIn("无法批准", result)
+        self.assertIn("cancel", result)
+        # 不应误报"还在干活"
+        self.assertNotIn("还在干活", result)
+
 
 class DshCancelTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancel(self):
