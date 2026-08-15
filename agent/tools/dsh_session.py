@@ -10,6 +10,9 @@ DshSessionTool 封装 DeepSeek Harness web profile 的 HTTP RPC API
                   DSH 侧会话持久、记得上下文
 - action=read    增量读取 DSH 的回复：传 before_seq 只返回 seq 大于该值的
                   新内容（工具无状态，增量游标由调用方持有）
+- action=approve / reject  应答 DSH 的权限审批请求（approval_id 来自
+                  read 输出的审批提示；工具常驻监听 /api/events.mux
+                  WebSocket，审批发生时记录 rpcId，应答时回填）
 - action=cancel  打断 DSH 当前回合（方向错了时兜底）
 
 协议事实（2026-08-14 对运行中的 DSH web 实测）：
@@ -17,18 +20,26 @@ DshSessionTool 封装 DeepSeek Harness web profile 的 HTTP RPC API
   "method":"...","payload":{...}}；响应 result.ok / result.value / result.error
 - session.history 返回 value.events[]，assistant/message 文本位于
   event.data.message.content[].text，回合结束有 turn/end 事件，事件带单调 seq
+- 审批应答（2026-08-15 实测）：下行 WS /api/events.mux 推送 server-request 帧
+  {type:"server-request", rpcId, payload:{type:"approval/requested", sessionId,
+  approvalId, toolName, reason}}；应答 = POST /api/respond，body
+  {"type":"client-response","rpcId":<帧的rpcId>,"result":{"ok":true,"value":
+  {sessionId, approvalId, outcome:"allowed-once"|"rejected"}}}。
+  帧只推送一次（不重放），因此必须常驻监听 WS 才能应答。
 
 安全边界：DSH web 默认绑定 127.0.0.1 且无认证（本机专用）；DSH Agent 运行在
-workspace-write 沙箱 + 审批 fail-closed（无应答者时需审批的操作会被拒绝），
-因此派活应限定在项目目录内。
+workspace-write 沙箱 + 审批 ask 策略（应答者缺省为 Web 界面用户；宿主 Agent
+可通过本工具的 approve/reject 远程应答）。派活应限定在项目目录内。
 """
 
+import asyncio
 import json
 import os
 from typing import Optional
 from urllib.parse import urljoin
 
 import httpx
+import websockets
 
 from agent.tools.base import Tool
 
@@ -51,16 +62,18 @@ class DshSessionTool(Tool):
         "action=list 查看已有 DSH 会话；action=prompt 派活/追问（同一 session_id "
         "反复调用即对话，DSH 记住上下文；不传 session_id 会自动新建项目会话）；"
         "action=read 增量读取 DSH 回复（传 before_seq 只取新内容）；"
-        "action=cancel 打断当前回合。当用户要求用 dsh/DeepSeek Harness 开发、"
-        "或需要独立编程 Agent 写代码/改 bug/跑测试/做代码审查时使用。"
+        "action=approve / action=reject 应答 DSH 的权限审批请求（approval_id 来自 "
+        "read 输出的审批提示）；action=cancel 打断当前回合。当用户要求用 "
+        "dsh/DeepSeek Harness 开发、或需要独立编程 Agent 写代码/改 bug/跑测试/"
+        "做代码审查时使用。"
     )
     parameters = {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["list", "prompt", "read", "cancel"],
-                "description": "操作：list 列会话 / prompt 发消息 / read 读回复 / cancel 取消",
+                "enum": ["list", "prompt", "read", "approve", "reject", "cancel"],
+                "description": "操作：list 列会话 / prompt 发消息 / read 读回复 / approve 批准审批 / reject 拒绝审批 / cancel 取消",
             },
             "session_id": {
                 "type": "string",
@@ -73,6 +86,10 @@ class DshSessionTool(Tool):
             "before_seq": {
                 "type": "integer",
                 "description": "增量读取起点（action=read 使用，只返回 seq 大于该值的新内容；首次可省略）",
+            },
+            "approval_id": {
+                "type": "string",
+                "description": "DSH 审批请求 ID（action=approve/reject 必填；来自 read 输出的审批提示）",
             },
         },
         "required": ["action"],
@@ -87,6 +104,7 @@ class DshSessionTool(Tool):
         workspace: str,
         base_url: Optional[str] = None,
         client_factory=None,
+        ws_factory=None,
     ) -> None:
         """构造工具。
 
@@ -95,6 +113,8 @@ class DshSessionTool(Tool):
             base_url: DSH web 的 API 根地址；缺省读环境变量 DSH_API_BASE，
                 再缺省 127.0.0.1:3080。
             client_factory: 测试注入用；接受 **kwargs 返回 httpx.AsyncClient。
+            ws_factory: 测试注入用；接受 uri 返回 websockets 客户端连接
+                （async context manager + 可异步迭代）。
         """
         self.workspace = os.path.abspath(workspace)
         # 注意：DSH 的 session.create 校验 cwd 必须是绝对路径（相对路径会报
@@ -105,6 +125,58 @@ class DshSessionTool(Tool):
             .rstrip("/")
         )
         self._client_factory = client_factory or httpx.AsyncClient
+        self._ws_factory = ws_factory or websockets.connect
+        # 审批监听：approvalId -> {rpcId, sessionId, toolName, reason}
+        self._pending_approvals: dict[str, dict] = {}
+        self._ws_task: Optional[asyncio.Task] = None
+        self._ws_retry_sec = 3.0
+
+    # ---- 审批监听（WS /api/events.mux）----
+    def _ws_uri(self) -> str:
+        ws_scheme = "wss" if self.base_url.startswith("https") else "ws"
+        host = self.base_url.split("://", 1)[1]
+        return f"{ws_scheme}://{host}/api/events.mux"
+
+    def _ensure_ws(self) -> None:
+        """懒启动审批监听后台任务（幂等）。"""
+        if self._ws_task is None or self._ws_task.done():
+            self._ws_task = asyncio.create_task(self._ws_loop())
+
+    async def _ws_loop(self) -> None:
+        """常驻监听 DSH 审批帧；断线自动重连（帧只推送一次，不能错过）。"""
+        uri = self._ws_uri()
+        while True:
+            try:
+                async with self._ws_factory(uri) as ws:
+                    async for raw in ws:
+                        try:
+                            self._handle_frame(raw)
+                        except Exception:
+                            continue
+            except Exception:
+                pass  # 连接失败/断开：退避重连
+            await asyncio.sleep(self._ws_retry_sec)
+
+    def _handle_frame(self, raw: str) -> None:
+        """解析一条 WS 帧，维护审批 pending 表。"""
+        frame = json.loads(raw)
+        if frame.get("type") != "server-request":
+            return
+        payload = frame.get("payload") or {}
+        ptype = payload.get("type")
+        if ptype == "approval/requested":
+            approval_id = payload.get("approvalId")
+            if approval_id:
+                self._pending_approvals[str(approval_id)] = {
+                    "rpcId": str(frame.get("rpcId") or ""),
+                    "sessionId": str(payload.get("sessionId") or ""),
+                    "toolName": str(payload.get("toolName") or "?"),
+                    "reason": str(payload.get("reason") or ""),
+                }
+        elif ptype == "approval/resolved":
+            approval_id = payload.get("approvalId")
+            if approval_id:
+                self._pending_approvals.pop(str(approval_id), None)
 
     # ---- Tool 执行入口 ----
     async def execute(self, **kwargs) -> str:
@@ -112,12 +184,15 @@ class DshSessionTool(Tool):
         session_id = kwargs.get("session_id")
         message = kwargs.get("message")
         before_seq = kwargs.get("before_seq")
+        approval_id = kwargs.get("approval_id")
 
-        if action not in ("list", "prompt", "read", "cancel"):
+        if action not in ("list", "prompt", "read", "approve", "reject", "cancel"):
             return (
                 f"未知 action：{action!r}。可选：list（列会话）/ prompt（派活或追问，"
-                "需 message）/ read（读回复，可带 before_seq）/ cancel（取消，需 session_id）"
+                "需 message）/ read（读回复，可带 before_seq）/ approve（批准审批，"
+                "需 approval_id）/ reject（拒绝审批，需 approval_id）/ cancel（取消，需 session_id）"
             )
+        self._ensure_ws()
         try:
             if action == "list":
                 return await self._list_sessions()
@@ -125,6 +200,10 @@ class DshSessionTool(Tool):
                 return await self._prompt(session_id, message)
             if action == "read":
                 return await self._read(session_id, before_seq)
+            if action in ("approve", "reject"):
+                return await self._answer_approval(
+                    approval_id, "allowed-once" if action == "approve" else "rejected"
+                )
             return await self._cancel(session_id)
         except httpx.ConnectError as exc:
             return (
@@ -253,8 +332,8 @@ class DshSessionTool(Tool):
             (e.get("event") or {}).get("type") == "turn/end" for e in events
         )
 
-        # 检测挂起的审批请求：DSH 审批策略为 ask 且应答者缺失/无人应答时，
-        # 回合会卡在 approval/asked 上（宿主 Agent 无法通过 API 批准）。
+        # 检测挂起的审批请求：DSH 审批策略为 ask 时，越界操作会发 approval/asked
+        # 并等待应答者（默认是 Web 界面用户）。宿主 Agent 可经 approve/reject 远程应答。
         approvals = [
             (e.get("event") or {}).get("data") or {}
             for e in events
@@ -264,12 +343,13 @@ class DshSessionTool(Tool):
             a = approvals[-1]
             reason = str(a.get("reason") or "")
             tool_name = str(a.get("toolName") or "?")
+            approval_id = str(a.get("id") or "")
             return (
                 f"⚠️ DSH 正在等待权限审批（工具 {tool_name}），已挂起：{reason}\n"
-                "宿主 Agent 无法批准 DSH 的审批请求（/api 无审批方法）。处理方式：\n"
-                "1) 让用户在 DSH Web 界面（127.0.0.1:3080）处理审批，或\n"
-                "2) 用 action=cancel 取消当前回合，重新派活时明确限定在项目目录内，或\n"
-                "3) 在 DSH 侧把审批策略改为 never（越界操作确定性拒绝，不挂起）。"
+                f"审批 ID：{approval_id}\n"
+                "请用户决定后，用 action=approve 传 approval_id 批准（仅本次），"
+                "或用 action=reject 拒绝。若审批不在监听范围内（DSH 重启/错过推送），"
+                "可改用 action=cancel 取消当前回合后重新派活（限定在项目目录内）。"
             )
 
         if not replies:
@@ -288,6 +368,52 @@ class DshSessionTool(Tool):
         return (
             f"【DSH Agent 回复】（事件 seq={seq}，状态：{state}）\n{text}\n"
             f"---\n下次增量读取请传 before_seq={last_seq}。"
+        )
+
+    async def _answer_approval(self, approval_id, outcome: str) -> str:
+        """应答 DSH 审批请求（allowed-once / rejected）。
+
+        审批帧只在发生时推送一次（不重放），rpcId 由常驻 WS 监听记录；
+        监听缺失（DSH 重启/错过推送）时无法应答，fail-closed 提示。
+        """
+        if not approval_id or not str(approval_id).strip():
+            return "应答失败：action=approve/reject 必须带 approval_id（来自 read 的审批提示）。"
+        approval_id = str(approval_id).strip()
+        pending = self._pending_approvals.get(approval_id)
+        if not pending:
+            return (
+                f"无法应答审批 {approval_id}：未监听到该审批请求"
+                "（WS 未连接、DSH 重启、或审批已被处理/取消）。"
+                "可用 action=read 确认当前状态，或 action=cancel 取消回合。"
+            )
+        body = {
+            "type": "client-response",
+            "rpcId": pending["rpcId"],
+            "result": {
+                "ok": True,
+                "value": {
+                    "sessionId": pending["sessionId"],
+                    "approvalId": approval_id,
+                    "outcome": outcome,
+                },
+            },
+        }
+        url = f"{self.base_url}/api/respond"
+        async with self._client_factory(timeout=self.RPC_TIMEOUT_SEC) as client:
+            resp = await client.post(url, json=body)
+            resp.raise_for_status()
+            data = resp.json()
+        # /api/respond 响应是 {"accepted": true}（无 result 包装，2026-08-15 实测）
+        result = data.get("result") if isinstance(data.get("result"), dict) else data
+        accepted = bool(result.get("accepted"))
+        verdict = "已批准" if outcome == "allowed-once" else "已拒绝"
+        if not accepted:
+            return f"{verdict}审批 {approval_id} 失败：{data}"
+        self._pending_approvals.pop(approval_id, None)
+        tool_name = pending.get("toolName", "?")
+        return (
+            f"{verdict}审批 {approval_id}（工具 {tool_name}，{pending.get('reason', '')}）。\n"
+            "DSH Agent 将继续；稍后用 action=read 轮询结果。"
         )
 
     async def _cancel(self, session_id) -> str:

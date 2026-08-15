@@ -21,8 +21,23 @@ dsh_session(action="list")                          // 看有哪些会话（本�
 dsh_session(action="prompt", message="...")          // 派活（自动新建项目会话）→ 返回会话ID
 dsh_session(action="prompt", session_id="session-xxx", message="...")  // 追问/纠偏（同一会话）
 dsh_session(action="read", session_id="session-xxx", before_seq=N)     // 增量读结果
+dsh_session(action="approve", approval_id="...")     // 批准 DSH 的权限审批（仅本次）
+dsh_session(action="reject", approval_id="...")      // 拒绝 DSH 的权限审批
 dsh_session(action="cancel", session_id="session-xxx")                 // 打断当前回合
 ```
+
+## 权限审批的远程应答（2026-08-15 新增）
+
+DSH Agent 做越界操作（写项目外路径、沙箱升级等）时会**挂起等待审批**（审批策略 ask，默认应答者是 Web 界面用户）。远程场景（用户不在电脑前）下，宿主 Agent 就是应答者：
+
+1. `read` 检测到挂起时会明确提示「⚠️ DSH 正在等待权限审批」+ 工具名 + 原因 + **审批 ID**
+2. **先问用户**：「DSH 请求权限：<原因>，批准还是拒绝？」
+3. 用户说批准 → `dsh_session(action="approve", approval_id="<审批ID>")`；拒绝 → `action="reject"`
+4. 应答后 DSH Agent 继续干活，照常 `read` 轮询
+
+技术说明（供排障）：工具常驻监听 DSH 的 `/api/events.mux` WebSocket，审批帧只在发生时推送一次（不重放），监听错过（DSH 重启/工具刚启动）时 approve 会报「未监听到该审批请求」——此时只能 `cancel` 回合重派，或让用户到 Web 界面处理。
+
+安全边界：**批准 = 授权 DSH 执行该次越界操作（allowed-once，仅本次）**。必须经用户明确同意才 approve；用户不在/不确定时一律 reject 或等待。
 
 ## 调用工作流（标准姿势）
 
@@ -75,6 +90,8 @@ dsh_session(action="prompt", session_id="<已有>", message="分析 xxx 的架�
 | 「DSH 服务未连接」 | `dsh web` 未启动 → 请用户运行（首次会要 DeepSeek API Key，Settings → Models 配置） |
 | 「DSH 返回错误 [xxx]」 | 按错误码处理；`session-not-found` 说明会话被清理/不存在 → 重新 `prompt` 新建 |
 | read 一直「还在干活」 | 任务较长属正常；继续轮询；确认回合卡死可 `cancel` 后重派 |
+| read 提示「等待权限审批」 | 越界操作挂起；先问用户，批准用 `approve`、拒绝用 `reject`（见上文审批章节） |
+| approve 报「未监听到该审批请求」 | WS 监听错过（DSH 重启/工具刚启动/审批已处理）；`cancel` 回合重派或让用户到 Web 界面处理 |
 | 回复与预期不符 | 用同一会话 `prompt` 追问纠偏，不要重开（重开丢失上下文） |
 | 想打断重来 | `cancel` 当前回合 → 重新 `prompt`（会话上下文保留） |
 | 行为异常 | 到 Web 侧边栏查看该会话的完整工具调用记录 |

@@ -1,11 +1,14 @@
 """dsh_session 工具单元测试。
 
-mock HTTP 层（httpx.MockTransport），不发真实请求、不依赖 DSH 实例。
-覆盖：RPC 信封构造、list 会话展示、prompt 自动建会话/复用会话、read 增量
-（before_seq）过滤、回合状态判断、cancel、未知 action、连接失败与业务错误的
-可读报错。
+mock HTTP 层（httpx.MockTransport）与 WS 层（挂起 fake 连接），不发真实请求、
+不依赖 DSH 实例。覆盖：RPC 信封构造、list 会话展示、prompt 自动建会话/复用会话、
+read 增量（before_seq）过滤、回合状态判断、审批挂起检测、审批应答
+（approve/reject 的 /api/respond 信封与 pending 表）、cancel、未知 action、
+连接失败与业务错误的可读报错。
 """
 
+import asyncio
+import json
 import unittest
 
 import httpx
@@ -15,14 +18,38 @@ from agent.tools.dsh_session import DshSessionTool
 WS = "/Users/xx/WorkBuddy/nanoclaw"
 
 
+class _HangingWs:
+    """fake WS：进入后挂起，模拟长连接（不真连网络）。"""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    def __aiter__(self):
+        async def gen():
+            while True:
+                await asyncio.sleep(3600)
+
+        return gen()
+
+
+def _hanging_ws_factory(uri):
+    return _HangingWs()
+
+
 def make_tool(handler, base_url="http://127.0.0.1:3080", workspace=WS):
-    """构造注入 MockTransport 的 DshSessionTool。"""
+    """构造注入 MockTransport 与挂起 WS 的 DshSessionTool。"""
 
     def factory(**kwargs):
         return httpx.AsyncClient(transport=httpx.MockTransport(handler), **kwargs)
 
     return DshSessionTool(
-        workspace=workspace, base_url=base_url, client_factory=factory
+        workspace=workspace,
+        base_url=base_url,
+        client_factory=factory,
+        ws_factory=_hanging_ws_factory,
     )
 
 
@@ -259,7 +286,7 @@ class DshReadTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_read_detects_pending_approval(self):
         """审批挂起检测（2026-08-15 真机复现）：DSH 需要权限时回合卡在
-        approval/asked 上，宿主 Agent 无法批准——read 必须明确提示而不是
+        approval/asked 上——read 必须明确提示审批 ID 与应答方式，而不是
         一直显示"还在干活"。"""
         events = [
             _msg_event(3, "旧回复"),
@@ -279,10 +306,116 @@ class DshReadTests(unittest.IsolatedAsyncioTestCase):
         result = await tool.execute(action="read", session_id="s1", before_seq=5)
         self.assertIn("等待权限审批", result)
         self.assertIn("write", result)
-        self.assertIn("无法批准", result)
-        self.assertIn("cancel", result)
+        self.assertIn("appr-1", result)  # 提示里带审批 ID，供 approve/reject 使用
+        self.assertIn("approve", result)
+        self.assertIn("reject", result)
         # 不应误报"还在干活"
         self.assertNotIn("还在干活", result)
+
+
+class DshApprovalTests(unittest.IsolatedAsyncioTestCase):
+    """审批应答（approve/reject）：WS 帧入表 + /api/respond 信封。"""
+
+    def _requested_frame(self, approval_id="appr-x", rpc_id="rpc-1", session="s9"):
+        return json.dumps(
+            {
+                "type": "server-request",
+                "rpcId": rpc_id,
+                "method": "approval/requested",
+                "payload": {
+                    "type": "approval/requested",
+                    "sessionId": session,
+                    "approvalId": approval_id,
+                    "toolName": "write",
+                    "reason": "写 workspace 外路径",
+                },
+            }
+        )
+
+    def test_frame_approval_requested_enters_pending_table(self):
+        tool = make_tool(json_handler(lambda *a: (None, None)))
+        tool._handle_frame(self._requested_frame())
+        pending = tool._pending_approvals["appr-x"]
+        self.assertEqual(pending["rpcId"], "rpc-1")
+        self.assertEqual(pending["sessionId"], "s9")
+        self.assertEqual(pending["toolName"], "write")
+
+    def test_frame_approval_resolved_clears_pending_table(self):
+        tool = make_tool(json_handler(lambda *a: (None, None)))
+        tool._handle_frame(self._requested_frame())
+        tool._handle_frame(
+            json.dumps(
+                {
+                    "type": "server-request",
+                    "rpcId": "rpc-2",
+                    "payload": {
+                        "type": "approval/resolved",
+                        "sessionId": "s9",
+                        "approvalId": "appr-x",
+                        "outcome": "allowed-once",
+                    },
+                }
+            )
+        )
+        self.assertNotIn("appr-x", tool._pending_approvals)
+
+    async def test_approve_sends_respond_with_pending_rpc_id(self):
+        seen = {}
+
+        def responder(path, method, payload):
+            seen["path"] = path
+            seen["body"] = payload
+            return None, None  # /api/respond 不走 rpc 结果
+
+        # /api/respond 的响应是 {"accepted": true}（无 result 包装，实测）
+        def handler(request):
+            body = json.loads(request.content)
+            seen["path"] = request.url.path
+            seen["envelope"] = body
+            return httpx.Response(200, json={"accepted": True})
+
+        tool = make_tool(handler)
+        tool._handle_frame(self._requested_frame(approval_id="appr-1", rpc_id="rpc-77"))
+        result = await tool.execute(action="approve", approval_id="appr-1")
+        self.assertIn("已批准", result)
+        self.assertIn("appr-1", result)
+        # 信封：client-response + 回填 WS 帧的 rpcId + 三字段 value
+        env = seen["envelope"]
+        self.assertEqual(env["type"], "client-response")
+        self.assertEqual(env["rpcId"], "rpc-77")
+        self.assertEqual(env["result"]["ok"], True)
+        self.assertEqual(
+            env["result"]["value"],
+            {"sessionId": "s9", "approvalId": "appr-1", "outcome": "allowed-once"},
+        )
+        self.assertEqual(seen["path"], "/api/respond")
+        # 应答后清表
+        self.assertNotIn("appr-1", tool._pending_approvals)
+
+    async def test_reject_sends_rejected_outcome(self):
+        seen = {}
+
+        def handler(request):
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"result": {"accepted": True}})
+
+        tool = make_tool(handler)
+        tool._handle_frame(self._requested_frame(approval_id="appr-2", rpc_id="rpc-88"))
+        result = await tool.execute(action="reject", approval_id="appr-2")
+        self.assertIn("已拒绝", result)
+        self.assertEqual(
+            seen["body"]["result"]["value"]["outcome"], "rejected"
+        )
+
+    async def test_answer_unknown_approval_id(self):
+        tool = make_tool(json_handler(lambda *a: (None, None)))
+        result = await tool.execute(action="approve", approval_id="ghost")
+        self.assertIn("未监听到该审批请求", result)
+
+    async def test_answer_requires_approval_id(self):
+        tool = make_tool(json_handler(lambda *a: (None, None)))
+        result = await tool.execute(action="approve")
+        self.assertIn("必须带 approval_id", result)
 
 
 class DshCancelTests(unittest.IsolatedAsyncioTestCase):
